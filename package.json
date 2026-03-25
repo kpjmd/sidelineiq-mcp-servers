@@ -1,0 +1,38 @@
+{
+  "name": "sidelineiq-mcp-servers",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "start:farcaster": "node dist/servers/farcaster/server.js",
+    "start:twitter": "node dist/servers/twitter/server.js",
+    "start:web": "node dist/servers/web/server.js",
+    "dev": "tsx src/index.ts",
+    "dev:farcaster": "tsx src/servers/farcaster/server.ts",
+    "dev:twitter": "tsx src/servers/twitter/server.ts",
+    "dev:web": "tsx src/servers/web/server.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@neondatabase/serverless": "^0.10.4",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "twitter-api-v2": "^1.18.2",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
