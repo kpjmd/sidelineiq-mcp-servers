@@ -10,6 +10,7 @@ const sportEnum = z.enum(["NFL", "NBA", "PREMIER_LEAGUE", "UFC", "OTHER"]);
 const severityEnum = z.enum(["MINOR", "MODERATE", "SEVERE", "UNKNOWN"]);
 const contentTypeEnum = z.enum(["BREAKING", "TRACKING", "DEEP_DIVE"]);
 const statusEnum = z.enum(["PUBLISHED", "PENDING_REVIEW", "DRAFT"]);
+const mdReviewStatusEnum = z.enum(["PENDING", "APPROVED", "REJECTED"]);
 
 const returnToPlaySchema = z.object({
   min_weeks: z.number().int().min(0),
@@ -26,7 +27,7 @@ export function registerWebTools(server: McpServer): void {
   // ── web_create_injury_post ──────────────────────────────────────────
   server.tool(
     "web_create_injury_post",
-    "Create a new injury post in the SidelineIQ database for display on the web frontend. Stores full clinical content, platform publish status, and metadata.",
+    "Create a new injury post in the SidelineIQ database for display on the web frontend. Stores full clinical content, platform publish status, and metadata. Auto-generates a URL slug.",
     {
       athlete_name: z.string().min(1).describe("Athlete's full name"),
       sport: sportEnum.describe("Sport league"),
@@ -41,6 +42,11 @@ export function registerWebTools(server: McpServer): void {
       twitter_id: z.string().optional().describe("Populated after Twitter publish"),
       source_url: z.string().url().optional().describe("Original news source URL"),
       md_review_required: z.boolean().default(false).describe("Whether MD review is needed"),
+      parent_post_id: z
+        .string()
+        .uuid()
+        .optional()
+        .describe("Parent BREAKING post ID — set on TRACKING updates"),
     },
     async (input) => {
       try {
@@ -63,10 +69,12 @@ export function registerWebTools(server: McpServer): void {
           twitter_id: input.twitter_id,
           source_url: input.source_url,
           md_review_required: input.md_review_required,
+          parent_post_id: input.parent_post_id,
         });
 
         return toolSuccess({
           post_id: result.id,
+          slug: result.slug,
           created_at: result.created_at,
           status: result.status,
         });
@@ -156,7 +164,7 @@ export function registerWebTools(server: McpServer): void {
   // ── web_flag_for_md_review ──────────────────────────────────────────
   server.tool(
     "web_flag_for_md_review",
-    "Flag an injury post for MD review in the OrthoIQ admin dashboard. Called automatically when confidence is below threshold or when injury is high-profile. Sets post status to PENDING_REVIEW.",
+    "Flag an injury post for MD review. Sets post status to PENDING_REVIEW and creates a review record in the admin dashboard. Called when confidence is below threshold or injury is high-profile.",
     {
       post_id: z.string().uuid().describe("The post ID to flag"),
       reason: z.string().min(1).describe("Why MD review is needed"),
@@ -219,6 +227,60 @@ export function registerWebTools(server: McpServer): void {
           total,
           has_more: hasMore,
           next_offset: hasMore ? input.offset + input.limit : null,
+        });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_list_md_reviews ─────────────────────────────────────────────
+  server.tool(
+    "web_list_md_reviews",
+    "List MD review records for the admin dashboard, joined with injury post details. Optionally filter by review status.",
+    {
+      status: mdReviewStatusEnum
+        .optional()
+        .describe("Filter by review status (PENDING, APPROVED, REJECTED)"),
+    },
+    async (input) => {
+      try {
+        const reviews = await client.listMdReviews(input.status);
+        return toolSuccess({ reviews });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_update_md_review ────────────────────────────────────────────
+  server.tool(
+    "web_update_md_review",
+    "Approve or reject an MD review. If approved, also sets the linked injury post status to PUBLISHED. Sets reviewed_at timestamp.",
+    {
+      id: z.string().uuid().describe("The MD review ID to update"),
+      status: z
+        .enum(["APPROVED", "REJECTED"])
+        .describe("The review decision"),
+      reviewer_notes: z
+        .string()
+        .optional()
+        .describe("Optional notes from the reviewing physician"),
+    },
+    async (input) => {
+      try {
+        const result = await client.updateMdReview({
+          id: input.id,
+          status: input.status,
+          reviewer_notes: input.reviewer_notes,
+        });
+
+        return toolSuccess({
+          id: result.id,
+          post_id: result.post_id,
+          status: result.status,
+          reviewed_at: result.reviewed_at,
+          post_updated: result.post_updated,
         });
       } catch (err) {
         return handleToolError(err, logger);

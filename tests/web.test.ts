@@ -56,8 +56,24 @@ const samplePost = {
   md_review_reason: null,
   md_review_confidence: null,
   version: 1,
+  parent_post_id: null,
+  slug: "patrick-mahomes-ankle-sprain-2026-03-24",
   created_at: "2026-03-24T00:00:00Z",
   updated_at: "2026-03-24T00:00:00Z",
+};
+
+const sampleReview = {
+  id: "660e8400-e29b-41d4-a716-446655440001",
+  post_id: samplePost.id,
+  reason: "Low confidence score",
+  status: "PENDING",
+  reviewer_notes: null,
+  created_at: "2026-03-24T01:00:00Z",
+  reviewed_at: null,
+  athlete_name: "Patrick Mahomes",
+  sport: "NFL",
+  headline: "Mahomes suffers ankle sprain in practice",
+  slug: samplePost.slug,
 };
 
 describe("Web MCP Server", () => {
@@ -66,8 +82,11 @@ describe("Web MCP Server", () => {
   });
 
   describe("web_create_injury_post", () => {
-    it("should create a post successfully", async () => {
-      mockSql.mockResolvedValue([samplePost]);
+    it("should create a post successfully and return slug", async () => {
+      // resolveUniqueSlug check (no collision) + INSERT
+      mockSql
+        .mockResolvedValueOnce([]) // slug uniqueness check — no collision
+        .mockResolvedValueOnce([samplePost]); // INSERT RETURNING
 
       const server = createTestServer();
       const tool = getTool(server, "web_create_injury_post");
@@ -97,11 +116,83 @@ describe("Web MCP Server", () => {
       expect(result.isError).toBeUndefined();
       const data = JSON.parse(result.content[0].text);
       expect(data.post_id).toBe(samplePost.id);
+      expect(data.slug).toBe(samplePost.slug);
       expect(data.status).toBe("PUBLISHED");
     });
 
+    it("should append -2 to slug on collision", async () => {
+      const collisionPost = { ...samplePost, slug: "patrick-mahomes-ankle-sprain-2026-03-24-2" };
+      mockSql
+        .mockResolvedValueOnce([{ id: "existing" }]) // base slug exists
+        .mockResolvedValueOnce([])                    // -2 slug is free
+        .mockResolvedValueOnce([collisionPost]);       // INSERT RETURNING
+
+      const server = createTestServer();
+      const tool = getTool(server, "web_create_injury_post");
+
+      const result = (await tool.handler(
+        {
+          athlete_name: "Patrick Mahomes",
+          sport: "NFL",
+          team: "Kansas City Chiefs",
+          injury_type: "Ankle sprain",
+          injury_severity: "MODERATE",
+          content_type: "BREAKING",
+          headline: "Duplicate headline",
+          clinical_summary: "Summary.",
+          return_to_play_estimate: {
+            min_weeks: 2,
+            max_weeks: 4,
+            probability_week_2: 0.3,
+            probability_week_4: 0.75,
+            probability_week_8: 0.95,
+            confidence: 0.82,
+          },
+        },
+        {},
+      )) as { content: Array<{ text: string }> };
+
+      const data = JSON.parse(result.content[0].text);
+      expect(data.slug).toContain("-2");
+    });
+
+    it("should accept parent_post_id for TRACKING posts", async () => {
+      const trackingPost = { ...samplePost, content_type: "TRACKING", parent_post_id: samplePost.id };
+      mockSql
+        .mockResolvedValueOnce([])               // slug check
+        .mockResolvedValueOnce([trackingPost]);   // INSERT RETURNING
+
+      const server = createTestServer();
+      const tool = getTool(server, "web_create_injury_post");
+
+      const result = (await tool.handler(
+        {
+          athlete_name: "Patrick Mahomes",
+          sport: "NFL",
+          team: "Kansas City Chiefs",
+          injury_type: "Ankle sprain",
+          injury_severity: "MODERATE",
+          content_type: "TRACKING",
+          headline: "Mahomes week 2 update",
+          clinical_summary: "Progressing well.",
+          return_to_play_estimate: {
+            min_weeks: 1,
+            max_weeks: 2,
+            probability_week_2: 0.7,
+            probability_week_4: 0.95,
+            probability_week_8: 1.0,
+            confidence: 0.9,
+          },
+          parent_post_id: samplePost.id,
+        },
+        {},
+      )) as { content: Array<{ text: string }>; isError?: boolean };
+
+      expect(result.isError).toBeUndefined();
+    });
+
     it("should handle database errors", async () => {
-      mockSql.mockRejectedValue(new Error("Connection refused"));
+      mockSql.mockResolvedValueOnce([]).mockRejectedValueOnce(new Error("Connection refused"));
 
       const server = createTestServer();
       const tool = getTool(server, "web_create_injury_post");
@@ -147,6 +238,7 @@ describe("Web MCP Server", () => {
 
       const data = JSON.parse(result.content[0].text);
       expect(data.athlete_name).toBe("Patrick Mahomes");
+      expect(data.slug).toBe(samplePost.slug);
     });
 
     it("should return error for missing post", async () => {
@@ -166,7 +258,7 @@ describe("Web MCP Server", () => {
   });
 
   describe("web_flag_for_md_review", () => {
-    it("should flag a post for review", async () => {
+    it("should flag a post and insert into md_reviews", async () => {
       const flaggedPost = {
         ...samplePost,
         status: "PENDING_REVIEW",
@@ -174,7 +266,10 @@ describe("Web MCP Server", () => {
         md_review_reason: "Low confidence score",
         md_review_confidence: 0.6,
       };
-      mockSql.mockResolvedValue([flaggedPost]);
+      // First call: UPDATE injury_posts RETURNING, second call: INSERT md_reviews
+      mockSql
+        .mockResolvedValueOnce([flaggedPost])
+        .mockResolvedValueOnce([]);
 
       const server = createTestServer();
       const tool = getTool(server, "web_flag_for_md_review");
@@ -191,10 +286,12 @@ describe("Web MCP Server", () => {
 
       const data = JSON.parse(result.content[0].text);
       expect(data.review_status).toBe("PENDING_REVIEW");
+      // Verify both DB calls were made
+      expect(mockSql).toHaveBeenCalledTimes(2);
     });
 
     it("should return error for missing post", async () => {
-      mockSql.mockResolvedValue([]);
+      mockSql.mockResolvedValueOnce([]);
 
       const server = createTestServer();
       const tool = getTool(server, "web_flag_for_md_review");
@@ -216,7 +313,6 @@ describe("Web MCP Server", () => {
 
   describe("web_list_posts", () => {
     it("should list posts with pagination", async () => {
-      // First call is count, second is data
       mockSql
         .mockResolvedValueOnce([{ total: "2" }])
         .mockResolvedValueOnce([samplePost, { ...samplePost, id: "other-id" }]);
@@ -278,6 +374,117 @@ describe("Web MCP Server", () => {
 
       const data = JSON.parse(result.content[0].text);
       expect(data.version).toBe(2);
+    });
+  });
+
+  describe("web_list_md_reviews", () => {
+    it("should list reviews with joined post fields", async () => {
+      mockSql.mockResolvedValue([sampleReview]);
+
+      const server = createTestServer();
+      const tool = getTool(server, "web_list_md_reviews");
+
+      const result = (await tool.handler({}, {})) as { content: Array<{ text: string }> };
+
+      const data = JSON.parse(result.content[0].text);
+      expect(data.reviews).toHaveLength(1);
+      expect(data.reviews[0].athlete_name).toBe("Patrick Mahomes");
+      expect(data.reviews[0].slug).toBe(samplePost.slug);
+      expect(data.reviews[0].status).toBe("PENDING");
+    });
+
+    it("should filter by status", async () => {
+      mockSql.mockResolvedValue([sampleReview]);
+
+      const server = createTestServer();
+      const tool = getTool(server, "web_list_md_reviews");
+
+      const result = (await tool.handler({ status: "PENDING" }, {})) as {
+        content: Array<{ text: string }>;
+      };
+
+      const data = JSON.parse(result.content[0].text);
+      expect(data.reviews[0].status).toBe("PENDING");
+      expect(mockSql).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe("web_update_md_review", () => {
+    it("should approve a review and update linked post", async () => {
+      const approvedReview = {
+        ...sampleReview,
+        status: "APPROVED",
+        reviewed_at: "2026-03-24T02:00:00Z",
+        post_id: samplePost.id,
+      };
+      // First call: UPDATE md_reviews RETURNING, second call: UPDATE injury_posts
+      mockSql
+        .mockResolvedValueOnce([approvedReview])
+        .mockResolvedValueOnce([]);
+
+      const server = createTestServer();
+      const tool = getTool(server, "web_update_md_review");
+
+      const result = (await tool.handler(
+        {
+          id: sampleReview.id,
+          status: "APPROVED",
+          reviewer_notes: "Clinically accurate, approved for publication.",
+        },
+        {},
+      )) as { content: Array<{ text: string }> };
+
+      const data = JSON.parse(result.content[0].text);
+      expect(data.status).toBe("APPROVED");
+      expect(data.post_updated).toBe(true);
+      // Verify both DB calls (review update + post publish)
+      expect(mockSql).toHaveBeenCalledTimes(2);
+    });
+
+    it("should reject a review without updating post", async () => {
+      const rejectedReview = {
+        ...sampleReview,
+        status: "REJECTED",
+        reviewed_at: "2026-03-24T02:00:00Z",
+        post_id: samplePost.id,
+      };
+      mockSql.mockResolvedValueOnce([rejectedReview]);
+
+      const server = createTestServer();
+      const tool = getTool(server, "web_update_md_review");
+
+      const result = (await tool.handler(
+        {
+          id: sampleReview.id,
+          status: "REJECTED",
+          reviewer_notes: "Needs clinical revision.",
+        },
+        {},
+      )) as { content: Array<{ text: string }> };
+
+      const data = JSON.parse(result.content[0].text);
+      expect(data.status).toBe("REJECTED");
+      expect(data.post_updated).toBe(false);
+      // Only one DB call — no post update on rejection
+      expect(mockSql).toHaveBeenCalledTimes(1);
+    });
+
+    it("should return error for missing review", async () => {
+      mockSql.mockResolvedValueOnce([]);
+
+      const server = createTestServer();
+      const tool = getTool(server, "web_update_md_review");
+
+      const result = (await tool.handler(
+        {
+          id: "660e8400-e29b-41d4-a716-446655440099",
+          status: "APPROVED",
+        },
+        {},
+      )) as { content: Array<{ text: string }>; isError?: boolean };
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("not found");
     });
   });
 });

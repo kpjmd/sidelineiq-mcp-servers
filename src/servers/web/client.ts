@@ -1,6 +1,6 @@
 import { getDatabase } from "../../shared/database.js";
 import { McpToolError } from "../../shared/errors.js";
-import type { InjuryPost, PostStatus, Sport, ContentType } from "../../shared/types.js";
+import type { InjuryPost, MdReview, MdReviewStatus, PostStatus, Sport, ContentType } from "../../shared/types.js";
 
 export interface CreatePostInput {
   athlete_name: string;
@@ -21,6 +21,7 @@ export interface CreatePostInput {
   twitter_id?: string;
   source_url?: string;
   md_review_required?: boolean;
+  parent_post_id?: string;
 }
 
 export interface UpdatePostInput {
@@ -44,6 +45,12 @@ export interface UpdatePostInput {
   md_review_required?: boolean;
 }
 
+export interface UpdateMdReviewInput {
+  id: string;
+  status: "APPROVED" | "REJECTED";
+  reviewer_notes?: string;
+}
+
 export interface ListPostsFilters {
   sport?: Sport;
   athlete_name?: string;
@@ -56,14 +63,42 @@ export class WebDatabaseClient {
     return getDatabase();
   }
 
+  // ── Slug helpers ────────────────────────────────────────────────────
+  private generateBaseSlug(athleteName: string, injuryType: string, date: Date): string {
+    const dateStr = date.toISOString().split("T")[0];
+    return `${athleteName}-${injuryType}-${dateStr}`
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, "")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "");
+  }
+
+  private async resolveUniqueSlug(baseSlug: string): Promise<string> {
+    let rows = await this.sql`SELECT id FROM injury_posts WHERE slug = ${baseSlug}`;
+    if (rows.length === 0) return baseSlug;
+    for (let i = 2; i <= 99; i++) {
+      const candidate = `${baseSlug}-${i}`;
+      rows = await this.sql`SELECT id FROM injury_posts WHERE slug = ${candidate}`;
+      if (rows.length === 0) return candidate;
+    }
+    return `${baseSlug}-${Date.now()}`;
+  }
+
+  // ── Posts ────────────────────────────────────────────────────────────
   async createPost(data: CreatePostInput): Promise<InjuryPost> {
+    const slug = await this.resolveUniqueSlug(
+      this.generateBaseSlug(data.athlete_name, data.injury_type, new Date()),
+    );
+
     const rows = await this.sql`
       INSERT INTO injury_posts (
         athlete_name, sport, team, injury_type, injury_severity,
         content_type, headline, clinical_summary,
         return_to_play_min_weeks, return_to_play_max_weeks,
         rtp_probability_week_2, rtp_probability_week_4, rtp_probability_week_8,
-        rtp_confidence, farcaster_hash, twitter_id, source_url, md_review_required
+        rtp_confidence, farcaster_hash, twitter_id, source_url, md_review_required,
+        parent_post_id, slug
       ) VALUES (
         ${data.athlete_name}, ${data.sport}, ${data.team},
         ${data.injury_type}, ${data.injury_severity},
@@ -72,7 +107,8 @@ export class WebDatabaseClient {
         ${data.rtp_probability_week_2 ?? null}, ${data.rtp_probability_week_4 ?? null},
         ${data.rtp_probability_week_8 ?? null}, ${data.rtp_confidence ?? null},
         ${data.farcaster_hash ?? null}, ${data.twitter_id ?? null},
-        ${data.source_url ?? null}, ${data.md_review_required ?? false}
+        ${data.source_url ?? null}, ${data.md_review_required ?? false},
+        ${data.parent_post_id ?? null}, ${slug}
       )
       RETURNING *
     `;
@@ -84,7 +120,6 @@ export class WebDatabaseClient {
     updates: UpdatePostInput,
     updateReason: string,
   ): Promise<InjuryPost> {
-    // Build dynamic update — only set fields that were provided
     const setClauses: string[] = [];
     const values: unknown[] = [];
     let paramIndex = 1;
@@ -106,7 +141,6 @@ export class WebDatabaseClient {
       paramIndex++;
     }
 
-    // Always bump version and updated_at
     setClauses.push(`version = version + 1`);
     setClauses.push(`updated_at = NOW()`);
 
@@ -162,6 +196,12 @@ export class WebDatabaseClient {
       );
     }
 
+    // Insert into md_reviews for admin dashboard
+    await this.sql`
+      INSERT INTO md_reviews (post_id, reason, status)
+      VALUES (${id}, ${reason}, 'PENDING')
+    `;
+
     return rows[0] as InjuryPost;
   }
 
@@ -170,7 +210,6 @@ export class WebDatabaseClient {
     limit: number,
     offset: number,
   ): Promise<{ posts: InjuryPost[]; total: number }> {
-    // Build dynamic WHERE clauses
     const conditions: string[] = [];
     const values: unknown[] = [];
     let paramIndex = 1;
@@ -198,12 +237,10 @@ export class WebDatabaseClient {
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
-    // Count query
     const countQuery = `SELECT COUNT(*) as total FROM injury_posts ${whereClause}`;
     const countRows = await this.sql(countQuery, values);
     const total = parseInt(String(countRows[0].total), 10);
 
-    // Data query
     const dataQuery = `
       SELECT * FROM injury_posts
       ${whereClause}
@@ -217,5 +254,55 @@ export class WebDatabaseClient {
       posts: rows as InjuryPost[],
       total,
     };
+  }
+
+  // ── MD Reviews ───────────────────────────────────────────────────────
+  async listMdReviews(status?: MdReviewStatus): Promise<MdReview[]> {
+    const query = `
+      SELECT
+        r.id, r.post_id, r.reason, r.status, r.reviewer_notes,
+        r.created_at, r.reviewed_at,
+        p.athlete_name, p.sport, p.headline, p.slug
+      FROM md_reviews r
+      JOIN injury_posts p ON p.id = r.post_id
+      ${status ? `WHERE r.status = $1` : ""}
+      ORDER BY r.created_at DESC
+    `;
+    const rows = status
+      ? await this.sql(query, [status])
+      : await this.sql(query, []);
+
+    return rows as MdReview[];
+  }
+
+  async updateMdReview(input: UpdateMdReviewInput): Promise<MdReview & { post_updated: boolean }> {
+    const rows = await this.sql(
+      `UPDATE md_reviews
+       SET status = $1, reviewer_notes = $2, reviewed_at = NOW()
+       WHERE id = $3
+       RETURNING *`,
+      [input.status, input.reviewer_notes ?? null, input.id],
+    );
+
+    if (rows.length === 0) {
+      throw new McpToolError(
+        `MD review ${input.id} not found`,
+        "Verify the review id is correct. Use web_list_md_reviews to find valid review IDs.",
+      );
+    }
+
+    const review = rows[0] as MdReview;
+    let post_updated = false;
+
+    if (input.status === "APPROVED") {
+      await this.sql`
+        UPDATE injury_posts
+        SET status = 'PUBLISHED', updated_at = NOW()
+        WHERE id = ${review.post_id}
+      `;
+      post_updated = true;
+    }
+
+    return { ...review, post_updated };
   }
 }

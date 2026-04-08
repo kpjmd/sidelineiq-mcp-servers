@@ -6,6 +6,8 @@ export type ContentType = "BREAKING" | "TRACKING" | "DEEP_DIVE";
 
 export type PostStatus = "PUBLISHED" | "PENDING_REVIEW" | "DRAFT";
 
+export type MdReviewStatus = "PENDING" | "APPROVED" | "REJECTED";
+
 export interface ReturnToPlayEstimate {
   min_weeks: number;
   max_weeks: number;
@@ -39,6 +41,23 @@ export interface InjuryPost {
   md_review_reason: string | null;
   md_review_confidence: number | null;
   version: number;
+  parent_post_id: string | null;
+  slug: string | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface MdReview {
+  id: string;
+  post_id: string;
+  reason: string;
+  status: MdReviewStatus;
+  reviewer_notes: string | null;
+  created_at: string;
+  reviewed_at: string | null;
+  // Joined fields from injury_posts (present in list queries)
+  athlete_name?: string;
+  sport?: Sport;
+  headline?: string;
+  slug?: string;
 }
