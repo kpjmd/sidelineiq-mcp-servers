@@ -51,6 +51,8 @@ const samplePost = {
   farcaster_hash: null,
   twitter_id: null,
   source_url: null,
+  conflict_reason: null,
+  team_timeline_weeks: null,
   status: "PUBLISHED",
   md_review_required: false,
   md_review_reason: null,
@@ -221,6 +223,39 @@ describe("Web MCP Server", () => {
 
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("Error");
+    });
+  });
+
+  describe("web_get_post_by_slug", () => {
+    it("should retrieve a post by slug", async () => {
+      mockSql.mockResolvedValue([samplePost]);
+
+      const server = createTestServer();
+      const tool = getTool(server, "web_get_post_by_slug");
+
+      const result = (await tool.handler(
+        { slug: samplePost.slug },
+        {},
+      )) as { content: Array<{ text: string }> };
+
+      const data = JSON.parse(result.content[0].text);
+      expect(data.athlete_name).toBe("Patrick Mahomes");
+      expect(data.slug).toBe(samplePost.slug);
+    });
+
+    it("should return error for missing slug", async () => {
+      mockSql.mockResolvedValue([]);
+
+      const server = createTestServer();
+      const tool = getTool(server, "web_get_post_by_slug");
+
+      const result = (await tool.handler(
+        { slug: "nonexistent-slug" },
+        {},
+      )) as { content: Array<{ text: string }>; isError?: boolean };
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("not found");
     });
   });
 

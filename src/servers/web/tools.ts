@@ -8,7 +8,7 @@ const logger = createLogger("web-tools");
 
 const sportEnum = z.enum(["NFL", "NBA", "PREMIER_LEAGUE", "UFC", "OTHER"]);
 const severityEnum = z.enum(["MINOR", "MODERATE", "SEVERE", "UNKNOWN"]);
-const contentTypeEnum = z.enum(["BREAKING", "TRACKING", "DEEP_DIVE"]);
+const contentTypeEnum = z.enum(["BREAKING", "TRACKING", "DEEP_DIVE", "CONFLICT_FLAG"]);
 const statusEnum = z.enum(["PUBLISHED", "PENDING_REVIEW", "DRAFT"]);
 const mdReviewStatusEnum = z.enum(["PENDING", "APPROVED", "REJECTED"]);
 
@@ -47,6 +47,16 @@ export function registerWebTools(server: McpServer): void {
         .uuid()
         .optional()
         .describe("Parent BREAKING post ID — set on TRACKING updates"),
+      conflict_reason: z
+        .string()
+        .optional()
+        .describe("Reason for conflict flag — set on CONFLICT_FLAG posts"),
+      team_timeline_weeks: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("Team's official return timeline in weeks"),
     },
     async (input) => {
       try {
@@ -70,6 +80,8 @@ export function registerWebTools(server: McpServer): void {
           source_url: input.source_url,
           md_review_required: input.md_review_required,
           parent_post_id: input.parent_post_id,
+          conflict_reason: input.conflict_reason,
+          team_timeline_weeks: input.team_timeline_weeks,
         });
 
         return toolSuccess({
@@ -110,6 +122,8 @@ export function registerWebTools(server: McpServer): void {
           twitter_id: z.string().optional(),
           source_url: z.string().url().optional(),
           md_review_required: z.boolean().optional(),
+          conflict_reason: z.string().optional(),
+          team_timeline_weeks: z.number().int().min(0).optional(),
         })
         .describe("Fields to update"),
       update_reason: z.string().min(1).describe("Why this post is being updated"),
@@ -149,6 +163,34 @@ export function registerWebTools(server: McpServer): void {
               {
                 type: "text" as const,
                 text: `Error: Post ${input.post_id} not found. Verify the post_id is correct. Use web_list_posts to find valid post IDs.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        return toolSuccess(result);
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_get_post_by_slug ────────────────────────────────────────────
+  server.tool(
+    "web_get_post_by_slug",
+    "Retrieve an injury post by its URL slug. Used by the frontend for slug-based routing.",
+    {
+      slug: z.string().min(1).describe("The URL slug to look up"),
+    },
+    async (input) => {
+      try {
+        const result = await client.getPostBySlug(input.slug);
+        if (!result) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Error: Post with slug '${input.slug}' not found. Use web_list_posts to find valid slugs.`,
               },
             ],
             isError: true,

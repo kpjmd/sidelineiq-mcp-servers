@@ -2,7 +2,7 @@ export type Sport = "NFL" | "NBA" | "PREMIER_LEAGUE" | "UFC" | "OTHER";
 
 export type InjurySeverity = "MINOR" | "MODERATE" | "SEVERE" | "UNKNOWN";
 
-export type ContentType = "BREAKING" | "TRACKING" | "DEEP_DIVE";
+export type ContentType = "BREAKING" | "TRACKING" | "DEEP_DIVE" | "CONFLICT_FLAG";
 
 export type PostStatus = "PUBLISHED" | "PENDING_REVIEW" | "DRAFT";
 
@@ -43,6 +43,8 @@ export interface InjuryPost {
   version: number;
   parent_post_id: string | null;
   slug: string | null;
+  conflict_reason: string | null;
+  team_timeline_weeks: number | null;
   created_at: string;
   updated_at: string;
 }

@@ -22,6 +22,8 @@ export interface CreatePostInput {
   source_url?: string;
   md_review_required?: boolean;
   parent_post_id?: string;
+  conflict_reason?: string;
+  team_timeline_weeks?: number;
 }
 
 export interface UpdatePostInput {
@@ -43,6 +45,8 @@ export interface UpdatePostInput {
   twitter_id?: string;
   source_url?: string;
   md_review_required?: boolean;
+  conflict_reason?: string;
+  team_timeline_weeks?: number;
 }
 
 export interface UpdateMdReviewInput {
@@ -98,7 +102,7 @@ export class WebDatabaseClient {
         return_to_play_min_weeks, return_to_play_max_weeks,
         rtp_probability_week_2, rtp_probability_week_4, rtp_probability_week_8,
         rtp_confidence, farcaster_hash, twitter_id, source_url, md_review_required,
-        parent_post_id, slug
+        parent_post_id, slug, conflict_reason, team_timeline_weeks
       ) VALUES (
         ${data.athlete_name}, ${data.sport}, ${data.team},
         ${data.injury_type}, ${data.injury_severity},
@@ -108,7 +112,8 @@ export class WebDatabaseClient {
         ${data.rtp_probability_week_8 ?? null}, ${data.rtp_confidence ?? null},
         ${data.farcaster_hash ?? null}, ${data.twitter_id ?? null},
         ${data.source_url ?? null}, ${data.md_review_required ?? false},
-        ${data.parent_post_id ?? null}, ${slug}
+        ${data.parent_post_id ?? null}, ${slug},
+        ${data.conflict_reason ?? null}, ${data.team_timeline_weeks ?? null}
       )
       RETURNING *
     `;
@@ -167,6 +172,13 @@ export class WebDatabaseClient {
   async getPost(id: string): Promise<InjuryPost | null> {
     const rows = await this.sql`
       SELECT * FROM injury_posts WHERE id = ${id}
+    `;
+    return (rows[0] as InjuryPost) ?? null;
+  }
+
+  async getPostBySlug(slug: string): Promise<InjuryPost | null> {
+    const rows = await this.sql`
+      SELECT * FROM injury_posts WHERE slug = ${slug}
     `;
     return (rows[0] as InjuryPost) ?? null;
   }
