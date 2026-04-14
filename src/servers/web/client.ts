@@ -169,6 +169,60 @@ export class WebDatabaseClient {
     return rows[0] as InjuryPost;
   }
 
+  async countTrackingChildren(parentId: string): Promise<number> {
+    const rows = await this.sql`
+      SELECT COUNT(*)::int AS count
+      FROM injury_posts
+      WHERE parent_post_id = ${parentId}
+    `;
+    return (rows[0] as { count: number }).count;
+  }
+
+  async deletePost(id: string): Promise<{ deleted: true; post_id: string }> {
+    const rows = await this.sql`
+      DELETE FROM injury_posts
+      WHERE id = ${id}
+      RETURNING id
+    `;
+
+    if (rows.length === 0) {
+      throw new McpToolError(
+        `Post ${id} not found`,
+        "Verify the post_id is correct. Use web_list_posts to find valid post IDs.",
+      );
+    }
+
+    return { deleted: true, post_id: id };
+  }
+
+  async approveInjuryPost(id: string): Promise<InjuryPost> {
+    const rows = await this.sql`
+      UPDATE injury_posts
+      SET status = 'PUBLISHED', updated_at = NOW()
+      WHERE id = ${id} AND status = 'PENDING_REVIEW'
+      RETURNING *
+    `;
+
+    if (rows.length === 0) {
+      throw new McpToolError(
+        "Post not found or not in PENDING_REVIEW status",
+        "Verify the post_id is correct and that the post is currently PENDING_REVIEW. Use web_list_md_reviews to find posts awaiting approval.",
+      );
+    }
+
+    const post = rows[0] as InjuryPost;
+
+    // Keep the md_reviews audit row in sync so the admin dashboard's
+    // PENDING queue reflects the approval.
+    await this.sql`
+      UPDATE md_reviews
+      SET status = 'APPROVED', reviewed_at = NOW()
+      WHERE post_id = ${id} AND status = 'PENDING'
+    `;
+
+    return post;
+  }
+
   async getPost(id: string): Promise<InjuryPost | null> {
     const rows = await this.sql`
       SELECT * FROM injury_posts WHERE id = ${id}

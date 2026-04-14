@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebDatabaseClient } from "./client.js";
-import { handleToolError, toolSuccess } from "../../shared/errors.js";
+import { handleToolError, McpToolError, toolSuccess } from "../../shared/errors.js";
 import { createLogger } from "../../shared/logger.js";
 
 const logger = createLogger("web-tools");
@@ -140,6 +140,53 @@ export function registerWebTools(server: McpServer): void {
           post_id: result.id,
           updated_at: result.updated_at,
           version: result.version,
+        });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_delete_injury_post ──────────────────────────────────────────
+  server.tool(
+    "web_delete_injury_post",
+    "Hard delete an injury post from the SidelineIQ database. Protected against accidentally deleting posts with TRACKING children — pass force:true to cascade-delete children and md_reviews.",
+    {
+      post_id: z.string().describe("The post ID to delete"),
+      reason: z
+        .string()
+        .optional()
+        .describe("Why this post is being deleted (for audit log)"),
+      force: z
+        .boolean()
+        .optional()
+        .describe(
+          "If true, cascade-delete all TRACKING descendants and md_reviews. Required when the post has children.",
+        ),
+    },
+    async (input) => {
+      try {
+        const childCount = await client.countTrackingChildren(input.post_id);
+
+        if (!input.force && childCount > 0) {
+          throw new McpToolError(
+            `Cannot delete: post has ${childCount} TRACKING child post(s)`,
+            "Delete children first or pass force:true to cascade-delete them along with the parent.",
+          );
+        }
+
+        const result = await client.deletePost(input.post_id);
+
+        logger.info("injury post deleted", {
+          post_id: input.post_id,
+          force: input.force ?? false,
+          cascaded_count: input.force ? childCount : 0,
+          ...(input.reason ? { reason: input.reason } : {}),
+        });
+
+        return toolSuccess({
+          ...result,
+          ...(input.force ? { cascaded_count: childCount } : {}),
         });
       } catch (err) {
         return handleToolError(err, logger);
@@ -324,6 +371,26 @@ export function registerWebTools(server: McpServer): void {
           reviewed_at: result.reviewed_at,
           post_updated: result.post_updated,
         });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_approve_injury_post ─────────────────────────────────────────
+  server.tool(
+    "web_approve_injury_post",
+    "One-click approve a PENDING_REVIEW injury post. Flips status to PUBLISHED and marks the linked md_reviews row as APPROVED. Returns the full post row for downstream social publishing (Farcaster, Twitter). No reviewer notes required — for richer reviews with notes, use web_update_md_review.",
+    {
+      post_id: z.string().describe("The post ID to approve"),
+    },
+    async (input) => {
+      try {
+        const post = await client.approveInjuryPost(input.post_id);
+
+        logger.info("injury post approved", { post_id: post.id });
+
+        return toolSuccess({ approved: true, post });
       } catch (err) {
         return handleToolError(err, logger);
       }
