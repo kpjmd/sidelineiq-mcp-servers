@@ -377,6 +377,39 @@ export function registerWebTools(server: McpServer): void {
     },
   );
 
+  // ── web_purge_all_posts ─────────────────────────────────────────────
+  server.tool(
+    "web_purge_all_posts",
+    "Purge ALL injury posts and their cascaded md_reviews from the database. One-time pre-launch operation. Requires confirm:true. Returns row counts before and after.",
+    {
+      confirm: z.literal(true).describe("Must be true to execute the purge"),
+      reason: z.string().min(1).describe("Why the purge is being performed"),
+    },
+    async (input) => {
+      try {
+        const before = await client.getTableCounts();
+        const deletedPosts = await client.purgeAllPosts();
+        const after = await client.getTableCounts();
+
+        logger.info("database purged", {
+          reason: input.reason,
+          deleted_posts: deletedPosts,
+          before,
+          after,
+        });
+
+        return toolSuccess({
+          before,
+          after,
+          deleted_posts: deletedPosts,
+          deleted_reviews: before.md_reviews - after.md_reviews,
+        });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
   // ── web_approve_injury_post ─────────────────────────────────────────
   server.tool(
     "web_approve_injury_post",

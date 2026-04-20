@@ -322,6 +322,22 @@ export class WebDatabaseClient {
     };
   }
 
+  // ── Bulk Admin ───────────────────────────────────────────────────────
+  async getTableCounts(): Promise<{ injury_posts: number; md_reviews: number }> {
+    const rows = await this.sql`
+      SELECT
+        (SELECT COUNT(*)::int FROM injury_posts) AS injury_posts_count,
+        (SELECT COUNT(*)::int FROM md_reviews) AS md_reviews_count
+    `;
+    const row = rows[0] as { injury_posts_count: number; md_reviews_count: number };
+    return { injury_posts: row.injury_posts_count, md_reviews: row.md_reviews_count };
+  }
+
+  async purgeAllPosts(): Promise<number> {
+    const rows = await this.sql`DELETE FROM injury_posts RETURNING id`;
+    return rows.length;
+  }
+
   // ── MD Reviews ───────────────────────────────────────────────────────
   async listMdReviews(status?: MdReviewStatus): Promise<MdReview[]> {
     const query = `
