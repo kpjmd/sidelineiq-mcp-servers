@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebDatabaseClient } from "./client.js";
+import type { InsertProcessedMentionInput, InsertPendingCorrectionInput } from "./client.js";
 import { handleToolError, McpToolError, toolSuccess } from "../../shared/errors.js";
 import { createLogger } from "../../shared/logger.js";
 
@@ -404,6 +405,148 @@ export function registerWebTools(server: McpServer): void {
           deleted_posts: deletedPosts,
           deleted_reviews: before.md_reviews - after.md_reviews,
         });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_get_social_state ────────────────────────────────────────────
+  server.tool(
+    "web_get_social_state",
+    "Read a value from the social monitor state table. Used to retrieve pagination cursors (twitter_mentions_since_id, farcaster_notifications_cursor) between polling cycles.",
+    {
+      key: z.string().describe("The state key to read"),
+    },
+    async (input) => {
+      try {
+        const value = await client.getSocialState(input.key);
+        return toolSuccess({ key: input.key, value });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_set_social_state ────────────────────────────────────────────
+  server.tool(
+    "web_set_social_state",
+    "Upsert a value in the social monitor state table. Used to persist pagination cursors between polling cycles.",
+    {
+      key: z.string().describe("The state key to write"),
+      value: z.string().describe("The value to store"),
+    },
+    async (input) => {
+      try {
+        await client.setSocialState(input.key, input.value);
+        return toolSuccess({ key: input.key, updated: true });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_check_mention_processed ─────────────────────────────────────
+  server.tool(
+    "web_check_mention_processed",
+    "Check whether a social mention has already been processed. Returns processed:true if a matching row exists in processed_mentions.",
+    {
+      platform: z.string().describe("Platform: 'twitter' or 'farcaster'"),
+      mention_id: z.string().describe("Tweet ID or cast hash"),
+    },
+    async (input) => {
+      try {
+        const processed = await client.checkMentionProcessed(input.platform, input.mention_id);
+        return toolSuccess({ processed });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_insert_processed_mention ────────────────────────────────────
+  server.tool(
+    "web_insert_processed_mention",
+    "Log a processed mention to the processed_mentions table. Call this after every mention regardless of action taken (REPLIED, IGNORED, QUEUED_CORRECTION). Silently ignores duplicates.",
+    {
+      platform: z.string().describe("Platform: 'twitter' or 'farcaster'"),
+      mention_id: z.string().describe("Tweet ID or cast hash — unique mention identifier"),
+      author_handle: z.string().describe("Author's @handle"),
+      author_follower_count: z.number().int().optional().describe("Author's follower count"),
+      mention_text: z.string().describe("Full text of the mention"),
+      intent: z.string().describe("Classified intent (CORRECTION, CLINICAL_QUESTION, ENGAGEMENT, PUSHBACK, SOURCING, IGNORE)"),
+      intent_confidence: z.number().min(0).max(1).optional().describe("Intent classification confidence 0-1"),
+      action_taken: z.string().describe("Action taken: REPLIED | IGNORED | QUEUED_CORRECTION"),
+      reply_content: z.string().optional().describe("Text of the reply posted"),
+      reply_post_id: z.string().optional().describe("ID of the reply tweet or cast hash"),
+      raw_payload: z.record(z.unknown()).optional().describe("Raw platform API response for audit"),
+    },
+    async (input) => {
+      try {
+        const data: InsertProcessedMentionInput = {
+          platform: input.platform,
+          mention_id: input.mention_id,
+          author_handle: input.author_handle,
+          author_follower_count: input.author_follower_count,
+          mention_text: input.mention_text,
+          intent: input.intent,
+          intent_confidence: input.intent_confidence,
+          action_taken: input.action_taken,
+          reply_content: input.reply_content,
+          reply_post_id: input.reply_post_id,
+          raw_payload: input.raw_payload,
+        };
+        const result = await client.insertProcessedMention(data);
+        return toolSuccess(result);
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_insert_pending_correction ───────────────────────────────────
+  server.tool(
+    "web_insert_pending_correction",
+    "Queue a user-submitted correction for admin review. Called when a mention is classified as CORRECTION with confidence > 0.8. Corrections do NOT auto-update posts.",
+    {
+      original_post_id: z.string().uuid().optional().describe("UUID of the OTM post being corrected"),
+      mention_id: z.string().describe("Tweet ID or cast hash of the correcting mention"),
+      platform: z.string().describe("Platform: 'twitter' or 'farcaster'"),
+      correction_field: z.string().describe("Which field is being corrected (e.g. player_team, injury_type, rtp_weeks)"),
+      old_value: z.string().describe("The value OTM originally stated"),
+      new_value: z.string().describe("The corrected value from the user"),
+      submitted_by_handle: z.string().describe("@handle of the user who submitted the correction"),
+    },
+    async (input) => {
+      try {
+        const data: InsertPendingCorrectionInput = {
+          original_post_id: input.original_post_id,
+          mention_id: input.mention_id,
+          platform: input.platform,
+          correction_field: input.correction_field,
+          old_value: input.old_value,
+          new_value: input.new_value,
+          submitted_by_handle: input.submitted_by_handle,
+        };
+        const result = await client.insertPendingCorrection(data);
+        return toolSuccess(result);
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_list_pending_corrections ────────────────────────────────────
+  server.tool(
+    "web_list_pending_corrections",
+    "List pending corrections submitted by users. Used by the admin dashboard to review and approve/dismiss factual corrections to OTM posts.",
+    {
+      status: z.enum(["PENDING", "APPROVED", "DISMISSED"]).optional().describe("Filter by status (default: all)"),
+    },
+    async (input) => {
+      try {
+        const corrections = await client.listPendingCorrections(input.status);
+        return toolSuccess({ corrections });
       } catch (err) {
         return handleToolError(err, logger);
       }

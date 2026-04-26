@@ -33,6 +33,22 @@ export interface CastDetails {
   status: string;
 }
 
+export interface FarcasterNotification {
+  hash: string;
+  text: string;
+  authorFid: number;
+  authorUsername: string;
+  authorFollowerCount?: number;
+  parentHash?: string;
+  timestamp: string;
+  type: "mention" | "reply";
+}
+
+export interface GetNotificationsResult {
+  notifications: FarcasterNotification[];
+  nextCursor?: string;
+}
+
 export class NeynarClient {
   private baseUrl = "https://api.neynar.com/v2/farcaster";
   private apiKey: string;
@@ -113,6 +129,69 @@ export class NeynarClient {
       timestamp: data.cast.timestamp,
       url: `https://warpcast.com/~/conversations/${data.cast.hash}`,
     };
+  }
+
+  async getNotifications(fid: number, cursor?: string, limit?: number): Promise<GetNotificationsResult> {
+    const params: Record<string, string> = {
+      fid: String(fid),
+      type: "mention,reply",
+      limit: String(limit ?? 25),
+    };
+    if (cursor) {
+      params.cursor = cursor;
+    }
+
+    try {
+      const data = await this.request<{
+        notifications?: Array<{
+          type?: string;
+          cast?: {
+            hash?: string;
+            text?: string;
+            parent_hash?: string;
+            timestamp?: string;
+            author?: {
+              fid?: number;
+              username?: string;
+              follower_count?: number;
+            };
+          };
+        }>;
+        next?: { cursor?: string };
+      }>("GET", "/notifications", undefined, params);
+
+      const notifications: FarcasterNotification[] = [];
+
+      for (const raw of data.notifications ?? []) {
+        const type = raw.type;
+        if (type !== "mention" && type !== "reply") continue;
+        const cast = raw.cast;
+        if (!cast?.hash || !cast.text) continue;
+
+        notifications.push({
+          hash: cast.hash,
+          text: cast.text,
+          authorFid: cast.author?.fid ?? 0,
+          authorUsername: cast.author?.username ?? "",
+          authorFollowerCount: cast.author?.follower_count,
+          parentHash: cast.parent_hash,
+          timestamp: cast.timestamp ?? new Date().toISOString(),
+          type: type as "mention" | "reply",
+        });
+      }
+
+      return {
+        notifications,
+        nextCursor: data.next?.cursor,
+      };
+    } catch (err: unknown) {
+      // Handle 429 rate limit gracefully — return empty result instead of throwing
+      if (err instanceof Error && err.message.includes("429")) {
+        logger.warn("Neynar notifications rate limit hit — returning empty result");
+        return { notifications: [] };
+      }
+      throw err;
+    }
   }
 
   async getCast(hash: string): Promise<CastDetails> {

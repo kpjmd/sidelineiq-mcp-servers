@@ -80,6 +80,25 @@ export function registerTwitterTools(server: McpServer): void {
     },
   );
 
+  // ── twitter_get_mentions ────────────────────────────────────────────
+  server.tool(
+    "twitter_get_mentions",
+    "Fetch recent mentions of the SidelineIQ Twitter account. Returns tweets that mention the account since the given since_id cursor. Use newestId from the response as since_id on the next call to avoid reprocessing.",
+    {
+      user_id: z.string().describe("OTM's numeric Twitter user ID"),
+      since_id: z.string().optional().describe("Only return mentions newer than this tweet ID (pagination cursor)"),
+      max_results: z.number().int().min(5).max(100).default(10).optional().describe("Max mentions to return (5-100, default 10)"),
+    },
+    async (input) => {
+      try {
+        const result = await client.getMentions(input.user_id, input.since_id, input.max_results ?? 10);
+        return toolSuccess(result);
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
   // ── twitter_delete_tweet ────────────────────────────────────────────
   server.tool(
     "twitter_delete_tweet",

@@ -23,6 +23,22 @@ export interface TweetDetails {
   };
 }
 
+export interface TwitterMention {
+  id: string;
+  text: string;
+  authorId: string;
+  authorUsername: string;
+  authorFollowerCount?: number;
+  conversationId: string;
+  inReplyToUserId?: string;
+  createdAt: string;
+}
+
+export interface GetMentionsResult {
+  mentions: TwitterMention[];
+  newestId?: string;
+}
+
 export class TwitterClient {
   private client: TwitterApi;
 
@@ -73,6 +89,61 @@ export class TwitterClient {
         },
       };
     } catch (err: unknown) {
+      this.handleTwitterError(err);
+    }
+  }
+
+  async getMentions(userId: string, sinceId?: string, maxResults?: number): Promise<GetMentionsResult> {
+    try {
+      const opts: Record<string, unknown> = {
+        "tweet.fields": ["id", "text", "author_id", "conversation_id", "in_reply_to_user_id", "created_at"],
+        "user.fields": ["public_metrics", "username"],
+        expansions: ["author_id"],
+        max_results: maxResults ?? 10,
+      };
+      if (sinceId) {
+        opts.since_id = sinceId;
+      }
+
+      const timeline = await this.client.v2.userMentionTimeline(userId, opts as Parameters<typeof this.client.v2.userMentionTimeline>[1]);
+
+      const usersMap = new Map<string, { username: string; followerCount?: number }>();
+      const includes = timeline.includes;
+      if (includes?.users) {
+        for (const user of includes.users) {
+          usersMap.set(user.id, {
+            username: user.username,
+            followerCount: user.public_metrics?.followers_count,
+          });
+        }
+      }
+
+      const tweets = timeline.data?.data ?? [];
+      const mentions: TwitterMention[] = tweets.map((tweet) => {
+        const authorInfo = usersMap.get(tweet.author_id ?? "");
+        return {
+          id: tweet.id,
+          text: tweet.text,
+          authorId: tweet.author_id ?? "",
+          authorUsername: authorInfo?.username ?? "",
+          authorFollowerCount: authorInfo?.followerCount,
+          conversationId: tweet.conversation_id ?? tweet.id,
+          inReplyToUserId: tweet.in_reply_to_user_id,
+          createdAt: tweet.created_at ?? new Date().toISOString(),
+        };
+      });
+
+      const newestId = timeline.data?.meta?.newest_id;
+      return { mentions, newestId };
+    } catch (err: unknown) {
+      // Handle 429 rate limit gracefully — return empty result instead of throwing
+      if (err && typeof err === "object" && "code" in err) {
+        const code = (err as { code: number }).code;
+        if (code === 429) {
+          logger.warn("Twitter mentions rate limit hit — returning empty result");
+          return { mentions: [] };
+        }
+      }
       this.handleTwitterError(err);
     }
   }

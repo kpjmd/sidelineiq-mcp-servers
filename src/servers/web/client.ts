@@ -2,6 +2,46 @@ import { getDatabase } from "../../shared/database.js";
 import { McpToolError } from "../../shared/errors.js";
 import type { InjuryPost, MdReview, MdReviewStatus, PostStatus, Sport, ContentType } from "../../shared/types.js";
 
+// ── Social engagement types ───────────────────────────────────────────
+export interface InsertProcessedMentionInput {
+  platform: string;
+  mention_id: string;
+  author_handle: string;
+  author_follower_count?: number;
+  mention_text: string;
+  intent: string;
+  intent_confidence?: number;
+  action_taken: string;
+  reply_content?: string;
+  reply_post_id?: string;
+  raw_payload?: Record<string, unknown>;
+}
+
+export interface InsertPendingCorrectionInput {
+  original_post_id?: string;
+  mention_id: string;
+  platform: string;
+  correction_field: string;
+  old_value: string;
+  new_value: string;
+  submitted_by_handle: string;
+}
+
+export interface PendingCorrection {
+  id: string;
+  original_post_id?: string;
+  mention_id: string;
+  platform: string;
+  correction_field: string;
+  old_value: string;
+  new_value: string;
+  submitted_by_handle: string;
+  submitted_at: string;
+  status: string;
+  reviewed_at?: string;
+  reviewed_by?: string;
+}
+
 export interface CreatePostInput {
   athlete_name: string;
   sport: string;
@@ -355,6 +395,82 @@ export class WebDatabaseClient {
       : await this.sql(query, []);
 
     return rows as MdReview[];
+  }
+
+  // ── Social engagement ────────────────────────────────────────────────
+  async getSocialState(key: string): Promise<string | null> {
+    const rows = await this.sql`
+      SELECT value FROM social_monitor_state WHERE key = ${key}
+    `;
+    if (rows.length === 0) return null;
+    const row = rows[0] as { value: string | null };
+    return row.value ?? null;
+  }
+
+  async setSocialState(key: string, value: string): Promise<void> {
+    await this.sql`
+      INSERT INTO social_monitor_state (key, value, updated_at)
+      VALUES (${key}, ${value}, NOW())
+      ON CONFLICT (key) DO UPDATE SET value = ${value}, updated_at = NOW()
+    `;
+  }
+
+  async checkMentionProcessed(platform: string, mentionId: string): Promise<boolean> {
+    const rows = await this.sql`
+      SELECT id FROM processed_mentions
+      WHERE platform = ${platform} AND mention_id = ${mentionId}
+      LIMIT 1
+    `;
+    return rows.length > 0;
+  }
+
+  async insertProcessedMention(data: InsertProcessedMentionInput): Promise<{ id: string }> {
+    const rows = await this.sql`
+      INSERT INTO processed_mentions (
+        platform, mention_id, author_handle, author_follower_count,
+        mention_text, intent, intent_confidence, action_taken,
+        reply_content, reply_post_id, raw_payload
+      ) VALUES (
+        ${data.platform}, ${data.mention_id}, ${data.author_handle},
+        ${data.author_follower_count ?? null}, ${data.mention_text},
+        ${data.intent}, ${data.intent_confidence ?? null}, ${data.action_taken},
+        ${data.reply_content ?? null}, ${data.reply_post_id ?? null},
+        ${data.raw_payload ? JSON.stringify(data.raw_payload) : null}
+      )
+      ON CONFLICT (platform, mention_id) DO NOTHING
+      RETURNING id
+    `;
+    const id = rows[0] ? (rows[0] as { id: string }).id : "duplicate";
+    return { id };
+  }
+
+  async insertPendingCorrection(data: InsertPendingCorrectionInput): Promise<{ id: string }> {
+    const rows = await this.sql`
+      INSERT INTO pending_corrections (
+        original_post_id, mention_id, platform,
+        correction_field, old_value, new_value, submitted_by_handle
+      ) VALUES (
+        ${data.original_post_id ?? null}, ${data.mention_id}, ${data.platform},
+        ${data.correction_field}, ${data.old_value}, ${data.new_value},
+        ${data.submitted_by_handle}
+      )
+      RETURNING id
+    `;
+    return { id: (rows[0] as { id: string }).id };
+  }
+
+  async listPendingCorrections(status?: string): Promise<PendingCorrection[]> {
+    const rows = status
+      ? await this.sql`
+          SELECT * FROM pending_corrections
+          WHERE status = ${status}
+          ORDER BY submitted_at DESC
+        `
+      : await this.sql`
+          SELECT * FROM pending_corrections
+          ORDER BY submitted_at DESC
+        `;
+    return rows as PendingCorrection[];
   }
 
   async updateMdReview(input: UpdateMdReviewInput): Promise<MdReview & { post_updated: boolean }> {

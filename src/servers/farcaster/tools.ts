@@ -97,6 +97,25 @@ export function registerFarcasterTools(server: McpServer): void {
     },
   );
 
+  // ── farcaster_get_notifications ─────────────────────────────────────
+  server.tool(
+    "farcaster_get_notifications",
+    "Fetch recent Farcaster notifications (mentions and replies) for the SidelineIQ account. Filters to mention and reply types only — ignores likes and recasts. Use nextCursor from the response as the cursor on the next call.",
+    {
+      fid: z.number().int().describe("OTM's Farcaster FID"),
+      cursor: z.string().optional().describe("Pagination cursor from previous call"),
+      limit: z.number().int().min(1).max(50).default(25).optional().describe("Max notifications to return (1-50, default 25)"),
+    },
+    async (input) => {
+      try {
+        const result = await client.getNotifications(input.fid, input.cursor, input.limit ?? 25);
+        return toolSuccess(result);
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
   // ── farcaster_delete_cast ───────────────────────────────────────────
   server.tool(
     "farcaster_delete_cast",
