@@ -12,9 +12,9 @@ export function registerTwitterTools(server: McpServer): void {
   // ── twitter_publish_tweet ───────────────────────────────────────────
   server.tool(
     "twitter_publish_tweet",
-    "Publish a single tweet to X/Twitter. Use for Breaking injury posts. Hard limit of 280 characters enforced. Rejects if content exceeds limit.",
+    "Publish a single tweet to X/Twitter. Use for Breaking and Tracking injury posts. Premium account supports up to 25,000 characters per post.",
     {
-      text: z.string().min(1).max(500).describe("Tweet content. Twitter counts URLs as 23 chars (t.co shortening), so raw strings with long URLs may exceed 280 chars but still be valid."),
+      text: z.string().min(1).max(25000).describe("Tweet content. Premium account supports up to 25,000 characters. Twitter counts URLs as 23 chars (t.co shortening)."),
       reply_to_id: z.string().optional().describe("Tweet ID to reply to"),
     },
     async (input) => {
@@ -30,13 +30,13 @@ export function registerTwitterTools(server: McpServer): void {
   // ── twitter_publish_thread ──────────────────────────────────────────
   server.tool(
     "twitter_publish_thread",
-    "Publish a multi-tweet thread to X/Twitter. Use for Deep Dive injury content. Each tweet max 280 characters. Automatically chains as replies. Maximum 10 tweets per thread.",
+    "Publish a multi-tweet thread to X/Twitter. Use for Deep Dive and Conflict Flag content. Premium account supports up to 25,000 characters per post. Automatically chains as replies. Maximum 10 tweets per thread.",
     {
       tweets: z
-        .array(z.string().min(1).max(500))
+        .array(z.string().min(1).max(25000))
         .min(2)
         .max(10)
-        .describe("Ordered thread content (2-10 tweets). Twitter counts URLs as 23 chars (t.co shortening), so raw strings with long URLs may exceed 280 chars but still be valid."),
+        .describe("Ordered thread content (2-10 tweets). Premium account supports up to 25,000 characters per tweet. Twitter counts URLs as 23 chars (t.co shortening)."),
     },
     async (input) => {
       try {
