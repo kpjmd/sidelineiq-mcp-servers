@@ -58,6 +58,11 @@ export function registerWebTools(server: McpServer): void {
         .min(0)
         .optional()
         .describe("Team's official return timeline in weeks"),
+      injury_date: z
+        .string()
+        .date()
+        .optional()
+        .describe("ISO 8601 date (YYYY-MM-DD) when the injury or surgery originally occurred"),
     },
     async (input) => {
       try {
@@ -83,6 +88,7 @@ export function registerWebTools(server: McpServer): void {
           parent_post_id: input.parent_post_id,
           conflict_reason: input.conflict_reason,
           team_timeline_weeks: input.team_timeline_weeks,
+          injury_date: input.injury_date,
         });
 
         return toolSuccess({
