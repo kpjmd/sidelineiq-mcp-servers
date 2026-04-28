@@ -45,6 +45,7 @@ export interface InjuryPost {
   slug: string | null;
   conflict_reason: string | null;
   team_timeline_weeks: number | null;
+  injury_date: string | null;
   created_at: string;
   updated_at: string;
 }

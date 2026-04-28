@@ -279,6 +279,13 @@ export class WebDatabaseClient {
     return (rows[0] as InjuryPost) ?? null;
   }
 
+  async getPostBySocialId(platform: 'twitter' | 'farcaster', socialId: string): Promise<InjuryPost | null> {
+    const rows = platform === 'twitter'
+      ? await this.sql`SELECT * FROM injury_posts WHERE twitter_id = ${socialId} LIMIT 1`
+      : await this.sql`SELECT * FROM injury_posts WHERE farcaster_hash = ${socialId} LIMIT 1`;
+    return (rows[0] as InjuryPost) ?? null;
+  }
+
   async flagForMdReview(
     id: string,
     reason: string,

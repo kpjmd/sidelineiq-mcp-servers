@@ -257,6 +257,39 @@ export function registerWebTools(server: McpServer): void {
     },
   );
 
+  // ── web_get_post_by_social_id ───────────────────────────────────────
+  server.tool(
+    "web_get_post_by_social_id",
+    "Look up an OTM injury post by its Twitter ID or Farcaster hash — use this to retrieve the original post content when responding to mentions.",
+    {
+      platform: z.enum(["twitter", "farcaster"]).describe("The platform the social ID belongs to"),
+      social_id: z.string().min(1).describe("Twitter tweet ID or Farcaster cast hash"),
+    },
+    async (input) => {
+      try {
+        const post = await client.getPostBySocialId(input.platform, input.social_id);
+        if (!post) {
+          return toolSuccess({ post: null });
+        }
+        return toolSuccess({
+          post: {
+            id: post.id,
+            athlete_name: post.athlete_name,
+            sport: post.sport,
+            team: post.team,
+            injury_type: post.injury_type,
+            content_type: post.content_type,
+            clinical_summary: post.clinical_summary,
+            injury_date: post.injury_date ?? null,
+            slug: post.slug,
+          },
+        });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
   // ── web_flag_for_md_review ──────────────────────────────────────────
   server.tool(
     "web_flag_for_md_review",
