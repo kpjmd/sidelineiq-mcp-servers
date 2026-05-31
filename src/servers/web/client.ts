@@ -802,6 +802,61 @@ export class WebDatabaseClient {
     };
   }
 
+  // ── Post corrections (legacy fact sweep) ─────────────────────────────
+  async applyCorrection(
+    postId: string,
+    field: string,
+    newValue: string,
+    note: string,
+  ): Promise<{ post: InjuryPost; previous_value: string | null }> {
+    // Allowlist: only fields safe to programmatically correct.
+    const allowed = new Set([
+      "team",
+      "injury_type",
+      "injury_severity",
+      "team_timeline_weeks",
+    ]);
+    if (!allowed.has(field)) {
+      throw new McpToolError(
+        `Field '${field}' is not correctable`,
+        `Allowed: ${Array.from(allowed).join(", ")}`,
+      );
+    }
+
+    const beforeRows = await this.sql`
+      SELECT * FROM injury_posts WHERE id = ${postId}
+    `;
+    if (beforeRows.length === 0) {
+      throw new McpToolError(`Post ${postId} not found`, "Verify the post_id.");
+    }
+    const before = beforeRows[0] as Record<string, unknown>;
+    const previousValue = before[field] != null ? String(before[field]) : null;
+
+    // Visible note appended to the public clinical_summary; the existing copy
+    // never gets silently overwritten.
+    const today = new Date().toISOString().slice(0, 10);
+    const updateNote = `\n\nUpdated on ${today}: ${note}`;
+    const newSummary = `${String(before.clinical_summary ?? "")}${updateNote}`;
+
+    // Dynamic UPDATE so we can target the right column.
+    const query = `
+      UPDATE injury_posts
+      SET ${field} = $1,
+          clinical_summary = $2,
+          corrected_at = NOW(),
+          correction_count = correction_count + 1,
+          version = version + 1,
+          updated_at = NOW()
+      WHERE id = $3
+      RETURNING *
+    `;
+    const rows = await this.sql(query, [newValue, newSummary, postId]);
+    return {
+      post: rows[0] as InjuryPost,
+      previous_value: previousValue,
+    };
+  }
+
   // ── Injury entities ──────────────────────────────────────────────────
   async findMatchingEntity(input: FindMatchingEntityInput): Promise<MatchingEntityResult> {
     const recencyDays = input.recency_days ?? 21;
@@ -876,6 +931,23 @@ export class WebDatabaseClient {
       last_team_weeks: (first.last_team_weeks as number | null) ?? null,
       match_count: rows.length,
     };
+  }
+
+  async getEntityForPost(postId: string): Promise<InjuryEntity | null> {
+    // Look up the entity that has this post as its canonical, OR the entity
+    // whose timeline includes this post via injury_updates.
+    const rows = await this.sql`
+      SELECT e.*
+      FROM injury_entities e
+      WHERE e.canonical_post_id = ${postId}
+      UNION
+      SELECT e.*
+      FROM injury_entities e
+      JOIN injury_updates u ON u.entity_id = e.id
+      WHERE u.post_id = ${postId}
+      LIMIT 1
+    `;
+    return (rows[0] as InjuryEntity) ?? null;
   }
 
   async createInjuryEntity(input: {

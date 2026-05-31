@@ -704,6 +704,53 @@ export function registerWebTools(server: McpServer): void {
     },
   );
 
+  // ── web_apply_correction ────────────────────────────────────────────
+  // Used by the legacy fact sweep (and any future manual correction tool).
+  // Updates one allowlisted field on a published post, bumps correction_count,
+  // sets corrected_at, appends a visible "Updated on <date>: <note>" line to
+  // clinical_summary. NEVER silently overwrites — the public copy always shows
+  // that a correction was made.
+  server.tool(
+    "web_apply_correction",
+    "Apply a fact correction to a published injury post. Field must be one of: team, injury_type, injury_severity, team_timeline_weeks. Appends a visible 'Updated on <date>: <note>' line to clinical_summary and bumps correction_count — never a silent overwrite. Caller should follow up with web_append_injury_update kind=CORRECTION and web_audit_append.",
+    {
+      post_id: z.string().uuid(),
+      field: z.enum(["team", "injury_type", "injury_severity", "team_timeline_weeks"]),
+      new_value: z.string().min(1),
+      note: z.string().min(1).describe("Public-facing reason for the correction"),
+    },
+    async (input) => {
+      try {
+        const result = await client.applyCorrection(
+          input.post_id,
+          input.field,
+          input.new_value,
+          input.note,
+        );
+        return toolSuccess(result);
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_get_entity_for_post ─────────────────────────────────────────
+  server.tool(
+    "web_get_entity_for_post",
+    "Look up the injury entity associated with a post — either as the canonical_post_id or via an injury_updates link. Used by the entity backfill script to walk parent_post_id chains and reuse existing entities.",
+    {
+      post_id: z.string().uuid(),
+    },
+    async (input) => {
+      try {
+        const entity = await client.getEntityForPost(input.post_id);
+        return toolSuccess({ entity });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
   // ── web_find_matching_entity ────────────────────────────────────────
   // The injury-identity dedup primitive. Replaces the 24h time-window check.
   // Given a resolved player and the body part / laterality / injury type
