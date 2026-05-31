@@ -1,6 +1,34 @@
 import { getDatabase } from "../../shared/database.js";
 import { McpToolError } from "../../shared/errors.js";
+import { hashPayload } from "../../shared/hash.js";
 import type { InjuryPost, MdReview, MdReviewStatus, PostStatus, Sport, ContentType } from "../../shared/types.js";
+
+// ── Audit log types ──────────────────────────────────────────────────
+export type AuditActor = "system" | "md" | "automation" | "agent";
+
+export interface AuditAppendInput {
+  actor: AuditActor;
+  actor_id?: string;
+  entity_type: string;
+  entity_id?: string;
+  action: string;
+  before?: unknown;
+  after?: unknown;
+  payload?: Record<string, unknown>;
+}
+
+export interface AuditEntry {
+  id: string;
+  ts: string;
+  actor: AuditActor;
+  actor_id: string | null;
+  entity_type: string;
+  entity_id: string | null;
+  action: string;
+  before_hash: string | null;
+  after_hash: string | null;
+  payload: Record<string, unknown> | null;
+}
 
 // ── Social engagement types ───────────────────────────────────────────
 export interface InsertProcessedMentionInput {
@@ -94,6 +122,141 @@ export interface UpdateMdReviewInput {
   id: string;
   status: "APPROVED" | "REJECTED";
   reviewer_notes?: string;
+}
+
+// ── Players & teams ──────────────────────────────────────────────────
+export interface UpsertTeamInput {
+  sport: string;
+  espn_team_id?: string;
+  name: string;
+  abbreviation?: string;
+  location?: string;
+  display_name?: string;
+  conference?: string;
+}
+
+export interface Team {
+  id: string;
+  sport: string;
+  espn_team_id: string | null;
+  name: string;
+  abbreviation: string | null;
+  location: string | null;
+  display_name: string | null;
+  conference: string | null;
+  last_synced_at: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface UpsertPlayerInput {
+  sport: string;
+  espn_athlete_id?: string;
+  full_name: string;
+  current_team_id?: string;
+  position?: string;
+  jersey?: string;
+  prominence_tier?: number;
+  prominence_source?: string;
+}
+
+export interface Player {
+  id: string;
+  sport: string;
+  espn_athlete_id: string | null;
+  full_name: string;
+  normalized_name: string;
+  current_team_id: string | null;
+  position: string | null;
+  jersey: string | null;
+  prominence_tier: number | null;
+  prominence_source: string | null;
+  last_synced_at: string;
+  retired_at: string | null;
+}
+
+export interface ResolvedPlayer {
+  player_id: string;
+  full_name: string;
+  current_team_id: string | null;
+  current_team_name: string | null;
+  current_team_abbreviation: string | null;
+  prominence_tier: number | null;
+  confidence: "exact" | "normalized" | "ambiguous" | "miss";
+  match_count: number;
+}
+
+// ── Injury entities & updates ────────────────────────────────────────
+export type Laterality = "LEFT" | "RIGHT" | "BILATERAL" | "UNSPECIFIED";
+export type EntityStatus = "ACTIVE" | "RESOLVED" | "RETIRED";
+export type UpdateKind =
+  | "INITIAL"
+  | "TRACKING"
+  | "CONFLICT"
+  | "DEEP_DIVE"
+  | "CORRECTION"
+  | "RESOLUTION";
+
+export interface InjuryEntity {
+  id: string;
+  player_id: string;
+  body_part: string | null;
+  laterality: Laterality;
+  injury_type: string | null;
+  status: EntityStatus;
+  canonical_post_id: string | null;
+  first_reported_at: string;
+  last_updated_at: string;
+  actual_return_date: string | null;
+}
+
+export interface InjuryUpdate {
+  id: string;
+  entity_id: string;
+  post_id: string | null;
+  update_kind: UpdateKind;
+  severity_at_time: string | null;
+  team_timeline_weeks: number | null;
+  otm_min_weeks: number | null;
+  source_url: string | null;
+  description: string | null;
+  created_at: string;
+}
+
+export interface FindMatchingEntityInput {
+  player_id: string;
+  body_part?: string;
+  laterality?: Laterality;
+  injury_type?: string;
+  recency_days?: number;
+}
+
+export interface MatchingEntityResult {
+  matched: boolean;
+  entity_id: string | null;
+  canonical_post_id: string | null;
+  body_part: string | null;
+  laterality: Laterality | null;
+  injury_type: string | null;
+  last_update_kind: UpdateKind | null;
+  last_severity: string | null;
+  last_team_weeks: number | null;
+  match_count: number;
+}
+
+// Lowercase, strip diacritics, remove common suffixes, collapse punctuation.
+// Shared between upsert (write) and resolve (read) so both sides agree.
+export function normalizePlayerName(name: string): string {
+  return name
+    .normalize("NFKD")
+    .replace(/[̀-ͯ]/g, "")
+    .toLowerCase()
+    .replace(/[''`]/g, "")
+    .replace(/[^a-z0-9\s.-]/g, " ")
+    .replace(/\b(jr|sr|ii|iii|iv)\.?\b/g, "")
+    .replace(/[.-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 export interface ListPostsFilters {
@@ -480,6 +643,325 @@ export class WebDatabaseClient {
           ORDER BY submitted_at DESC
         `;
     return rows as PendingCorrection[];
+  }
+
+  // ── Teams & players ──────────────────────────────────────────────────
+  async upsertTeam(input: UpsertTeamInput): Promise<Team> {
+    if (input.espn_team_id) {
+      const rows = await this.sql`
+        INSERT INTO teams (
+          sport, espn_team_id, name, abbreviation, location, display_name, conference, last_synced_at, updated_at
+        ) VALUES (
+          ${input.sport}, ${input.espn_team_id}, ${input.name},
+          ${input.abbreviation ?? null}, ${input.location ?? null},
+          ${input.display_name ?? null}, ${input.conference ?? null},
+          NOW(), NOW()
+        )
+        ON CONFLICT (sport, espn_team_id) DO UPDATE SET
+          name = EXCLUDED.name,
+          abbreviation = EXCLUDED.abbreviation,
+          location = EXCLUDED.location,
+          display_name = EXCLUDED.display_name,
+          conference = COALESCE(EXCLUDED.conference, teams.conference),
+          last_synced_at = NOW(),
+          updated_at = NOW()
+        RETURNING *
+      `;
+      return rows[0] as Team;
+    }
+    const rows = await this.sql`
+      INSERT INTO teams (sport, name, abbreviation, location, display_name, conference, last_synced_at, updated_at)
+      VALUES (
+        ${input.sport}, ${input.name}, ${input.abbreviation ?? null},
+        ${input.location ?? null}, ${input.display_name ?? null},
+        ${input.conference ?? null}, NOW(), NOW()
+      )
+      RETURNING *
+    `;
+    return rows[0] as Team;
+  }
+
+  async upsertPlayer(input: UpsertPlayerInput): Promise<Player> {
+    const normalized = normalizePlayerName(input.full_name);
+    if (input.espn_athlete_id) {
+      const rows = await this.sql`
+        INSERT INTO players (
+          sport, espn_athlete_id, full_name, normalized_name, current_team_id,
+          position, jersey, prominence_tier, prominence_source,
+          last_synced_at, updated_at
+        ) VALUES (
+          ${input.sport}, ${input.espn_athlete_id}, ${input.full_name}, ${normalized},
+          ${input.current_team_id ?? null}, ${input.position ?? null},
+          ${input.jersey ?? null}, ${input.prominence_tier ?? null},
+          ${input.prominence_source ?? null}, NOW(), NOW()
+        )
+        ON CONFLICT (sport, espn_athlete_id) DO UPDATE SET
+          full_name = EXCLUDED.full_name,
+          normalized_name = EXCLUDED.normalized_name,
+          current_team_id = COALESCE(EXCLUDED.current_team_id, players.current_team_id),
+          position = COALESCE(EXCLUDED.position, players.position),
+          jersey = COALESCE(EXCLUDED.jersey, players.jersey),
+          prominence_tier = COALESCE(EXCLUDED.prominence_tier, players.prominence_tier),
+          prominence_source = COALESCE(EXCLUDED.prominence_source, players.prominence_source),
+          last_synced_at = NOW(),
+          updated_at = NOW()
+        RETURNING *
+      `;
+      return rows[0] as Player;
+    }
+    // No ESPN id (override-list player). Upsert on (sport, normalized_name).
+    const existing = await this.sql`
+      SELECT * FROM players
+      WHERE sport = ${input.sport} AND normalized_name = ${normalized}
+      LIMIT 1
+    `;
+    if (existing.length > 0) {
+      const id = (existing[0] as Player).id;
+      const rows = await this.sql`
+        UPDATE players SET
+          prominence_tier = COALESCE(${input.prominence_tier ?? null}, prominence_tier),
+          prominence_source = COALESCE(${input.prominence_source ?? null}, prominence_source),
+          updated_at = NOW()
+        WHERE id = ${id}
+        RETURNING *
+      `;
+      return rows[0] as Player;
+    }
+    const rows = await this.sql`
+      INSERT INTO players (
+        sport, full_name, normalized_name, current_team_id,
+        position, jersey, prominence_tier, prominence_source,
+        last_synced_at, updated_at
+      ) VALUES (
+        ${input.sport}, ${input.full_name}, ${normalized},
+        ${input.current_team_id ?? null}, ${input.position ?? null},
+        ${input.jersey ?? null}, ${input.prominence_tier ?? null},
+        ${input.prominence_source ?? null}, NOW(), NOW()
+      )
+      RETURNING *
+    `;
+    return rows[0] as Player;
+  }
+
+  async setPlayerProminence(
+    playerId: string,
+    tier: number,
+    source: string,
+  ): Promise<Player> {
+    const rows = await this.sql`
+      UPDATE players
+      SET prominence_tier = ${tier},
+          prominence_source = ${source},
+          updated_at = NOW()
+      WHERE id = ${playerId}
+      RETURNING *
+    `;
+    if (rows.length === 0) {
+      throw new McpToolError(
+        `Player ${playerId} not found`,
+        "Verify the player id is correct.",
+      );
+    }
+    return rows[0] as Player;
+  }
+
+  async resolvePlayer(name: string, sport?: string): Promise<ResolvedPlayer | null> {
+    const normalized = normalizePlayerName(name);
+    const rows = sport
+      ? await this.sql`
+          SELECT
+            p.id AS player_id, p.full_name, p.prominence_tier,
+            p.current_team_id, t.name AS current_team_name, t.abbreviation AS current_team_abbreviation,
+            p.retired_at
+          FROM players p
+          LEFT JOIN teams t ON t.id = p.current_team_id
+          WHERE p.sport = ${sport} AND p.normalized_name = ${normalized}
+            AND p.retired_at IS NULL
+          LIMIT 5
+        `
+      : await this.sql`
+          SELECT
+            p.id AS player_id, p.full_name, p.prominence_tier,
+            p.current_team_id, t.name AS current_team_name, t.abbreviation AS current_team_abbreviation,
+            p.retired_at
+          FROM players p
+          LEFT JOIN teams t ON t.id = p.current_team_id
+          WHERE p.normalized_name = ${normalized}
+            AND p.retired_at IS NULL
+          LIMIT 5
+        `;
+
+    if (rows.length === 0) return null;
+    const first = rows[0] as Omit<ResolvedPlayer, "confidence" | "match_count">;
+    const confidence: ResolvedPlayer["confidence"] =
+      rows.length > 1 ? "ambiguous" : "normalized";
+    return {
+      ...first,
+      confidence,
+      match_count: rows.length,
+    };
+  }
+
+  // ── Injury entities ──────────────────────────────────────────────────
+  async findMatchingEntity(input: FindMatchingEntityInput): Promise<MatchingEntityResult> {
+    const recencyDays = input.recency_days ?? 21;
+    const bodyPart = input.body_part?.toLowerCase() ?? null;
+    const laterality = input.laterality ?? null;
+    const injuryType = input.injury_type?.toLowerCase() ?? null;
+
+    // Body-part match is exact (lowercased). Laterality match: UNSPECIFIED
+    // ↔ anything, else exact. Injury-type match: substring (covers
+    // "ACL tear" vs "ACL reconstruction").
+    const rows = await this.sql`
+      SELECT e.id, e.canonical_post_id, e.body_part, e.laterality, e.injury_type,
+             u.update_kind AS last_update_kind,
+             u.severity_at_time AS last_severity,
+             u.team_timeline_weeks AS last_team_weeks
+      FROM injury_entities e
+      LEFT JOIN LATERAL (
+        SELECT update_kind, severity_at_time, team_timeline_weeks
+        FROM injury_updates
+        WHERE entity_id = e.id
+        ORDER BY created_at DESC
+        LIMIT 1
+      ) u ON true
+      WHERE e.player_id = ${input.player_id}
+        AND e.status = 'ACTIVE'
+        AND e.last_updated_at >= NOW() - (${recencyDays} || ' days')::interval
+        AND (
+          ${bodyPart}::text IS NULL
+          OR e.body_part IS NULL
+          OR LOWER(e.body_part) = ${bodyPart}
+        )
+        AND (
+          ${laterality}::text IS NULL
+          OR e.laterality = 'UNSPECIFIED'
+          OR ${laterality} = 'UNSPECIFIED'
+          OR e.laterality = ${laterality}
+        )
+        AND (
+          ${injuryType}::text IS NULL
+          OR e.injury_type IS NULL
+          OR LOWER(e.injury_type) LIKE '%' || ${injuryType} || '%'
+          OR ${injuryType} LIKE '%' || LOWER(e.injury_type) || '%'
+        )
+      ORDER BY e.last_updated_at DESC
+      LIMIT 5
+    `;
+
+    if (rows.length === 0) {
+      return {
+        matched: false,
+        entity_id: null,
+        canonical_post_id: null,
+        body_part: null,
+        laterality: null,
+        injury_type: null,
+        last_update_kind: null,
+        last_severity: null,
+        last_team_weeks: null,
+        match_count: 0,
+      };
+    }
+    const first = rows[0] as Record<string, unknown>;
+    return {
+      matched: true,
+      entity_id: first.id as string,
+      canonical_post_id: (first.canonical_post_id as string | null) ?? null,
+      body_part: (first.body_part as string | null) ?? null,
+      laterality: (first.laterality as Laterality | null) ?? null,
+      injury_type: (first.injury_type as string | null) ?? null,
+      last_update_kind: (first.last_update_kind as UpdateKind | null) ?? null,
+      last_severity: (first.last_severity as string | null) ?? null,
+      last_team_weeks: (first.last_team_weeks as number | null) ?? null,
+      match_count: rows.length,
+    };
+  }
+
+  async createInjuryEntity(input: {
+    player_id: string;
+    body_part?: string;
+    laterality?: Laterality;
+    injury_type?: string;
+    canonical_post_id?: string;
+  }): Promise<InjuryEntity> {
+    const rows = await this.sql`
+      INSERT INTO injury_entities (
+        player_id, body_part, laterality, injury_type, canonical_post_id,
+        first_reported_at, last_updated_at, updated_at
+      ) VALUES (
+        ${input.player_id}, ${input.body_part ?? null},
+        ${input.laterality ?? 'UNSPECIFIED'}, ${input.injury_type ?? null},
+        ${input.canonical_post_id ?? null}, NOW(), NOW(), NOW()
+      )
+      RETURNING *
+    `;
+    return rows[0] as InjuryEntity;
+  }
+
+  async appendInjuryUpdate(input: {
+    entity_id: string;
+    post_id?: string;
+    update_kind: UpdateKind;
+    severity_at_time?: string;
+    team_timeline_weeks?: number;
+    otm_min_weeks?: number;
+    source_url?: string;
+    description?: string;
+  }): Promise<InjuryUpdate> {
+    const rows = await this.sql`
+      INSERT INTO injury_updates (
+        entity_id, post_id, update_kind, severity_at_time,
+        team_timeline_weeks, otm_min_weeks, source_url, description
+      ) VALUES (
+        ${input.entity_id}, ${input.post_id ?? null}, ${input.update_kind},
+        ${input.severity_at_time ?? null}, ${input.team_timeline_weeks ?? null},
+        ${input.otm_min_weeks ?? null}, ${input.source_url ?? null},
+        ${input.description ?? null}
+      )
+      RETURNING *
+    `;
+    // Bump entity's last_updated_at so future recency window matches.
+    await this.sql`
+      UPDATE injury_entities SET last_updated_at = NOW(), updated_at = NOW()
+      WHERE id = ${input.entity_id}
+    `;
+    return rows[0] as InjuryUpdate;
+  }
+
+  // ── Audit log ────────────────────────────────────────────────────────
+  async auditAppend(input: AuditAppendInput): Promise<AuditEntry> {
+    const beforeHash = input.before !== undefined ? hashPayload(input.before) : null;
+    const afterHash = input.after !== undefined ? hashPayload(input.after) : null;
+    const payload = input.payload ?? null;
+
+    const rows = await this.sql`
+      INSERT INTO audit_log (
+        actor, actor_id, entity_type, entity_id, action,
+        before_hash, after_hash, payload
+      ) VALUES (
+        ${input.actor}, ${input.actor_id ?? null},
+        ${input.entity_type}, ${input.entity_id ?? null}, ${input.action},
+        ${beforeHash}, ${afterHash},
+        ${payload ? JSON.stringify(payload) : null}
+      )
+      RETURNING *
+    `;
+    return rows[0] as AuditEntry;
+  }
+
+  async listAuditEntries(
+    entityType: string,
+    entityId: string,
+    limit = 100,
+  ): Promise<AuditEntry[]> {
+    const rows = await this.sql`
+      SELECT * FROM audit_log
+      WHERE entity_type = ${entityType} AND entity_id = ${entityId}
+      ORDER BY ts DESC
+      LIMIT ${limit}
+    `;
+    return rows as AuditEntry[];
   }
 
   async updateMdReview(input: UpdateMdReviewInput): Promise<MdReview & { post_updated: boolean }> {

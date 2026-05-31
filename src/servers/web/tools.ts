@@ -611,4 +611,234 @@ export function registerWebTools(server: McpServer): void {
       }
     },
   );
+
+  // ── web_upsert_team ─────────────────────────────────────────────────
+  server.tool(
+    "web_upsert_team",
+    "Upsert a team row from ESPN's teams endpoint. Conflict resolution: (sport, espn_team_id). Used by the roster-sync cycle that runs every 6h to keep teams current with trades and rebrands.",
+    {
+      sport: sportEnum,
+      espn_team_id: z.string().optional(),
+      name: z.string().min(1),
+      abbreviation: z.string().optional(),
+      location: z.string().optional(),
+      display_name: z.string().optional(),
+      conference: z.string().optional(),
+    },
+    async (input) => {
+      try {
+        const team = await client.upsertTeam(input);
+        return toolSuccess({ team });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_upsert_player ───────────────────────────────────────────────
+  server.tool(
+    "web_upsert_player",
+    "Upsert a player row from ESPN's roster endpoints (or the athlete-tier override list). Conflict resolution: (sport, espn_athlete_id) when ESPN id present, else (sport, normalized_name). The server canonicalizes full_name into normalized_name (lowercase, no diacritics, Jr/Sr stripped) to make later resolve() lookups deterministic.",
+    {
+      sport: sportEnum,
+      espn_athlete_id: z.string().optional(),
+      full_name: z.string().min(1),
+      current_team_id: z.string().uuid().optional(),
+      position: z.string().optional(),
+      jersey: z.string().optional(),
+      prominence_tier: z.number().int().min(1).max(4).optional(),
+      prominence_source: z.enum(["espn", "override", "default"]).optional(),
+    },
+    async (input) => {
+      try {
+        const player = await client.upsertPlayer(input);
+        return toolSuccess({ player });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_set_player_prominence ───────────────────────────────────────
+  // Used by the athlete-tier override migration (data/athlete-tiers.json) and
+  // future manual overrides of ESPN-default prominence.
+  server.tool(
+    "web_set_player_prominence",
+    "Override the prominence_tier for a specific player. Used by the athlete-tier override import and any future manual prominence adjustments. prominence_source signals where the value came from for auditability ('override' for the JSON file, 'manual' for dashboard edits).",
+    {
+      player_id: z.string().uuid(),
+      tier: z.number().int().min(1).max(4),
+      source: z.string().min(1).default("override"),
+    },
+    async (input) => {
+      try {
+        const player = await client.setPlayerProminence(input.player_id, input.tier, input.source);
+        return toolSuccess({ player });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_resolve_player ──────────────────────────────────────────────
+  // The single function the fact-validator depends on: given a name + sport
+  // from an incoming injury report, return the canonical player record so the
+  // validator can compare reportedTeamName against the actual current team.
+  server.tool(
+    "web_resolve_player",
+    "Resolve an athlete name to a canonical player record (with current team). Returns confidence='normalized' on a unique match, 'ambiguous' on multiple matches (caller should escalate to review), null on miss. This is the lookup that catches Luka-tagged-Lakers-class errors at ingestion time.",
+    {
+      name: z.string().min(1),
+      sport: sportEnum.optional(),
+    },
+    async (input) => {
+      try {
+        const player = await client.resolvePlayer(input.name, input.sport);
+        if (!player) {
+          return toolSuccess({ resolved: false, player: null });
+        }
+        return toolSuccess({ resolved: true, player });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_find_matching_entity ────────────────────────────────────────
+  // The injury-identity dedup primitive. Replaces the 24h time-window check.
+  // Given a resolved player and the body part / laterality / injury type
+  // extracted from an incoming event, return the matching active entity (if
+  // any) within recency_days. UNSPECIFIED laterality matches anything.
+  server.tool(
+    "web_find_matching_entity",
+    "Find an active injury entity matching player + body part + laterality + injury type within a recency window. Returns the most recent matching entity (with last update's severity + team_timeline_weeks for delta-decision purposes) or matched=false if nothing matches.",
+    {
+      player_id: z.string().uuid(),
+      body_part: z.string().optional(),
+      laterality: z.enum(["LEFT", "RIGHT", "BILATERAL", "UNSPECIFIED"]).optional(),
+      injury_type: z.string().optional(),
+      recency_days: z.number().int().min(1).max(365).default(21),
+    },
+    async (input) => {
+      try {
+        const result = await client.findMatchingEntity(input);
+        return toolSuccess(result);
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_create_injury_entity ────────────────────────────────────────
+  server.tool(
+    "web_create_injury_entity",
+    "Create a new injury entity. Called once per real-world injury — subsequent updates use web_append_injury_update. canonical_post_id should point to the originating BREAKING/DEEP_DIVE post when one exists.",
+    {
+      player_id: z.string().uuid(),
+      body_part: z.string().optional(),
+      laterality: z.enum(["LEFT", "RIGHT", "BILATERAL", "UNSPECIFIED"]).optional(),
+      injury_type: z.string().optional(),
+      canonical_post_id: z.string().uuid().optional(),
+    },
+    async (input) => {
+      try {
+        const entity = await client.createInjuryEntity(input);
+        return toolSuccess({ entity });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_append_injury_update ────────────────────────────────────────
+  server.tool(
+    "web_append_injury_update",
+    "Append an update to an injury entity's timeline. post_id is nullable (repeat source reports about the same injury append updates without producing a new post). Bumps the entity's last_updated_at so future recency-window matches stay current.",
+    {
+      entity_id: z.string().uuid(),
+      post_id: z.string().uuid().optional(),
+      update_kind: z.enum([
+        "INITIAL",
+        "TRACKING",
+        "CONFLICT",
+        "DEEP_DIVE",
+        "CORRECTION",
+        "RESOLUTION",
+      ]),
+      severity_at_time: severityEnum.optional(),
+      team_timeline_weeks: z.number().int().min(0).optional(),
+      otm_min_weeks: z.number().int().min(0).optional(),
+      source_url: z.string().url().optional(),
+      description: z.string().optional(),
+    },
+    async (input) => {
+      try {
+        const update = await client.appendInjuryUpdate(input);
+        return toolSuccess({ update });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_audit_append ────────────────────────────────────────────────
+  // Append-only audit trail. Every pipeline stage and MD action SHOULD write
+  // one entry here. before/after are full payloads; the server hashes them
+  // (canonical-JSON SHA-256) and stores hash + raw payload.
+  server.tool(
+    "web_audit_append",
+    "Append an immutable audit entry. Used at every pipeline stage (ingest, validate, draft, attest, publish, correct, retract). before/after payloads are hashed server-side using canonical-JSON SHA-256.",
+    {
+      actor: z
+        .enum(["system", "md", "automation", "agent"])
+        .describe("Who/what triggered this action"),
+      actor_id: z
+        .string()
+        .optional()
+        .describe("Identifier within actor scope (e.g. MD user id, agent name)"),
+      entity_type: z
+        .string()
+        .min(1)
+        .describe("Domain of the thing being acted on (e.g. injury_post, desk_post, injury_entity)"),
+      entity_id: z.string().uuid().optional().describe("Entity row id when applicable"),
+      action: z.string().min(1).describe("Verb describing the change (e.g. publish, attest, fact_validate)"),
+      before: z.unknown().optional().describe("Full prior state for diff/replay"),
+      after: z.unknown().optional().describe("Full new state for diff/replay"),
+      payload: z
+        .record(z.unknown())
+        .optional()
+        .describe("Free-form context (validation result codes, MD notes, etc.)"),
+    },
+    async (input) => {
+      try {
+        const entry = await client.auditAppend(input);
+        return toolSuccess({ id: entry.id, ts: entry.ts });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_list_audit_entries ──────────────────────────────────────────
+  server.tool(
+    "web_list_audit_entries",
+    "List audit entries for one entity in reverse-chronological order. Use to reconstruct the history of a post, desk piece, or entity for review/defensibility.",
+    {
+      entity_type: z.string().min(1).describe("Domain of the entity"),
+      entity_id: z.string().uuid().describe("Entity row id"),
+      limit: z.number().int().min(1).max(500).default(100),
+    },
+    async (input) => {
+      try {
+        const entries = await client.listAuditEntries(
+          input.entity_type,
+          input.entity_id,
+          input.limit,
+        );
+        return toolSuccess({ entries });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
 }
