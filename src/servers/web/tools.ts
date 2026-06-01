@@ -293,7 +293,7 @@ export function registerWebTools(server: McpServer): void {
   // ── web_flag_for_md_review ──────────────────────────────────────────
   server.tool(
     "web_flag_for_md_review",
-    "Flag an injury post for MD review. Sets post status to PENDING_REVIEW and creates a review record in the admin dashboard. Called when confidence is below threshold or injury is high-profile.",
+    "Flag an injury post for MD review. By default sets post status to PENDING_REVIEW (correct for new agent-generated content that hasn't published yet). Pass preserve_status=true for retrospective flags on already-PUBLISHED posts (legacy fact sweep, post-hoc audits) so the live post isn't pulled out of PUBLISHED filters.",
     {
       post_id: z.string().uuid().describe("The post ID to flag"),
       reason: z.string().min(1).describe("Why MD review is needed"),
@@ -303,6 +303,12 @@ export function registerWebTools(server: McpServer): void {
         .max(1)
         .describe("Confidence score that triggered the review (0-1)"),
       flagged_by: z.string().min(1).describe("Which agent flagged it"),
+      preserve_status: z
+        .boolean()
+        .default(false)
+        .describe(
+          "When true, do NOT flip post status to PENDING_REVIEW. Use for retrospective flags on already-published posts.",
+        ),
     },
     async (input) => {
       try {
@@ -311,6 +317,7 @@ export function registerWebTools(server: McpServer): void {
           input.reason,
           input.confidence_score,
           input.flagged_by,
+          input.preserve_status,
         );
 
         return toolSuccess({

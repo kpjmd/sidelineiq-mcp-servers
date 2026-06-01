@@ -454,18 +454,33 @@ export class WebDatabaseClient {
     reason: string,
     confidenceScore: number,
     flaggedBy: string,
+    preserveStatus = false,
   ): Promise<InjuryPost> {
-    const rows = await this.sql`
-      UPDATE injury_posts
-      SET
-        status = 'PENDING_REVIEW',
-        md_review_required = true,
-        md_review_reason = ${reason},
-        md_review_confidence = ${confidenceScore},
-        updated_at = NOW()
-      WHERE id = ${id}
-      RETURNING *
-    `;
+    // preserveStatus=true is for retrospective flags on already-PUBLISHED posts
+    // (legacy fact sweep, post-hoc audits). The default behavior — flipping to
+    // PENDING_REVIEW — is correct for new agent-generated content that hasn't
+    // published yet, but applying it to live posts pulls them out of any
+    // "PUBLISHED only" filter and creates confusing review-queue states.
+    const rows = preserveStatus
+      ? await this.sql`
+          UPDATE injury_posts
+          SET md_review_required = true,
+              md_review_reason = ${reason},
+              md_review_confidence = ${confidenceScore},
+              updated_at = NOW()
+          WHERE id = ${id}
+          RETURNING *
+        `
+      : await this.sql`
+          UPDATE injury_posts
+          SET status = 'PENDING_REVIEW',
+              md_review_required = true,
+              md_review_reason = ${reason},
+              md_review_confidence = ${confidenceScore},
+              updated_at = NOW()
+          WHERE id = ${id}
+          RETURNING *
+        `;
 
     if (rows.length === 0) {
       throw new McpToolError(
