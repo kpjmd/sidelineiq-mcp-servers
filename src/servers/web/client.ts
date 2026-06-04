@@ -244,6 +244,42 @@ export interface MatchingEntityResult {
   match_count: number;
 }
 
+// ── Desk candidates (Phase 1 promotion path) ─────────────────────────
+export type CandidateStatus = "PROPOSED" | "ACCEPTED" | "DISMISSED" | "PROMOTED";
+
+export interface DeskCandidate {
+  id: string;
+  entity_id: string;
+  source_post_id: string | null;
+  promotion_score: number;
+  reasons: unknown;
+  status: CandidateStatus;
+  proposed_at: string;
+  decided_at: string | null;
+  decided_by: string | null;
+}
+
+export interface ProposeCandidateInput {
+  entity_id: string;
+  source_post_id?: string;
+  promotion_score: number;
+  reasons?: unknown;
+  // Origin of the proposal: 'system' for auto, MD user id for manual promote.
+  proposed_by?: string;
+}
+
+// A candidate joined to the display fields the Candidates queue needs so the
+// frontend doesn't have to fan out per-row lookups.
+export interface CandidateListItem extends DeskCandidate {
+  athlete_name: string | null;
+  sport: string | null;
+  body_part: string | null;
+  laterality: Laterality | null;
+  injury_type: string | null;
+  headline: string | null;
+  slug: string | null;
+}
+
 // Lowercase, strip diacritics, remove common suffixes, collapse punctuation.
 // Shared between upsert (write) and resolve (read) so both sides agree.
 export function normalizePlayerName(name: string): string {
@@ -1049,6 +1085,104 @@ export class WebDatabaseClient {
       LIMIT ${limit}
     `;
     return rows as AuditEntry[];
+  }
+
+  // ── Desk candidates (Phase 1 promotion path) ──────────────────────────
+  // Upsert the OPEN proposal for an entity. If a PROPOSED candidate already
+  // exists (uniq_open_candidate_per_entity), refresh its score/reasons/source
+  // in place instead of inserting a duplicate. Decided rows are untouched.
+  async proposeCandidate(input: ProposeCandidateInput): Promise<DeskCandidate> {
+    const reasons = input.reasons !== undefined ? JSON.stringify(input.reasons) : null;
+    const rows = await this.sql`
+      INSERT INTO desk_candidates (
+        entity_id, source_post_id, promotion_score, reasons, status
+      ) VALUES (
+        ${input.entity_id}, ${input.source_post_id ?? null},
+        ${input.promotion_score}, ${reasons}, 'PROPOSED'
+      )
+      ON CONFLICT (entity_id) WHERE status = 'PROPOSED'
+      DO UPDATE SET
+        source_post_id = EXCLUDED.source_post_id,
+        promotion_score = EXCLUDED.promotion_score,
+        reasons = EXCLUDED.reasons,
+        proposed_at = NOW(),
+        updated_at = NOW()
+      RETURNING *
+    `;
+    const candidate = rows[0] as DeskCandidate;
+    await this.auditAppend({
+      actor: input.proposed_by && input.proposed_by !== "system" ? "md" : "system",
+      actor_id: input.proposed_by ?? "promotion-scorer",
+      entity_type: "desk_candidate",
+      entity_id: candidate.id,
+      action: "propose_candidate",
+      payload: {
+        injury_entity_id: input.entity_id,
+        source_post_id: input.source_post_id ?? null,
+        promotion_score: input.promotion_score,
+        reasons: input.reasons ?? null,
+      },
+    });
+    return candidate;
+  }
+
+  async listCandidates(status?: CandidateStatus, limit = 100): Promise<CandidateListItem[]> {
+    const base = `
+      SELECT
+        c.*,
+        p.full_name      AS athlete_name,
+        e.injury_type    AS injury_type,
+        e.body_part      AS body_part,
+        e.laterality     AS laterality,
+        pl.sport         AS sport,
+        pl.headline      AS headline,
+        pl.slug          AS slug
+      FROM desk_candidates c
+      JOIN injury_entities e ON e.id = c.entity_id
+      LEFT JOIN players p     ON p.id = e.player_id
+      LEFT JOIN injury_posts pl ON pl.id = c.source_post_id
+    `;
+    const rows = status
+      ? await this.sql(
+          `${base} WHERE c.status = $1 ORDER BY c.promotion_score DESC, c.proposed_at DESC LIMIT $2`,
+          [status, limit],
+        )
+      : await this.sql(
+          `${base} ORDER BY c.promotion_score DESC, c.proposed_at DESC LIMIT $1`,
+          [limit],
+        );
+    return rows as CandidateListItem[];
+  }
+
+  // MD triage. PROPOSED → ACCEPTED | DISMISSED. (PROMOTED is set in Phase 2
+  // when an accepted candidate actually produces a desk_post.)
+  async decideCandidate(
+    candidateId: string,
+    decision: "ACCEPTED" | "DISMISSED",
+    decidedBy: string,
+  ): Promise<DeskCandidate> {
+    const rows = await this.sql`
+      UPDATE desk_candidates
+      SET status = ${decision}, decided_at = NOW(), decided_by = ${decidedBy}, updated_at = NOW()
+      WHERE id = ${candidateId} AND status = 'PROPOSED'
+      RETURNING *
+    `;
+    if (rows.length === 0) {
+      throw new McpToolError(
+        `Candidate ${candidateId} not found or already decided`,
+        "Only PROPOSED candidates can be decided. Use web_list_candidates to find open candidates.",
+      );
+    }
+    const candidate = rows[0] as DeskCandidate;
+    await this.auditAppend({
+      actor: "md",
+      actor_id: decidedBy,
+      entity_type: "desk_candidate",
+      entity_id: candidate.id,
+      action: decision === "ACCEPTED" ? "accept_candidate" : "dismiss_candidate",
+      payload: { injury_entity_id: candidate.entity_id, decision },
+    });
+    return candidate;
   }
 
   async updateMdReview(input: UpdateMdReviewInput): Promise<MdReview & { post_updated: boolean }> {
