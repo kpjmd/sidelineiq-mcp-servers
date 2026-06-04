@@ -895,4 +895,76 @@ export function registerWebTools(server: McpServer): void {
       }
     },
   );
+
+  // ── web_propose_candidate ───────────────────────────────────────────
+  // Phase 1 promotion path. Proposes (or refreshes) an OPEN Injury-Desk
+  // candidate for an entity. Upserts the single PROPOSED row per entity so
+  // re-proposals don't pile up. proposed_by='system' for auto-proposals, or
+  // the MD user id when the human clicks "Promote to Injury Desk".
+  server.tool(
+    "web_propose_candidate",
+    "Propose (or refresh) an Injury Desk promotion candidate for an injury entity. Upserts the single open PROPOSED candidate per entity — re-proposing updates the score/reasons in place rather than creating a duplicate. Does NOT publish anything; it queues the entity for MD triage. promotion_score is 0-100; reasons is the per-term contribution breakdown for display/audit.",
+    {
+      entity_id: z.string().uuid(),
+      source_post_id: z.string().uuid().optional(),
+      promotion_score: z.number().min(0).max(100),
+      reasons: z.unknown().optional(),
+      proposed_by: z
+        .string()
+        .optional()
+        .describe("'system' for auto-proposals, or MD user id for manual promote"),
+    },
+    async (input) => {
+      try {
+        const candidate = await client.proposeCandidate(input);
+        return toolSuccess({ candidate });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_list_candidates ─────────────────────────────────────────────
+  server.tool(
+    "web_list_candidates",
+    "List Injury Desk promotion candidates, joined to athlete/entity/post display fields, ordered by promotion_score. Filter by status (PROPOSED for the open queue). Use to render the Candidates tab in /admin.",
+    {
+      status: z.enum(["PROPOSED", "ACCEPTED", "DISMISSED", "PROMOTED"]).optional(),
+      limit: z.number().int().min(1).max(500).default(100),
+    },
+    async (input) => {
+      try {
+        const candidates = await client.listCandidates(input.status, input.limit);
+        return toolSuccess({ candidates });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_decide_candidate ────────────────────────────────────────────
+  // MD triage. Only PROPOSED candidates can be decided. ACCEPTED parks the
+  // candidate for Phase 2 desk_post creation; DISMISSED closes it. Both are
+  // audited. PROMOTED is reserved for Phase 2 (set when a desk_post is made).
+  server.tool(
+    "web_decide_candidate",
+    "Record an MD decision on a promotion candidate: ACCEPTED (park for Injury Desk authoring) or DISMISSED (close). Only PROPOSED candidates can be decided. Audited. decided_by should be the MD user id.",
+    {
+      candidate_id: z.string().uuid(),
+      decision: z.enum(["ACCEPTED", "DISMISSED"]),
+      decided_by: z.string().min(1).describe("MD user id (or 'md' until NextAuth lands in Phase 2)"),
+    },
+    async (input) => {
+      try {
+        const candidate = await client.decideCandidate(
+          input.candidate_id,
+          input.decision,
+          input.decided_by,
+        );
+        return toolSuccess({ candidate });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
 }
