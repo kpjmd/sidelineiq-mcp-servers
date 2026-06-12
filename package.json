@@ -21,6 +21,7 @@
     "lint": "tsc --noEmit"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.80.0",
     "@modelcontextprotocol/sdk": "^1.12.1",
     "@neondatabase/serverless": "^0.10.4",
     "dotenv": "^16.4.7",

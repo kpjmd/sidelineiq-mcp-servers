@@ -6,12 +6,32 @@ vi.mock("../src/shared/database.js", () => ({
   getDatabase: () => mockSql,
 }));
 
+// Mock the Haiku framing classifier — the only network-touching seam in the
+// linter. Default unconfigured (regex-only, no network); classifier-path tests
+// flip classifierConfigured to true and stub classifyDeskPost per case.
+vi.mock("../src/servers/web/linter-classifier.js", () => ({
+  classifierConfigured: vi.fn(() => false),
+  classifyDeskPost: vi.fn(),
+}));
+
 // Mock env vars
 vi.stubEnv("DATABASE_URL", "postgresql://test:test@localhost:5432/test");
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerWebTools } from "../src/servers/web/tools.js";
 import { hashPayload } from "../src/shared/hash.js";
+import { TIER2_DISCLAIMER } from "../src/servers/web/disclaimer.js";
+import { classifierConfigured, classifyDeskPost } from "../src/servers/web/linter-classifier.js";
+import {
+  checkCareerPrognosis,
+  checkDiagnosisAsFact,
+  checkDisclaimer,
+  checkSourceAttribution,
+  checkNonPublicDetailRegex,
+} from "../src/servers/web/linter.js";
+
+const mockClassifierConfigured = vi.mocked(classifierConfigured);
+const mockClassifyDeskPost = vi.mocked(classifyDeskPost);
 
 interface RegisteredTool {
   handler: (args: Record<string, unknown>, extra: unknown) => Promise<unknown>;
@@ -82,6 +102,10 @@ const sampleReview = {
 describe("Web MCP Server", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Re-assert classifier defaults (clearAllMocks keeps implementations, so a
+    // prior test's override would otherwise leak): unconfigured, empty result.
+    mockClassifierConfigured.mockReturnValue(false);
+    mockClassifyDeskPost.mockResolvedValue([]);
   });
 
   describe("web_create_injury_post", () => {
@@ -620,7 +644,14 @@ describe("Web MCP Server", () => {
   const CANDIDATE_ID = "990e8400-e29b-41d4-a716-446655440000";
   const ENTITY_ID = "aa0e8400-e29b-41d4-a716-446655440000";
   const AUTHOR_ID = mdUserRow.id;
-  const BODY = "Public reporting indicates a left knee injury; general educational analysis follows.";
+  // A lint-clean body: hedged framing, a markdown source link, and the canonical
+  // Tier 2 disclaimer. Keeping it clean means the existing publish/attest tests
+  // (which rely on zero blockers) stay green now that the linter is real.
+  const BODY =
+    "Public reporting indicates a left knee issue. According to " +
+    "[ESPN](https://espn.com/story), the team has not shared a timeline. " +
+    "This is general educational analysis. " +
+    TIER2_DISCLAIMER;
 
   function deskPost(overrides: Record<string, unknown> = {}) {
     return {
@@ -754,14 +785,66 @@ describe("Web MCP Server", () => {
   });
 
   describe("desk_lint", () => {
-    it("returns empty warnings/blockers for a found post (2C stub)", async () => {
+    it("returns no blockers for a clean, disclaimed, sourced body", async () => {
       mockSql.mockResolvedValueOnce([deskPost()]);
       const tool = getTool(createTestServer(), "desk_lint");
       const result = (await tool.handler({ desk_post_id: DESK_POST_ID }, {})) as ToolResult;
       expect(result.isError).toBeUndefined();
       const data = JSON.parse(result.content[0].text);
-      expect(data.warnings).toEqual([]);
       expect(data.blockers).toEqual([]);
+      // Classifier mocked unconfigured → fail-open warning; deterministic checks still ran.
+      expect(data.warnings.map((w: { code: string }) => w.code)).toContain("classifier_unavailable");
+    });
+
+    it("blocks a body that violates every deterministic rule", async () => {
+      mockSql.mockResolvedValueOnce([
+        deskPost({ markdown_body: "He tore his ACL and is done for good." }),
+      ]);
+      const tool = getTool(createTestServer(), "desk_lint");
+      const result = (await tool.handler({ desk_post_id: DESK_POST_ID }, {})) as ToolResult;
+      expect(result.isError).toBeUndefined();
+      const data = JSON.parse(result.content[0].text);
+      const codes = data.blockers.map((b: { code: string }) => b.code);
+      expect(codes).toContain("diagnosis_as_fact");
+      expect(codes).toContain("career_prognosis");
+      expect(codes).toContain("missing_disclaimer");
+      expect(codes).toContain("missing_source_attribution");
+    });
+
+    it("clears the disclaimer blocker once the canonical footer is present", async () => {
+      mockSql.mockResolvedValueOnce([
+        deskPost({ markdown_body: `See [ESPN](https://espn.com). ${TIER2_DISCLAIMER}` }),
+      ]);
+      const tool = getTool(createTestServer(), "desk_lint");
+      const result = (await tool.handler({ desk_post_id: DESK_POST_ID }, {})) as ToolResult;
+      const data = JSON.parse(result.content[0].text);
+      const codes = data.blockers.map((b: { code: string }) => b.code);
+      expect(codes).not.toContain("missing_disclaimer");
+      expect(codes).not.toContain("missing_source_attribution");
+    });
+
+    it("adds a classifier blocker when configured", async () => {
+      mockClassifierConfigured.mockReturnValue(true);
+      mockClassifyDeskPost.mockResolvedValue([
+        { code: "diagnosis_as_fact", severity: "blocker", message: "paraphrased diagnosis" },
+      ]);
+      mockSql.mockResolvedValueOnce([deskPost()]); // clean regex body
+      const tool = getTool(createTestServer(), "desk_lint");
+      const result = (await tool.handler({ desk_post_id: DESK_POST_ID }, {})) as ToolResult;
+      const data = JSON.parse(result.content[0].text);
+      expect(data.blockers.map((b: { code: string }) => b.code)).toContain("diagnosis_as_fact");
+      expect(data.warnings.map((w: { code: string }) => w.code)).not.toContain("classifier_unavailable");
+    });
+
+    it("fails open with a warning when the classifier throws", async () => {
+      mockClassifierConfigured.mockReturnValue(true);
+      mockClassifyDeskPost.mockRejectedValue(new Error("Anthropic 529"));
+      mockSql.mockResolvedValueOnce([deskPost()]); // clean regex body
+      const tool = getTool(createTestServer(), "desk_lint");
+      const result = (await tool.handler({ desk_post_id: DESK_POST_ID }, {})) as ToolResult;
+      const data = JSON.parse(result.content[0].text);
+      expect(data.blockers).toEqual([]); // clean body → no classifier blocker leaks through
+      expect(data.warnings.map((w: { code: string }) => w.code)).toContain("classifier_unavailable");
     });
 
     it("errors on an unknown post", async () => {
@@ -900,6 +983,41 @@ describe("Web MCP Server", () => {
       const result = (await tool.handler(input, {})) as ToolResult;
       expect(result.isError).toBe(true);
     });
+
+    it("blocks when the body trips a regex blocker, even with role+hash OK", async () => {
+      const dirty = BODY + " His career is over — done for good.";
+      mockSql
+        .mockResolvedValueOnce([deskPost({ status: "READY", markdown_body: dirty })]) // select post
+        .mockResolvedValueOnce([mdUserRow]) // getUser
+        .mockResolvedValueOnce([attestation({ content_hash: hashPayload(dirty) })]) // hash matches
+        .mockResolvedValueOnce([{ id: "audit" }]); // blocked audit
+      const tool = getTool(createTestServer(), "desk_publish");
+      const result = (await tool.handler(input, {})) as ToolResult;
+      const data = JSON.parse(result.content[0].text);
+      expect(data.published).toBe(false);
+      expect(data.gate.role_ok).toBe(true);
+      expect(data.gate.hash_match).toBe(true);
+      expect(data.gate.blockers.map((b: { code: string }) => b.code)).toContain("career_prognosis");
+    });
+
+    it("blocks when the classifier returns a blocker, even with role+hash OK", async () => {
+      mockClassifierConfigured.mockReturnValue(true);
+      mockClassifyDeskPost.mockResolvedValue([
+        { code: "diagnosis_as_fact", severity: "blocker", message: "paraphrased diagnosis" },
+      ]);
+      mockSql
+        .mockResolvedValueOnce([deskPost({ status: "READY" })]) // select post (clean regex body)
+        .mockResolvedValueOnce([mdUserRow]) // getUser
+        .mockResolvedValueOnce([attestation({ content_hash: hashPayload(BODY) })]) // hash matches
+        .mockResolvedValueOnce([{ id: "audit" }]); // blocked audit
+      const tool = getTool(createTestServer(), "desk_publish");
+      const result = (await tool.handler(input, {})) as ToolResult;
+      const data = JSON.parse(result.content[0].text);
+      expect(data.published).toBe(false);
+      expect(data.gate.role_ok).toBe(true);
+      expect(data.gate.hash_match).toBe(true);
+      expect(data.gate.blockers.map((b: { code: string }) => b.code)).toContain("diagnosis_as_fact");
+    });
   });
 
   describe("desk_retract", () => {
@@ -962,5 +1080,50 @@ describe("Web MCP Server", () => {
       const result = (await tool.handler({ desk_post_id: DESK_POST_ID }, {})) as ToolResult;
       expect(result.isError).toBe(true);
     });
+  });
+});
+
+// Pure deterministic linter rules — no server, no sql, no network.
+describe("linter regex rules", () => {
+  it("checkCareerPrognosis flags career-prognosis language", () => {
+    expect(checkCareerPrognosis("This could be career-ending.")).toHaveLength(1);
+    expect(checkCareerPrognosis("He may never play again.")).toHaveLength(1);
+    expect(checkCareerPrognosis("This is done for good.")).toHaveLength(1);
+    expect(checkCareerPrognosis("A short recovery is expected.")).toHaveLength(0);
+  });
+
+  it("checkDiagnosisAsFact flags definitive structure claims but not hedged ones", () => {
+    expect(checkDiagnosisAsFact("He tore his ACL.")).toHaveLength(1);
+    expect(checkDiagnosisAsFact("He has a torn labrum.")).toHaveLength(1);
+    expect(checkDiagnosisAsFact("He reportedly tore his ACL.")).toHaveLength(0);
+    expect(checkDiagnosisAsFact("According to ESPN, he has a torn labrum.")).toHaveLength(0);
+    expect(checkDiagnosisAsFact("General ACL recovery takes months.")).toHaveLength(0);
+  });
+
+  it("checkDisclaimer requires the canonical footer", () => {
+    expect(checkDisclaimer({ title: "t", markdown_body: "no footer here" })).toHaveLength(1);
+    expect(
+      checkDisclaimer({ title: "t", markdown_body: `analysis. ${TIER2_DISCLAIMER}` }),
+    ).toHaveLength(0);
+  });
+
+  it("checkSourceAttribution accepts a link, <cite>, or structured sources", () => {
+    expect(checkSourceAttribution({ title: "t", markdown_body: "plain text" })).toHaveLength(1);
+    expect(
+      checkSourceAttribution({ title: "t", markdown_body: "see [ESPN](https://espn.com)" }),
+    ).toHaveLength(0);
+    expect(
+      checkSourceAttribution({ title: "t", markdown_body: "<cite>ESPN</cite> reported" }),
+    ).toHaveLength(0);
+    expect(
+      checkSourceAttribution({ title: "t", markdown_body: "plain", source_attribution: [{ url: "x" }] }),
+    ).toHaveLength(0);
+  });
+
+  it("checkNonPublicDetailRegex warns (not blocks) on imaging-reading language", () => {
+    const f = checkNonPublicDetailRegex("The MRI showed a partial tear.");
+    expect(f).toHaveLength(1);
+    expect(f[0].severity).toBe("warning");
+    expect(checkNonPublicDetailRegex("Recovery is progressing well.")).toHaveLength(0);
   });
 });
