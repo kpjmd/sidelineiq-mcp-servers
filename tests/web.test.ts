@@ -522,4 +522,87 @@ describe("Web MCP Server", () => {
       expect(result.content[0].text).toContain("not found");
     });
   });
+
+  describe("web_get_user", () => {
+    const mdUser = {
+      id: "770e8400-e29b-41d4-a716-446655440002",
+      email: "kpjohnsonmd@yahoo.com",
+      role: "md",
+      name: "Dr. K. P. Johnson",
+      created_at: "2026-06-06T00:00:00Z",
+    };
+
+    it("should return the seeded MD with role 'md'", async () => {
+      mockSql.mockResolvedValue([mdUser]);
+
+      const server = createTestServer();
+      const tool = getTool(server, "web_get_user");
+
+      const result = (await tool.handler(
+        { user_id: mdUser.id },
+        {},
+      )) as { content: Array<{ text: string }>; isError?: boolean };
+
+      expect(result.isError).toBeUndefined();
+      const data = JSON.parse(result.content[0].text);
+      expect(data.user.role).toBe("md");
+      expect(data.user.email).toBe("kpjohnsonmd@yahoo.com");
+    });
+
+    it("should return null user when id is unknown", async () => {
+      mockSql.mockResolvedValue([]);
+
+      const server = createTestServer();
+      const tool = getTool(server, "web_get_user");
+
+      const result = (await tool.handler(
+        { user_id: "770e8400-e29b-41d4-a716-446655440099" },
+        {},
+      )) as { content: Array<{ text: string }>; isError?: boolean };
+
+      expect(result.isError).toBeUndefined();
+      const data = JSON.parse(result.content[0].text);
+      expect(data.user).toBeNull();
+    });
+  });
+
+  describe("web_use_verification_token", () => {
+    const tokenRow = {
+      identifier: "kpjohnsonmd@yahoo.com",
+      token: "hashed-token-abc",
+      expires: "2026-06-06T01:00:00Z",
+    };
+
+    it("should consume a valid token (delete-on-read)", async () => {
+      mockSql.mockResolvedValueOnce([tokenRow]); // DELETE ... RETURNING hits
+
+      const server = createTestServer();
+      const tool = getTool(server, "web_use_verification_token");
+
+      const result = (await tool.handler(
+        { identifier: tokenRow.identifier, token: tokenRow.token },
+        {},
+      )) as { content: Array<{ text: string }>; isError?: boolean };
+
+      expect(result.isError).toBeUndefined();
+      const data = JSON.parse(result.content[0].text);
+      expect(data.verification_token.token).toBe("hashed-token-abc");
+    });
+
+    it("should return null on a second use (token already consumed)", async () => {
+      mockSql.mockResolvedValueOnce([]); // DELETE matches nothing the second time
+
+      const server = createTestServer();
+      const tool = getTool(server, "web_use_verification_token");
+
+      const result = (await tool.handler(
+        { identifier: tokenRow.identifier, token: tokenRow.token },
+        {},
+      )) as { content: Array<{ text: string }>; isError?: boolean };
+
+      expect(result.isError).toBeUndefined();
+      const data = JSON.parse(result.content[0].text);
+      expect(data.verification_token).toBeNull();
+    });
+  });
 });

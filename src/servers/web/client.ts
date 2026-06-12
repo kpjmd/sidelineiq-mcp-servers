@@ -280,6 +280,38 @@ export interface CandidateListItem extends DeskCandidate {
   slug: string | null;
 }
 
+// ── Auth / identity (Phase 2 foundation) ─────────────────────────────
+// The users table is the authority for role. The desk_publish gate (later
+// session) re-derives role from here via getUser; it never trusts a role string
+// supplied by the caller. The frontend reaches these only through MCP tools.
+export type UserRole = "md" | "editor";
+
+export interface User {
+  id: string;
+  email: string;
+  role: UserRole;
+  name: string | null;
+  created_at: string;
+}
+
+export interface UpsertUserInput {
+  email: string;
+  role: UserRole;
+  name?: string;
+}
+
+export interface CreateVerificationTokenInput {
+  identifier: string;
+  token: string;
+  expires: string; // ISO 8601
+}
+
+export interface VerificationToken {
+  identifier: string;
+  token: string;
+  expires: string;
+}
+
 // Lowercase, strip diacritics, remove common suffixes, collapse punctuation.
 // Shared between upsert (write) and resolve (read) so both sides agree.
 export function normalizePlayerName(name: string): string {
@@ -1214,5 +1246,76 @@ export class WebDatabaseClient {
     }
 
     return { ...review, post_updated };
+  }
+
+  // ── Auth / identity (Phase 2 foundation) ──────────────────────────────
+  // getUser is the role re-derive primitive: the future desk_publish gate looks
+  // up the reviewer's id here and trusts the DB's role, not the caller's claim.
+  async getUser(id: string): Promise<User | null> {
+    const rows = await this.sql`
+      SELECT id, email, role, name, created_at
+      FROM users
+      WHERE id = ${id}
+    `;
+    return rows.length > 0 ? (rows[0] as User) : null;
+  }
+
+  async getUserByEmail(email: string): Promise<User | null> {
+    const rows = await this.sql`
+      SELECT id, email, role, name, created_at
+      FROM users
+      WHERE email_lower = ${email.toLowerCase()}
+    `;
+    return rows.length > 0 ? (rows[0] as User) : null;
+  }
+
+  // Idempotent on email (case-insensitive). Used to seed/maintain identities;
+  // the NextAuth adapter does NOT mint users from the client (single-MD model),
+  // but this exists for explicit administrative provisioning. Audited.
+  async upsertUser(input: UpsertUserInput): Promise<User> {
+    const rows = await this.sql`
+      INSERT INTO users (email, role, name)
+      VALUES (${input.email}, ${input.role}, ${input.name ?? null})
+      ON CONFLICT (email) DO UPDATE SET
+        role = EXCLUDED.role,
+        name = COALESCE(EXCLUDED.name, users.name)
+      RETURNING id, email, role, name, created_at
+    `;
+    const user = rows[0] as User;
+    await this.auditAppend({
+      actor: "system",
+      actor_id: "auth-provisioning",
+      entity_type: "user",
+      entity_id: user.id,
+      action: "upsert_user",
+      payload: { email: user.email, role: user.role },
+    });
+    return user;
+  }
+
+  async createVerificationToken(
+    input: CreateVerificationTokenInput,
+  ): Promise<VerificationToken> {
+    const rows = await this.sql`
+      INSERT INTO verification_token (identifier, token, expires)
+      VALUES (${input.identifier}, ${input.token}, ${input.expires})
+      RETURNING identifier, token, expires
+    `;
+    return rows[0] as VerificationToken;
+  }
+
+  // Atomic delete-on-read: a magic-link token is single-use, so consuming it is
+  // a DELETE ... RETURNING. Returns null if the token was already used or never
+  // existed. NEVER split into select-then-delete (replay window).
+  async useVerificationToken(
+    identifier: string,
+    token: string,
+  ): Promise<VerificationToken | null> {
+    const rows = await this.sql`
+      DELETE FROM verification_token
+      WHERE identifier = ${identifier} AND token = ${token}
+      RETURNING identifier, token, expires
+    `;
+    return rows.length > 0 ? (rows[0] as VerificationToken) : null;
   }
 }

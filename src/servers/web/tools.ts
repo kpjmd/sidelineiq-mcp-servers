@@ -967,4 +967,103 @@ export function registerWebTools(server: McpServer): void {
       }
     },
   );
+
+  // ── Auth / identity (Phase 2 foundation) ────────────────────────────
+  // The users + verification_token tables back NextAuth magic-link auth in the
+  // frontend, which reaches them only through these tools (never Neon directly).
+  // web_get_user is the role re-derive primitive the future desk_publish gate
+  // depends on: it trusts the DB's role, not a caller-supplied string.
+
+  // ── web_get_user ────────────────────────────────────────────────────
+  server.tool(
+    "web_get_user",
+    "Look up a verified user (identity + role) by id. The Tier 2 publish gate uses this to re-derive role from the database rather than trusting a caller-supplied role. Returns null if not found.",
+    {
+      user_id: z.string().uuid(),
+    },
+    async (input) => {
+      try {
+        const user = await client.getUser(input.user_id);
+        return toolSuccess({ user });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_get_user_by_email ───────────────────────────────────────────
+  server.tool(
+    "web_get_user_by_email",
+    "Look up a verified user by email (case-insensitive). Used by the NextAuth adapter to resolve the signing-in identity and its role. Returns null if not found.",
+    {
+      email: z.string().email(),
+    },
+    async (input) => {
+      try {
+        const user = await client.getUserByEmail(input.email);
+        return toolSuccess({ user });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_upsert_user ─────────────────────────────────────────────────
+  server.tool(
+    "web_upsert_user",
+    "Provision or update a verified user identity (role md|editor). Idempotent on email. Audited. Administrative provisioning only — the magic-link flow does not mint users.",
+    {
+      email: z.string().email(),
+      role: z.enum(["md", "editor"]),
+      name: z.string().min(1).optional(),
+    },
+    async (input) => {
+      try {
+        const user = await client.upsertUser(input);
+        return toolSuccess({ user });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_create_verification_token ───────────────────────────────────
+  server.tool(
+    "web_create_verification_token",
+    "Persist an Auth.js magic-link verification token (issued at link-request time). identifier is the recipient email; expires is an ISO 8601 timestamp.",
+    {
+      identifier: z.string().min(1).describe("Recipient email (Auth.js identifier)"),
+      token: z.string().min(1).describe("Hashed verification token"),
+      expires: z.string().datetime().describe("ISO 8601 expiry timestamp"),
+    },
+    async (input) => {
+      try {
+        const verification_token = await client.createVerificationToken(input);
+        return toolSuccess({ verification_token });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_use_verification_token ──────────────────────────────────────
+  server.tool(
+    "web_use_verification_token",
+    "Atomically consume a magic-link verification token at click time (single-use, delete-on-read). Returns the token row if valid, or null if already used / never existed.",
+    {
+      identifier: z.string().min(1).describe("Recipient email (Auth.js identifier)"),
+      token: z.string().min(1).describe("Hashed verification token to consume"),
+    },
+    async (input) => {
+      try {
+        const verification_token = await client.useVerificationToken(
+          input.identifier,
+          input.token,
+        );
+        return toolSuccess({ verification_token });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
 }
