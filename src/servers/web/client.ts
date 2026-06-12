@@ -1577,7 +1577,7 @@ export class WebDatabaseClient {
 
   // Read-only lint of the current stored body. Backs desk_lint. The real rules
   // arrive in 2D; today this returns the stub's empty findings.
-  async lintDeskPostById(deskPostId: string): Promise<ReturnType<typeof lintDeskPost>> {
+  async lintDeskPostById(deskPostId: string): ReturnType<typeof lintDeskPost> {
     const rows = await this.sql`SELECT * FROM desk_posts WHERE id = ${deskPostId}`;
     if (rows.length === 0) {
       throw new McpToolError(
@@ -1586,7 +1586,7 @@ export class WebDatabaseClient {
       );
     }
     const post = rows[0] as DeskPost;
-    return lintDeskPost({
+    return await lintDeskPost({
       title: post.title,
       markdown_body: post.markdown_body,
       draft_json: post.draft_json,
@@ -1705,7 +1705,7 @@ export class WebDatabaseClient {
     const currentHash = hashPayload(post.markdown_body);
     const hash_match = !!latest && latest.content_hash === currentHash;
 
-    const { blockers } = lintDeskPost({
+    const { blockers } = await lintDeskPost({
       title: post.title,
       markdown_body: post.markdown_body,
       draft_json: post.draft_json,
