@@ -1,6 +1,7 @@
 import { getDatabase } from "../../shared/database.js";
 import { McpToolError } from "../../shared/errors.js";
 import { hashPayload } from "../../shared/hash.js";
+import { lintDeskPost, type LintFinding } from "./linter.js";
 import type { InjuryPost, MdReview, MdReviewStatus, PostStatus, Sport, ContentType } from "../../shared/types.js";
 
 // ── Audit log types ──────────────────────────────────────────────────
@@ -310,6 +311,107 @@ export interface VerificationToken {
   identifier: string;
   token: string;
   expires: string;
+}
+
+// ── Desk posts (Phase 2C — Tier 2 authored artifact + publish gate) ───
+// A desk_post is a physician-attributed Injury Desk breakdown. It moves
+// DRAFT → READY (attested) → PUBLISHED, gated server-side by desk_publish:
+// DB-derived role must be 'md', the latest attestation's content_hash must
+// equal the post's CURRENT hash, and the linter must return zero blockers.
+export type DeskPostStatus = "DRAFT" | "READY" | "PUBLISHED" | "RETRACTED";
+
+export interface DeskPost {
+  id: string;
+  candidate_id: string | null;
+  entity_id: string;
+  slug: string;
+  title: string;
+  markdown_body: string;
+  draft_json: unknown;
+  status: DeskPostStatus;
+  version: number;
+  author_id: string | null;
+  reviewed_by: string | null;
+  attestation_id: string | null;
+  content_hash: string;
+  source_attribution: unknown;
+  disclaimer_present: boolean;
+  created_at: string;
+  updated_at: string;
+  published_at: string | null;
+}
+
+export interface DeskAttestation {
+  id: string;
+  desk_post_id: string;
+  reviewer_user_id: string;
+  reviewed_source_reports: boolean;
+  edited_for_accuracy: boolean;
+  framing_confirmed: boolean;
+  content_hash: string;
+  timestamp: string;
+  ip: string | null;
+}
+
+export interface CreateDraftInput {
+  candidate_id: string;
+  author_id: string;
+  title: string;
+  markdown_body: string;
+  draft_json?: unknown;
+  source_attribution?: unknown;
+  disclaimer_present?: boolean;
+}
+
+export interface UpdateDraftInput {
+  desk_post_id: string;
+  edited_by: string;
+  markdown_body: string;
+  title?: string;
+  draft_json?: unknown;
+  source_attribution?: unknown;
+  disclaimer_present?: boolean;
+  edit_diff?: unknown;
+}
+
+export interface AttestInput {
+  desk_post_id: string;
+  reviewer_user_id: string;
+  reviewed_source_reports: boolean;
+  edited_for_accuracy: boolean;
+  framing_confirmed: boolean;
+  ip?: string;
+}
+
+// The structured outcome of the publish gate. A blocked publish is a SUCCESSFUL
+// tool call with published:false — the frontend renders `reasons` and maps it to
+// HTTP 422. Only true faults (post missing / wrong status) throw McpToolError.
+export interface PublishGate {
+  role_ok: boolean;
+  hash_match: boolean;
+  blockers: LintFinding[];
+  passed: boolean;
+  reasons: string[];
+}
+
+export interface PublishResult {
+  published: boolean;
+  gate: PublishGate;
+  post: DeskPost | null;
+}
+
+// A desk_post joined to display fields the Injury Desk list view needs.
+export interface DeskPostListItem extends DeskPost {
+  athlete_name: string | null;
+  sport: string | null;
+  body_part: string | null;
+  laterality: Laterality | null;
+  injury_type: string | null;
+}
+
+export interface DeskPostDetail {
+  post: DeskPost;
+  attestations: DeskAttestation[];
 }
 
 // Lowercase, strip diacritics, remove common suffixes, collapse punctuation.
@@ -1317,5 +1419,410 @@ export class WebDatabaseClient {
       RETURNING identifier, token, expires
     `;
     return rows.length > 0 ? (rows[0] as VerificationToken) : null;
+  }
+
+  // ── Desk posts (Phase 2C) ─────────────────────────────────────────────
+  // content_hash is hashPayload(markdown_body) EVERYWHERE (create/update/attest/
+  // publish) so the gate's equality check is meaningful. Always hash the body
+  // string — never draft_json, never an object.
+  private deskSlugify(title: string): string {
+    return title
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, "")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "")
+      .slice(0, 200) || "injury-desk-post";
+  }
+
+  private async resolveUniqueDeskSlug(baseSlug: string): Promise<string> {
+    let rows = await this.sql`SELECT id FROM desk_posts WHERE slug = ${baseSlug}`;
+    if (rows.length === 0) return baseSlug;
+    for (let i = 2; i <= 99; i++) {
+      const candidate = `${baseSlug}-${i}`;
+      rows = await this.sql`SELECT id FROM desk_posts WHERE slug = ${candidate}`;
+      if (rows.length === 0) return candidate;
+    }
+    return `${baseSlug}-${Date.now()}`;
+  }
+
+  // Create a DRAFT desk_post from an ACCEPTED candidate. Writes the v1 version
+  // row and flips the candidate ACCEPTED → PROMOTED (its terminal state).
+  async createDraft(input: CreateDraftInput): Promise<DeskPost> {
+    const candRows = await this.sql`
+      SELECT id, entity_id, status FROM desk_candidates WHERE id = ${input.candidate_id}
+    `;
+    if (candRows.length === 0) {
+      throw new McpToolError(
+        `Candidate ${input.candidate_id} not found`,
+        "Use web_list_candidates to find a valid candidate id.",
+      );
+    }
+    const candidate = candRows[0] as { id: string; entity_id: string; status: string };
+    if (candidate.status !== "ACCEPTED") {
+      throw new McpToolError(
+        `Candidate ${input.candidate_id} is ${candidate.status}, not ACCEPTED`,
+        "Only an ACCEPTED candidate can be drafted into a desk post. Accept it first via web_decide_candidate.",
+      );
+    }
+
+    const slug = await this.resolveUniqueDeskSlug(this.deskSlugify(input.title));
+    const contentHash = hashPayload(input.markdown_body);
+    const draftJson = input.draft_json !== undefined ? JSON.stringify(input.draft_json) : null;
+    const sourceAttribution =
+      input.source_attribution !== undefined ? JSON.stringify(input.source_attribution) : null;
+
+    const postRows = await this.sql`
+      INSERT INTO desk_posts (
+        candidate_id, entity_id, slug, title, markdown_body, draft_json,
+        status, version, author_id, content_hash, source_attribution, disclaimer_present
+      ) VALUES (
+        ${input.candidate_id}, ${candidate.entity_id}, ${slug}, ${input.title},
+        ${input.markdown_body}, ${draftJson}, 'DRAFT', 1, ${input.author_id},
+        ${contentHash}, ${sourceAttribution}, ${input.disclaimer_present ?? false}
+      )
+      RETURNING *
+    `;
+    const post = postRows[0] as DeskPost;
+
+    await this.sql`
+      INSERT INTO desk_post_versions (
+        desk_post_id, version, markdown_body, draft_json, content_hash, edited_by, edit_diff
+      ) VALUES (
+        ${post.id}, 1, ${input.markdown_body}, ${draftJson}, ${contentHash}, ${input.author_id}, ${null}
+      )
+    `;
+
+    await this.sql`
+      UPDATE desk_candidates
+      SET status = 'PROMOTED', decided_at = NOW(), updated_at = NOW()
+      WHERE id = ${input.candidate_id} AND status = 'ACCEPTED'
+    `;
+
+    await this.auditAppend({
+      actor: "md",
+      actor_id: input.author_id,
+      entity_type: "desk_post",
+      entity_id: post.id,
+      action: "create_draft",
+      payload: { candidate_id: input.candidate_id, entity_id: candidate.entity_id, slug },
+    });
+    return post;
+  }
+
+  // Edit a DRAFT or READY post. Writes a new version row on every save. Editing a
+  // READY post reverts it to DRAFT — the prior attestation is now stale, and the
+  // UI should reflect that (the publish gate's hash compare catches it regardless).
+  async updateDraft(input: UpdateDraftInput): Promise<DeskPost> {
+    const current = await this.sql`SELECT * FROM desk_posts WHERE id = ${input.desk_post_id}`;
+    if (current.length === 0) {
+      throw new McpToolError(
+        `Desk post ${input.desk_post_id} not found`,
+        "Use desk_list to find a valid desk post id.",
+      );
+    }
+    const prev = current[0] as DeskPost;
+    if (prev.status !== "DRAFT" && prev.status !== "READY") {
+      throw new McpToolError(
+        `Desk post ${input.desk_post_id} is ${prev.status} and cannot be edited`,
+        "Only DRAFT or READY posts can be edited.",
+      );
+    }
+
+    const newVersion = prev.version + 1;
+    const contentHash = hashPayload(input.markdown_body);
+    const newStatus: DeskPostStatus = prev.status === "READY" ? "DRAFT" : prev.status;
+    const draftJson = input.draft_json !== undefined ? JSON.stringify(input.draft_json) : null;
+    const sourceAttribution =
+      input.source_attribution !== undefined ? JSON.stringify(input.source_attribution) : null;
+    const editDiff = input.edit_diff !== undefined ? JSON.stringify(input.edit_diff) : null;
+
+    const updated = await this.sql`
+      UPDATE desk_posts SET
+        title = COALESCE(${input.title ?? null}, title),
+        markdown_body = ${input.markdown_body},
+        draft_json = COALESCE(${draftJson}, draft_json),
+        source_attribution = COALESCE(${sourceAttribution}, source_attribution),
+        disclaimer_present = COALESCE(${input.disclaimer_present ?? null}, disclaimer_present),
+        content_hash = ${contentHash},
+        version = ${newVersion},
+        status = ${newStatus},
+        updated_at = NOW()
+      WHERE id = ${input.desk_post_id}
+      RETURNING *
+    `;
+    const post = updated[0] as DeskPost;
+
+    await this.sql`
+      INSERT INTO desk_post_versions (
+        desk_post_id, version, markdown_body, draft_json, content_hash, edited_by, edit_diff
+      ) VALUES (
+        ${post.id}, ${newVersion}, ${input.markdown_body}, ${draftJson}, ${contentHash},
+        ${input.edited_by}, ${editDiff}
+      )
+    `;
+
+    await this.auditAppend({
+      actor: "md",
+      actor_id: input.edited_by,
+      entity_type: "desk_post",
+      entity_id: post.id,
+      action: "update_draft",
+      before: prev.markdown_body,
+      after: input.markdown_body,
+      payload: { version: newVersion, reverted_to_draft: newStatus !== prev.status },
+    });
+    return post;
+  }
+
+  // Read-only lint of the current stored body. Backs desk_lint. The real rules
+  // arrive in 2D; today this returns the stub's empty findings.
+  async lintDeskPostById(deskPostId: string): Promise<ReturnType<typeof lintDeskPost>> {
+    const rows = await this.sql`SELECT * FROM desk_posts WHERE id = ${deskPostId}`;
+    if (rows.length === 0) {
+      throw new McpToolError(
+        `Desk post ${deskPostId} not found`,
+        "Use desk_list to find a valid desk post id.",
+      );
+    }
+    const post = rows[0] as DeskPost;
+    return lintDeskPost({
+      title: post.title,
+      markdown_body: post.markdown_body,
+      draft_json: post.draft_json,
+      source_attribution: post.source_attribution,
+      disclaimer_present: post.disclaimer_present,
+    });
+  }
+
+  // Physician attestation. Re-derives role from the DB (never trusts the caller)
+  // and refuses unless role === 'md' AND all three review confirmations are true.
+  // Snapshots content_hash of the CURRENT body, records the attestation, points
+  // the post at it, and moves the post to READY.
+  async attestDeskPost(input: AttestInput): Promise<DeskAttestation> {
+    const user = await this.getUser(input.reviewer_user_id);
+    if (!user) {
+      throw new McpToolError(
+        `Reviewer ${input.reviewer_user_id} not found`,
+        "reviewer_user_id must be a known users.id (a UUID = session.user.id).",
+      );
+    }
+    if (user.role !== "md") {
+      throw new McpToolError(
+        `Reviewer ${input.reviewer_user_id} has role '${user.role}', not 'md'`,
+        "Only an MD identity can attest a desk post.",
+      );
+    }
+    if (
+      !input.reviewed_source_reports ||
+      !input.edited_for_accuracy ||
+      !input.framing_confirmed
+    ) {
+      throw new McpToolError(
+        "Cannot attest without confirming all three review steps",
+        "reviewed_source_reports, edited_for_accuracy, and framing_confirmed must all be true.",
+      );
+    }
+
+    const postRows = await this.sql`SELECT * FROM desk_posts WHERE id = ${input.desk_post_id}`;
+    if (postRows.length === 0) {
+      throw new McpToolError(
+        `Desk post ${input.desk_post_id} not found`,
+        "Use desk_list to find a valid desk post id.",
+      );
+    }
+    const post = postRows[0] as DeskPost;
+    if (post.status !== "DRAFT" && post.status !== "READY") {
+      throw new McpToolError(
+        `Desk post ${input.desk_post_id} is ${post.status} and cannot be attested`,
+        "Only DRAFT or READY posts can be attested.",
+      );
+    }
+
+    const contentHash = hashPayload(post.markdown_body);
+    const attRows = await this.sql`
+      INSERT INTO desk_attestations (
+        desk_post_id, reviewer_user_id, reviewed_source_reports,
+        edited_for_accuracy, framing_confirmed, content_hash, ip
+      ) VALUES (
+        ${input.desk_post_id}, ${input.reviewer_user_id}, ${input.reviewed_source_reports},
+        ${input.edited_for_accuracy}, ${input.framing_confirmed}, ${contentHash}, ${input.ip ?? null}
+      )
+      RETURNING *
+    `;
+    const attestation = attRows[0] as DeskAttestation;
+
+    await this.sql`
+      UPDATE desk_posts
+      SET attestation_id = ${attestation.id}, reviewed_by = ${input.reviewer_user_id},
+          status = 'READY', updated_at = NOW()
+      WHERE id = ${input.desk_post_id}
+    `;
+
+    await this.auditAppend({
+      actor: "md",
+      actor_id: input.reviewer_user_id,
+      entity_type: "desk_post",
+      entity_id: post.id,
+      action: "attest",
+      payload: { attestation_id: attestation.id, content_hash: contentHash },
+    });
+    return attestation;
+  }
+
+  // THE PUBLISH GATE — the medico-legal defensibility backbone. A blocked publish
+  // is a SUCCESSFUL result with published:false (frontend maps to 422); only a
+  // missing post or wrong status throws. Passes iff ALL hold:
+  //   • DB-derived role of reviewer === 'md' (re-derived here, never trusted)
+  //   • latest attestation's content_hash === hashPayload(current body)
+  //   • linter returns zero blockers
+  async publishDeskPost(deskPostId: string, reviewerUserId: string): Promise<PublishResult> {
+    const postRows = await this.sql`SELECT * FROM desk_posts WHERE id = ${deskPostId}`;
+    if (postRows.length === 0) {
+      throw new McpToolError(
+        `Desk post ${deskPostId} not found`,
+        "Use desk_list to find a valid desk post id.",
+      );
+    }
+    const post = postRows[0] as DeskPost;
+    if (post.status !== "READY") {
+      throw new McpToolError(
+        `Desk post ${deskPostId} is ${post.status}, not READY`,
+        "Attest the post (desk_attest) before publishing.",
+      );
+    }
+
+    const user = await this.getUser(reviewerUserId);
+    const role_ok = !!user && user.role === "md";
+
+    const attRows = await this.sql`
+      SELECT * FROM desk_attestations
+      WHERE desk_post_id = ${deskPostId}
+      ORDER BY timestamp DESC
+      LIMIT 1
+    `;
+    const latest = attRows.length > 0 ? (attRows[0] as DeskAttestation) : null;
+    const currentHash = hashPayload(post.markdown_body);
+    const hash_match = !!latest && latest.content_hash === currentHash;
+
+    const { blockers } = lintDeskPost({
+      title: post.title,
+      markdown_body: post.markdown_body,
+      draft_json: post.draft_json,
+      source_attribution: post.source_attribution,
+      disclaimer_present: post.disclaimer_present,
+    });
+
+    const reasons: string[] = [];
+    if (!role_ok) reasons.push("reviewer is not an MD");
+    if (!latest) reasons.push("no attestation found");
+    else if (!hash_match) reasons.push("post edited after attestation (content hash mismatch)");
+    for (const b of blockers) reasons.push(`${b.code}: ${b.message}`);
+
+    const passed = role_ok && hash_match && blockers.length === 0;
+    const gate: PublishGate = { role_ok, hash_match, blockers, passed, reasons };
+
+    if (!passed) {
+      await this.auditAppend({
+        actor: "md",
+        actor_id: reviewerUserId,
+        entity_type: "desk_post",
+        entity_id: post.id,
+        action: "publish_blocked",
+        payload: { role_ok, hash_match, blocker_count: blockers.length, reasons },
+      });
+      return { published: false, gate, post: null };
+    }
+
+    const updated = await this.sql`
+      UPDATE desk_posts
+      SET status = 'PUBLISHED', published_at = NOW(), reviewed_by = ${reviewerUserId}, updated_at = NOW()
+      WHERE id = ${deskPostId} AND status = 'READY'
+      RETURNING *
+    `;
+    const publishedPost = updated[0] as DeskPost;
+
+    await this.auditAppend({
+      actor: "md",
+      actor_id: reviewerUserId,
+      entity_type: "desk_post",
+      entity_id: post.id,
+      action: "publish",
+      payload: { attestation_id: latest?.id ?? null, content_hash: currentHash, slug: post.slug },
+    });
+    return { published: true, gate, post: publishedPost };
+  }
+
+  // Retract a PUBLISHED post. MD-only (role re-derived). Phase 3 adds the
+  // .retracted.json emission for the kpjmd builder; here it is the status flip.
+  async retractDeskPost(deskPostId: string, reviewerUserId: string): Promise<DeskPost> {
+    const user = await this.getUser(reviewerUserId);
+    if (!user || user.role !== "md") {
+      throw new McpToolError(
+        `Reviewer ${reviewerUserId} is not an MD`,
+        "Only an MD identity can retract a desk post.",
+      );
+    }
+    const rows = await this.sql`
+      UPDATE desk_posts
+      SET status = 'RETRACTED', updated_at = NOW()
+      WHERE id = ${deskPostId} AND status = 'PUBLISHED'
+      RETURNING *
+    `;
+    if (rows.length === 0) {
+      throw new McpToolError(
+        `Desk post ${deskPostId} not found or not PUBLISHED`,
+        "Only a PUBLISHED post can be retracted.",
+      );
+    }
+    const post = rows[0] as DeskPost;
+    await this.auditAppend({
+      actor: "md",
+      actor_id: reviewerUserId,
+      entity_type: "desk_post",
+      entity_id: post.id,
+      action: "retract",
+      payload: { slug: post.slug },
+    });
+    return post;
+  }
+
+  async listDeskPosts(status?: DeskPostStatus, limit = 100): Promise<DeskPostListItem[]> {
+    const base = `
+      SELECT
+        d.*,
+        p.full_name   AS athlete_name,
+        e.injury_type AS injury_type,
+        e.body_part   AS body_part,
+        e.laterality  AS laterality,
+        p.sport       AS sport
+      FROM desk_posts d
+      JOIN injury_entities e ON e.id = d.entity_id
+      LEFT JOIN players p    ON p.id = e.player_id
+    `;
+    const rows = status
+      ? await this.sql(
+          `${base} WHERE d.status = $1 ORDER BY d.updated_at DESC LIMIT $2`,
+          [status, limit],
+        )
+      : await this.sql(`${base} ORDER BY d.updated_at DESC LIMIT $1`, [limit]);
+    return rows as DeskPostListItem[];
+  }
+
+  async getDeskPost(deskPostId: string): Promise<DeskPostDetail> {
+    const postRows = await this.sql`SELECT * FROM desk_posts WHERE id = ${deskPostId}`;
+    if (postRows.length === 0) {
+      throw new McpToolError(
+        `Desk post ${deskPostId} not found`,
+        "Use desk_list to find a valid desk post id.",
+      );
+    }
+    const post = postRows[0] as DeskPost;
+    const attestations = await this.sql`
+      SELECT * FROM desk_attestations
+      WHERE desk_post_id = ${deskPostId}
+      ORDER BY timestamp DESC
+    `;
+    return { post, attestations: attestations as DeskAttestation[] };
   }
 }

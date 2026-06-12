@@ -1066,4 +1066,171 @@ export function registerWebTools(server: McpServer): void {
       }
     },
   );
+
+  // ── desk_create_draft ───────────────────────────────────────────────
+  // Phase 2C. Turns an ACCEPTED candidate into a DRAFT Injury Desk post and
+  // flips the candidate to PROMOTED. author_id is the editing user's id (UUID).
+  server.tool(
+    "desk_create_draft",
+    "Create a DRAFT Injury Desk (Tier 2) post from an ACCEPTED promotion candidate. Writes the v1 version row and moves the candidate to PROMOTED. Does NOT publish — a desk post must be attested by an MD and pass the server-enforced publish gate first.",
+    {
+      candidate_id: z.string().uuid(),
+      author_id: z.string().uuid().describe("Editing user's id (UUID = session.user.id)"),
+      title: z.string().min(1),
+      markdown_body: z.string().min(1).describe("Canonical markdown body; the content_hash is derived from this"),
+      draft_json: z.unknown().optional().describe("kpjmd handoff artifact (Phase 3 schema)"),
+      source_attribution: z.unknown().optional(),
+      disclaimer_present: z.boolean().optional(),
+    },
+    async (input) => {
+      try {
+        const post = await client.createDraft(input);
+        return toolSuccess({ post });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── desk_update_draft ───────────────────────────────────────────────
+  server.tool(
+    "desk_update_draft",
+    "Save edits to a DRAFT or READY desk post. Writes a new version row on every save. Editing a READY (attested) post reverts it to DRAFT — the prior attestation is now stale and must be redone before publishing.",
+    {
+      desk_post_id: z.string().uuid(),
+      edited_by: z.string().uuid().describe("Editing user's id (UUID)"),
+      markdown_body: z.string().min(1),
+      title: z.string().min(1).optional(),
+      draft_json: z.unknown().optional(),
+      source_attribution: z.unknown().optional(),
+      disclaimer_present: z.boolean().optional(),
+      edit_diff: z.unknown().optional(),
+    },
+    async (input) => {
+      try {
+        const post = await client.updateDraft(input);
+        return toolSuccess({ post });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── desk_lint ───────────────────────────────────────────────────────
+  // Typed seam. 2C returns empty findings; 2D fills in the classifier. The
+  // publish gate consumes the same lint internally — blockers there block publish.
+  server.tool(
+    "desk_lint",
+    "Lint a desk post's current body for Tier 2 framing violations. Returns {warnings, blockers}; non-empty blockers will block desk_publish. (Phase 2C: stub returning empty arrays; the real rules land in 2D.)",
+    {
+      desk_post_id: z.string().uuid(),
+    },
+    async (input) => {
+      try {
+        const result = await client.lintDeskPostById(input.desk_post_id);
+        return toolSuccess(result);
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── desk_attest ─────────────────────────────────────────────────────
+  // The role is RE-DERIVED server-side from reviewer_user_id (never trusted from
+  // the caller); all three confirmations must be true. Snapshots the body hash
+  // and moves the post to READY.
+  server.tool(
+    "desk_attest",
+    "Record a physician attestation on a desk post. The MD role is re-derived server-side from reviewer_user_id (a UUID = session.user.id) — a caller-supplied role is ignored. All three confirmations must be true. Snapshots the current body's content_hash and moves the post to READY.",
+    {
+      desk_post_id: z.string().uuid(),
+      reviewer_user_id: z.string().uuid().describe("MD user id (UUID); role re-derived from the DB"),
+      reviewed_source_reports: z.boolean(),
+      edited_for_accuracy: z.boolean(),
+      framing_confirmed: z.boolean(),
+      ip: z.string().optional(),
+    },
+    async (input) => {
+      try {
+        const attestation = await client.attestDeskPost(input);
+        return toolSuccess({ attestation });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── desk_publish ────────────────────────────────────────────────────
+  // THE GATE. A blocked publish is a SUCCESSFUL call with published:false and a
+  // gate breakdown the frontend renders and maps to HTTP 422. Only a missing post
+  // or wrong status is an error (isError).
+  server.tool(
+    "desk_publish",
+    "Run the server-enforced publish gate on a READY desk post. Publishes only if ALL hold: the DB-derived role of reviewer_user_id is 'md', the latest attestation's content_hash equals the post's current body hash (catches post-attestation edits), and the linter returns zero blockers. A blocked publish returns {published:false, gate:{...}} (a successful call — map to 422), not an error.",
+    {
+      desk_post_id: z.string().uuid(),
+      reviewer_user_id: z.string().uuid().describe("MD user id (UUID); role re-derived from the DB"),
+    },
+    async (input) => {
+      try {
+        const result = await client.publishDeskPost(input.desk_post_id, input.reviewer_user_id);
+        return toolSuccess(result);
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── desk_retract ────────────────────────────────────────────────────
+  server.tool(
+    "desk_retract",
+    "Retract a PUBLISHED desk post (status → RETRACTED). MD-only — role is re-derived from reviewer_user_id. (Phase 3 adds the .retracted.json emission for the kpjmd builder.)",
+    {
+      desk_post_id: z.string().uuid(),
+      reviewer_user_id: z.string().uuid().describe("MD user id (UUID); role re-derived from the DB"),
+    },
+    async (input) => {
+      try {
+        const post = await client.retractDeskPost(input.desk_post_id, input.reviewer_user_id);
+        return toolSuccess({ post });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── desk_list ───────────────────────────────────────────────────────
+  server.tool(
+    "desk_list",
+    "List Injury Desk posts (optionally filtered by status), newest-updated first, joined to athlete/injury display fields.",
+    {
+      status: z.enum(["DRAFT", "READY", "PUBLISHED", "RETRACTED"]).optional(),
+      limit: z.number().int().min(1).max(500).default(100),
+    },
+    async (input) => {
+      try {
+        const posts = await client.listDeskPosts(input.status, input.limit);
+        return toolSuccess({ posts });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── desk_get ────────────────────────────────────────────────────────
+  server.tool(
+    "desk_get",
+    "Fetch one desk post by id plus its attestations (newest first) for the Injury Desk editor view.",
+    {
+      desk_post_id: z.string().uuid(),
+    },
+    async (input) => {
+      try {
+        const detail = await client.getDeskPost(input.desk_post_id);
+        return toolSuccess(detail);
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
 }
