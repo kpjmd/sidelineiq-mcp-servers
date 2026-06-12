@@ -11,6 +11,7 @@ vi.stubEnv("DATABASE_URL", "postgresql://test:test@localhost:5432/test");
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerWebTools } from "../src/servers/web/tools.js";
+import { hashPayload } from "../src/shared/hash.js";
 
 interface RegisteredTool {
   handler: (args: Record<string, unknown>, extra: unknown) => Promise<unknown>;
@@ -603,6 +604,363 @@ describe("Web MCP Server", () => {
       expect(result.isError).toBeUndefined();
       const data = JSON.parse(result.content[0].text);
       expect(data.verification_token).toBeNull();
+    });
+  });
+
+  // ── Phase 2C — desk posts + the publish gate ─────────────────────────
+  const mdUserRow = {
+    id: "770e8400-e29b-41d4-a716-446655440002",
+    email: "kpjohnsonmd@yahoo.com",
+    role: "md",
+    name: "Dr. K. P. Johnson",
+    created_at: "2026-06-06T00:00:00Z",
+  };
+  const editorUserRow = { ...mdUserRow, id: "770e8400-e29b-41d4-a716-446655440003", role: "editor" };
+  const DESK_POST_ID = "880e8400-e29b-41d4-a716-446655440000";
+  const CANDIDATE_ID = "990e8400-e29b-41d4-a716-446655440000";
+  const ENTITY_ID = "aa0e8400-e29b-41d4-a716-446655440000";
+  const AUTHOR_ID = mdUserRow.id;
+  const BODY = "Public reporting indicates a left knee injury; general educational analysis follows.";
+
+  function deskPost(overrides: Record<string, unknown> = {}) {
+    return {
+      id: DESK_POST_ID,
+      candidate_id: CANDIDATE_ID,
+      entity_id: ENTITY_ID,
+      slug: "test-athlete-knee",
+      title: "Test Athlete Knee",
+      markdown_body: BODY,
+      draft_json: null,
+      status: "DRAFT",
+      version: 1,
+      author_id: AUTHOR_ID,
+      reviewed_by: null,
+      attestation_id: null,
+      content_hash: hashPayload(BODY),
+      source_attribution: null,
+      disclaimer_present: false,
+      created_at: "2026-06-12T00:00:00Z",
+      updated_at: "2026-06-12T00:00:00Z",
+      published_at: null,
+      ...overrides,
+    };
+  }
+
+  function attestation(overrides: Record<string, unknown> = {}) {
+    return {
+      id: "bb0e8400-e29b-41d4-a716-446655440000",
+      desk_post_id: DESK_POST_ID,
+      reviewer_user_id: mdUserRow.id,
+      reviewed_source_reports: true,
+      edited_for_accuracy: true,
+      framing_confirmed: true,
+      content_hash: hashPayload(BODY),
+      timestamp: "2026-06-12T01:00:00Z",
+      ip: null,
+      ...overrides,
+    };
+  }
+
+  type ToolResult = { content: Array<{ text: string }>; isError?: boolean };
+
+  describe("desk_create_draft", () => {
+    it("creates a DRAFT from an ACCEPTED candidate and flips it to PROMOTED", async () => {
+      mockSql
+        .mockResolvedValueOnce([{ id: CANDIDATE_ID, entity_id: ENTITY_ID, status: "ACCEPTED" }]) // select candidate
+        .mockResolvedValueOnce([]) // slug uniqueness
+        .mockResolvedValueOnce([deskPost()]) // insert desk_posts
+        .mockResolvedValueOnce([]) // insert version
+        .mockResolvedValueOnce([]) // update candidate -> PROMOTED
+        .mockResolvedValueOnce([{ id: "audit" }]); // audit
+
+      const tool = getTool(createTestServer(), "desk_create_draft");
+      const result = (await tool.handler(
+        { candidate_id: CANDIDATE_ID, author_id: AUTHOR_ID, title: "Test Athlete Knee", markdown_body: BODY },
+        {},
+      )) as ToolResult;
+
+      expect(result.isError).toBeUndefined();
+      const data = JSON.parse(result.content[0].text);
+      expect(data.post.status).toBe("DRAFT");
+      const updatedCandidate = mockSql.mock.calls.find(
+        (c) => Array.isArray(c[0]) && c[0].join("").includes("UPDATE desk_candidates"),
+      );
+      expect(updatedCandidate?.join("")).toContain("PROMOTED");
+    });
+
+    it("rejects a candidate that is not ACCEPTED", async () => {
+      mockSql.mockResolvedValueOnce([{ id: CANDIDATE_ID, entity_id: ENTITY_ID, status: "PROPOSED" }]);
+      const tool = getTool(createTestServer(), "desk_create_draft");
+      const result = (await tool.handler(
+        { candidate_id: CANDIDATE_ID, author_id: AUTHOR_ID, title: "x", markdown_body: BODY },
+        {},
+      )) as ToolResult;
+      expect(result.isError).toBe(true);
+    });
+
+    it("rejects an unknown candidate", async () => {
+      mockSql.mockResolvedValueOnce([]);
+      const tool = getTool(createTestServer(), "desk_create_draft");
+      const result = (await tool.handler(
+        { candidate_id: CANDIDATE_ID, author_id: AUTHOR_ID, title: "x", markdown_body: BODY },
+        {},
+      )) as ToolResult;
+      expect(result.isError).toBe(true);
+    });
+  });
+
+  describe("desk_update_draft", () => {
+    it("keeps DRAFT status and writes a new version", async () => {
+      mockSql
+        .mockResolvedValueOnce([deskPost({ status: "DRAFT", version: 1 })]) // select
+        .mockResolvedValueOnce([deskPost({ status: "DRAFT", version: 2 })]) // update returning
+        .mockResolvedValueOnce([]) // insert version
+        .mockResolvedValueOnce([{ id: "audit" }]); // audit
+      const tool = getTool(createTestServer(), "desk_update_draft");
+      const result = (await tool.handler(
+        { desk_post_id: DESK_POST_ID, edited_by: AUTHOR_ID, markdown_body: BODY + " edit" },
+        {},
+      )) as ToolResult;
+      expect(result.isError).toBeUndefined();
+    });
+
+    it("reverts a READY post to DRAFT on edit (stale attestation)", async () => {
+      mockSql
+        .mockResolvedValueOnce([deskPost({ status: "READY", version: 1 })]) // select
+        .mockResolvedValueOnce([deskPost({ status: "DRAFT", version: 2 })]) // update returning
+        .mockResolvedValueOnce([]) // insert version
+        .mockResolvedValueOnce([{ id: "audit" }]); // audit
+      const tool = getTool(createTestServer(), "desk_update_draft");
+      await tool.handler(
+        { desk_post_id: DESK_POST_ID, edited_by: AUTHOR_ID, markdown_body: BODY + " edit" },
+        {},
+      );
+      const updateCall = mockSql.mock.calls.find(
+        (c) => Array.isArray(c[0]) && c[0].join("").includes("UPDATE desk_posts SET"),
+      );
+      // newStatus is interpolated as a bound value; a READY source must write 'DRAFT'.
+      expect(updateCall?.slice(1)).toContain("DRAFT");
+    });
+
+    it("rejects editing a PUBLISHED post", async () => {
+      mockSql.mockResolvedValueOnce([deskPost({ status: "PUBLISHED" })]);
+      const tool = getTool(createTestServer(), "desk_update_draft");
+      const result = (await tool.handler(
+        { desk_post_id: DESK_POST_ID, edited_by: AUTHOR_ID, markdown_body: BODY },
+        {},
+      )) as ToolResult;
+      expect(result.isError).toBe(true);
+    });
+  });
+
+  describe("desk_lint", () => {
+    it("returns empty warnings/blockers for a found post (2C stub)", async () => {
+      mockSql.mockResolvedValueOnce([deskPost()]);
+      const tool = getTool(createTestServer(), "desk_lint");
+      const result = (await tool.handler({ desk_post_id: DESK_POST_ID }, {})) as ToolResult;
+      expect(result.isError).toBeUndefined();
+      const data = JSON.parse(result.content[0].text);
+      expect(data.warnings).toEqual([]);
+      expect(data.blockers).toEqual([]);
+    });
+
+    it("errors on an unknown post", async () => {
+      mockSql.mockResolvedValueOnce([]);
+      const tool = getTool(createTestServer(), "desk_lint");
+      const result = (await tool.handler({ desk_post_id: DESK_POST_ID }, {})) as ToolResult;
+      expect(result.isError).toBe(true);
+    });
+  });
+
+  describe("desk_attest", () => {
+    const fullInput = {
+      desk_post_id: DESK_POST_ID,
+      reviewer_user_id: mdUserRow.id,
+      reviewed_source_reports: true,
+      edited_for_accuracy: true,
+      framing_confirmed: true,
+    };
+
+    it("records an attestation as MD and moves the post to READY", async () => {
+      mockSql
+        .mockResolvedValueOnce([mdUserRow]) // getUser
+        .mockResolvedValueOnce([deskPost({ status: "DRAFT" })]) // select post
+        .mockResolvedValueOnce([attestation()]) // insert attestation
+        .mockResolvedValueOnce([]) // update post -> READY
+        .mockResolvedValueOnce([{ id: "audit" }]); // audit
+      const tool = getTool(createTestServer(), "desk_attest");
+      const result = (await tool.handler(fullInput, {})) as ToolResult;
+      expect(result.isError).toBeUndefined();
+      const data = JSON.parse(result.content[0].text);
+      expect(data.attestation.content_hash).toBe(hashPayload(BODY));
+      const updateCall = mockSql.mock.calls.find(
+        (c) => Array.isArray(c[0]) && c[0].join("").includes("UPDATE desk_posts"),
+      );
+      expect(updateCall?.join("")).toContain("'READY'");
+    });
+
+    it("rejects a non-MD reviewer (role re-derived from DB)", async () => {
+      mockSql.mockResolvedValueOnce([editorUserRow]); // getUser -> editor
+      const tool = getTool(createTestServer(), "desk_attest");
+      const result = (await tool.handler(fullInput, {})) as ToolResult;
+      expect(result.isError).toBe(true);
+    });
+
+    it("rejects when any confirmation is false", async () => {
+      mockSql.mockResolvedValueOnce([mdUserRow]); // getUser
+      const tool = getTool(createTestServer(), "desk_attest");
+      const result = (await tool.handler(
+        { ...fullInput, framing_confirmed: false },
+        {},
+      )) as ToolResult;
+      expect(result.isError).toBe(true);
+    });
+
+    it("rejects an unknown reviewer", async () => {
+      mockSql.mockResolvedValueOnce([]); // getUser -> none
+      const tool = getTool(createTestServer(), "desk_attest");
+      const result = (await tool.handler(fullInput, {})) as ToolResult;
+      expect(result.isError).toBe(true);
+    });
+  });
+
+  describe("desk_publish — THE GATE", () => {
+    const input = { desk_post_id: DESK_POST_ID, reviewer_user_id: mdUserRow.id };
+
+    it("publishes when role=md, hash matches, and zero blockers", async () => {
+      mockSql
+        .mockResolvedValueOnce([deskPost({ status: "READY" })]) // select post
+        .mockResolvedValueOnce([mdUserRow]) // getUser
+        .mockResolvedValueOnce([attestation({ content_hash: hashPayload(BODY) })]) // latest attestation
+        .mockResolvedValueOnce([deskPost({ status: "PUBLISHED", published_at: "2026-06-12T02:00:00Z" })]) // update
+        .mockResolvedValueOnce([{ id: "audit" }]); // audit
+      const tool = getTool(createTestServer(), "desk_publish");
+      const result = (await tool.handler(input, {})) as ToolResult;
+      expect(result.isError).toBeUndefined();
+      const data = JSON.parse(result.content[0].text);
+      expect(data.published).toBe(true);
+      expect(data.gate.passed).toBe(true);
+      expect(data.post.status).toBe("PUBLISHED");
+    });
+
+    it("blocks a non-MD reviewer (published:false, role_ok:false)", async () => {
+      mockSql
+        .mockResolvedValueOnce([deskPost({ status: "READY" })]) // select post
+        .mockResolvedValueOnce([editorUserRow]) // getUser -> editor
+        .mockResolvedValueOnce([attestation({ content_hash: hashPayload(BODY) })]) // attestation
+        .mockResolvedValueOnce([{ id: "audit" }]); // publish_blocked audit
+      const tool = getTool(createTestServer(), "desk_publish");
+      const result = (await tool.handler(input, {})) as ToolResult;
+      expect(result.isError).toBeUndefined();
+      const data = JSON.parse(result.content[0].text);
+      expect(data.published).toBe(false);
+      expect(data.gate.role_ok).toBe(false);
+    });
+
+    it("blocks when the body was edited after attestation (hash mismatch)", async () => {
+      mockSql
+        .mockResolvedValueOnce([deskPost({ status: "READY", markdown_body: "EDITED BODY" })]) // select post
+        .mockResolvedValueOnce([mdUserRow]) // getUser
+        .mockResolvedValueOnce([attestation({ content_hash: hashPayload(BODY) })]) // stale hash
+        .mockResolvedValueOnce([{ id: "audit" }]); // blocked audit
+      const tool = getTool(createTestServer(), "desk_publish");
+      const result = (await tool.handler(input, {})) as ToolResult;
+      expect(result.isError).toBeUndefined();
+      const data = JSON.parse(result.content[0].text);
+      expect(data.published).toBe(false);
+      expect(data.gate.role_ok).toBe(true);
+      expect(data.gate.hash_match).toBe(false);
+    });
+
+    it("blocks when there is no attestation", async () => {
+      mockSql
+        .mockResolvedValueOnce([deskPost({ status: "READY" })]) // select post
+        .mockResolvedValueOnce([mdUserRow]) // getUser
+        .mockResolvedValueOnce([]) // no attestation
+        .mockResolvedValueOnce([{ id: "audit" }]); // blocked audit
+      const tool = getTool(createTestServer(), "desk_publish");
+      const result = (await tool.handler(input, {})) as ToolResult;
+      expect(result.isError).toBeUndefined();
+      const data = JSON.parse(result.content[0].text);
+      expect(data.published).toBe(false);
+      expect(data.gate.hash_match).toBe(false);
+      expect(data.gate.reasons).toContain("no attestation found");
+    });
+
+    it("errors (not a gate-fail) when the post is not READY", async () => {
+      mockSql.mockResolvedValueOnce([deskPost({ status: "DRAFT" })]);
+      const tool = getTool(createTestServer(), "desk_publish");
+      const result = (await tool.handler(input, {})) as ToolResult;
+      expect(result.isError).toBe(true);
+    });
+
+    it("errors when the post is not found", async () => {
+      mockSql.mockResolvedValueOnce([]);
+      const tool = getTool(createTestServer(), "desk_publish");
+      const result = (await tool.handler(input, {})) as ToolResult;
+      expect(result.isError).toBe(true);
+    });
+  });
+
+  describe("desk_retract", () => {
+    const input = { desk_post_id: DESK_POST_ID, reviewer_user_id: mdUserRow.id };
+
+    it("retracts a PUBLISHED post as MD", async () => {
+      mockSql
+        .mockResolvedValueOnce([mdUserRow]) // getUser
+        .mockResolvedValueOnce([deskPost({ status: "RETRACTED" })]) // update returning
+        .mockResolvedValueOnce([{ id: "audit" }]); // audit
+      const tool = getTool(createTestServer(), "desk_retract");
+      const result = (await tool.handler(input, {})) as ToolResult;
+      expect(result.isError).toBeUndefined();
+      const data = JSON.parse(result.content[0].text);
+      expect(data.post.status).toBe("RETRACTED");
+    });
+
+    it("rejects retracting a non-PUBLISHED post", async () => {
+      mockSql
+        .mockResolvedValueOnce([mdUserRow]) // getUser
+        .mockResolvedValueOnce([]); // update matched nothing
+      const tool = getTool(createTestServer(), "desk_retract");
+      const result = (await tool.handler(input, {})) as ToolResult;
+      expect(result.isError).toBe(true);
+    });
+
+    it("rejects a non-MD reviewer", async () => {
+      mockSql.mockResolvedValueOnce([editorUserRow]); // getUser -> editor
+      const tool = getTool(createTestServer(), "desk_retract");
+      const result = (await tool.handler(input, {})) as ToolResult;
+      expect(result.isError).toBe(true);
+    });
+  });
+
+  describe("desk_list / desk_get", () => {
+    it("lists desk posts", async () => {
+      mockSql.mockResolvedValueOnce([deskPost(), deskPost({ id: "x", status: "PUBLISHED" })]);
+      const tool = getTool(createTestServer(), "desk_list");
+      const result = (await tool.handler({ limit: 100 }, {})) as ToolResult;
+      expect(result.isError).toBeUndefined();
+      const data = JSON.parse(result.content[0].text);
+      expect(data.posts).toHaveLength(2);
+    });
+
+    it("gets a post with its attestations", async () => {
+      mockSql
+        .mockResolvedValueOnce([deskPost()]) // select post
+        .mockResolvedValueOnce([attestation()]); // select attestations
+      const tool = getTool(createTestServer(), "desk_get");
+      const result = (await tool.handler({ desk_post_id: DESK_POST_ID }, {})) as ToolResult;
+      expect(result.isError).toBeUndefined();
+      const data = JSON.parse(result.content[0].text);
+      expect(data.post.id).toBe(DESK_POST_ID);
+      expect(data.attestations).toHaveLength(1);
+    });
+
+    it("errors getting an unknown post", async () => {
+      mockSql.mockResolvedValueOnce([]);
+      const tool = getTool(createTestServer(), "desk_get");
+      const result = (await tool.handler({ desk_post_id: DESK_POST_ID }, {})) as ToolResult;
+      expect(result.isError).toBe(true);
     });
   });
 });
