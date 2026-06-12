@@ -1135,6 +1135,24 @@ export class WebDatabaseClient {
     return (rows[0] as InjuryEntity) ?? null;
   }
 
+  async getEntity(entityId: string): Promise<InjuryEntity | null> {
+    const rows = await this.sql`
+      SELECT * FROM injury_entities WHERE id = ${entityId} LIMIT 1
+    `;
+    return (rows[0] as InjuryEntity) ?? null;
+  }
+
+  async listInjuryUpdates(entityId: string): Promise<InjuryUpdate[]> {
+    const rows = await this.sql`
+      SELECT id, entity_id, post_id, update_kind, severity_at_time,
+             team_timeline_weeks, otm_min_weeks, source_url, description, created_at
+      FROM injury_updates
+      WHERE entity_id = ${entityId}
+      ORDER BY created_at DESC
+    `;
+    return rows as InjuryUpdate[];
+  }
+
   async createInjuryEntity(input: {
     player_id: string;
     body_part?: string;

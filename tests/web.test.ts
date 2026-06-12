@@ -99,6 +99,46 @@ const sampleReview = {
   slug: samplePost.slug,
 };
 
+const sampleEntity = {
+  id: "770e8400-e29b-41d4-a716-446655440002",
+  player_id: "880e8400-e29b-41d4-a716-446655440003",
+  body_part: "ankle",
+  laterality: "RIGHT",
+  injury_type: "Ankle sprain",
+  status: "ACTIVE",
+  canonical_post_id: samplePost.id,
+  first_reported_at: "2026-03-24T00:00:00Z",
+  last_updated_at: "2026-03-26T00:00:00Z",
+  actual_return_date: null,
+};
+
+const sampleUpdates = [
+  {
+    id: "990e8400-e29b-41d4-a716-446655440005",
+    entity_id: sampleEntity.id,
+    post_id: samplePost.id,
+    update_kind: "TRACKING",
+    severity_at_time: "MODERATE",
+    team_timeline_weeks: 3,
+    otm_min_weeks: 2,
+    source_url: "https://espn.com/story/2",
+    description: "Limited in practice",
+    created_at: "2026-03-26T00:00:00Z",
+  },
+  {
+    id: "aa0e8400-e29b-41d4-a716-446655440006",
+    entity_id: sampleEntity.id,
+    post_id: samplePost.id,
+    update_kind: "INITIAL",
+    severity_at_time: "MODERATE",
+    team_timeline_weeks: 4,
+    otm_min_weeks: 2,
+    source_url: "https://espn.com/story/1",
+    description: "Initial report",
+    created_at: "2026-03-24T00:00:00Z",
+  },
+];
+
 describe("Web MCP Server", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -314,6 +354,74 @@ describe("Web MCP Server", () => {
 
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain("not found");
+    });
+  });
+
+  describe("web_get_entity", () => {
+    it("should resolve an entity by id", async () => {
+      mockSql.mockResolvedValue([sampleEntity]);
+
+      const server = createTestServer();
+      const tool = getTool(server, "web_get_entity");
+
+      const result = (await tool.handler(
+        { entity_id: sampleEntity.id },
+        {},
+      )) as { content: Array<{ text: string }> };
+
+      const data = JSON.parse(result.content[0].text);
+      expect(data.entity.id).toBe(sampleEntity.id);
+      expect(data.entity.canonical_post_id).toBe(samplePost.id);
+    });
+
+    it("should return error for missing entity", async () => {
+      mockSql.mockResolvedValue([]);
+
+      const server = createTestServer();
+      const tool = getTool(server, "web_get_entity");
+
+      const result = (await tool.handler(
+        { entity_id: "770e8400-e29b-41d4-a716-446655440099" },
+        {},
+      )) as { content: Array<{ text: string }>; isError?: boolean };
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("not found");
+    });
+  });
+
+  describe("web_list_injury_updates", () => {
+    it("should list updates newest-first", async () => {
+      mockSql.mockResolvedValue(sampleUpdates);
+
+      const server = createTestServer();
+      const tool = getTool(server, "web_list_injury_updates");
+
+      const result = (await tool.handler(
+        { entity_id: sampleEntity.id },
+        {},
+      )) as { content: Array<{ text: string }> };
+
+      const data = JSON.parse(result.content[0].text);
+      expect(data.updates).toHaveLength(2);
+      expect(data.updates[0].update_kind).toBe("TRACKING");
+      expect(data.updates[1].update_kind).toBe("INITIAL");
+    });
+
+    it("should return an empty array (not an error) when no updates exist", async () => {
+      mockSql.mockResolvedValue([]);
+
+      const server = createTestServer();
+      const tool = getTool(server, "web_list_injury_updates");
+
+      const result = (await tool.handler(
+        { entity_id: sampleEntity.id },
+        {},
+      )) as { content: Array<{ text: string }>; isError?: boolean };
+
+      expect(result.isError).toBeUndefined();
+      const data = JSON.parse(result.content[0].text);
+      expect(data.updates).toEqual([]);
     });
   });
 

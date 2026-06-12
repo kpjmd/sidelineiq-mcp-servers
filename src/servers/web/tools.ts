@@ -758,6 +758,51 @@ export function registerWebTools(server: McpServer): void {
     },
   );
 
+  // ── web_get_entity ──────────────────────────────────────────────────
+  server.tool(
+    "web_get_entity",
+    "Resolve an injury entity by id (player_id, body_part, laterality, injury_type, status, canonical_post_id, return date). Lets the Injury Desk walk a desk post's entity_id → canonical_post_id → web_get_post for fact-validation context.",
+    {
+      entity_id: z.string().uuid(),
+    },
+    async (input) => {
+      try {
+        const entity = await client.getEntity(input.entity_id);
+        if (!entity) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Error: Entity ${input.entity_id} not found. Verify the entity_id is correct.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        return toolSuccess({ entity });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_list_injury_updates ─────────────────────────────────────────
+  server.tool(
+    "web_list_injury_updates",
+    "List an injury entity's timeline updates newest-first (update_kind, severity_at_time, team_timeline_weeks, otm_min_weeks, source_url, description). Backs the Injury Desk entity-timeline panel. An empty array is a valid result, not an error.",
+    {
+      entity_id: z.string().uuid(),
+    },
+    async (input) => {
+      try {
+        const updates = await client.listInjuryUpdates(input.entity_id);
+        return toolSuccess({ updates });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
   // ── web_find_matching_entity ────────────────────────────────────────
   // The injury-identity dedup primitive. Replaces the 24h time-window check.
   // Given a resolved player and the body part / laterality / injury type
