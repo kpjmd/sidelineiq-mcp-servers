@@ -4,6 +4,21 @@ import { hashPayload } from "../../shared/hash.js";
 import { lintDeskPost, type LintFinding } from "./linter.js";
 import type { InjuryPost, MdReview, MdReviewStatus, PostStatus, Sport, ContentType } from "../../shared/types.js";
 
+// ── Date helpers (injury-thread accuracy math) ───────────────────────
+// Both operate on ISO date strings (YYYY-MM-DD) and stay in UTC to avoid
+// timezone drift on date-only values. Return ISO date strings so comparisons
+// against DATE columns are lexical.
+function daysBetween(fromIso: string, toIso: string): number {
+  const from = Date.parse(`${fromIso}T00:00:00Z`);
+  const to = Date.parse(`${toIso}T00:00:00Z`);
+  return Math.round((to - from) / 86_400_000);
+}
+
+function addWeeks(baseIso: string, weeks: number): string {
+  const base = Date.parse(`${baseIso}T00:00:00Z`);
+  return new Date(base + weeks * 7 * 86_400_000).toISOString().slice(0, 10);
+}
+
 // ── Audit log types ──────────────────────────────────────────────────
 export type AuditActor = "system" | "md" | "automation" | "agent";
 
@@ -198,6 +213,33 @@ export type UpdateKind =
   | "CORRECTION"
   | "RESOLUTION";
 
+export type DateConfidence = "unknown" | "possible" | "probable" | "confirmed";
+
+export interface DateResolutionSource {
+  url?: string;
+  title?: string;
+  stage: "api" | "web_search" | "md_manual";
+}
+
+export interface OtmProjection {
+  min_weeks: number;
+  max_weeks: number;
+  probability_week_2?: number;
+  probability_week_4?: number;
+  probability_week_8?: number;
+  projected_return_date?: string | null;
+  created_at?: string;
+}
+
+export interface AccuracyRecord {
+  projected_return_date: string | null;
+  actual_return_date: string | null;
+  error_days: number | null;
+  within_range: boolean | null;
+  otm_min_weeks: number | null;
+  otm_max_weeks: number | null;
+}
+
 export interface InjuryEntity {
   id: string;
   player_id: string;
@@ -209,6 +251,43 @@ export interface InjuryEntity {
   first_reported_at: string;
   last_updated_at: string;
   actual_return_date: string | null;
+  // Injury-thread date-resolution columns (migration 014). Present after the
+  // migration is applied; readers must tolerate absence on older rows.
+  injury_date: string | null;
+  injury_date_confidence: DateConfidence;
+  surgery_date: string | null;
+  surgery_confirmed: boolean;
+  date_resolution_sources: DateResolutionSource[] | null;
+  otm_projection: OtmProjection | null;
+  accuracy_record: AccuracyRecord | null;
+  returned_at: string | null;
+  closed_at: string | null;
+  needs_date_review: boolean;
+}
+
+// A thread row joined with player/team display fields for the MD dashboard list.
+export interface ThreadListItem {
+  id: string;
+  player_id: string;
+  athlete_name: string | null;
+  sport: string | null;
+  team_name: string | null;
+  body_part: string | null;
+  laterality: Laterality;
+  injury_type: string | null;
+  status: EntityStatus;
+  injury_date: string | null;
+  injury_date_confidence: DateConfidence;
+  surgery_date: string | null;
+  surgery_confirmed: boolean;
+  needs_date_review: boolean;
+  otm_projection: OtmProjection | null;
+  accuracy_record: AccuracyRecord | null;
+  actual_return_date: string | null;
+  returned_at: string | null;
+  closed_at: string | null;
+  first_reported_at: string;
+  last_updated_at: string;
 }
 
 export interface InjuryUpdate {
@@ -1202,6 +1281,163 @@ export class WebDatabaseClient {
       WHERE id = ${input.entity_id}
     `;
     return rows[0] as InjuryUpdate;
+  }
+
+  // ── Injury threads (migration 014) ───────────────────────────────────
+  // Persist resolved dates / provenance / projection onto the thread. Every
+  // field is COALESCE'd against the current value, so omitting a field leaves
+  // it untouched (the pre-OTM loop, the post-publish projection patch, and MD
+  // manual entry all call this with different subsets). needs_date_review is
+  // auto-derived from confidence ('unknown' → needs review) unless the caller
+  // sets it explicitly, or omitted entirely to keep the current value.
+  async updateThreadDates(input: {
+    entity_id: string;
+    injury_date?: string;
+    injury_date_confidence?: DateConfidence;
+    surgery_date?: string;
+    surgery_confirmed?: boolean;
+    date_resolution_sources?: DateResolutionSource[];
+    otm_projection?: OtmProjection;
+    needs_date_review?: boolean;
+  }): Promise<InjuryEntity> {
+    const needsReview =
+      input.needs_date_review !== undefined
+        ? input.needs_date_review
+        : input.injury_date_confidence !== undefined
+          ? input.injury_date_confidence === "unknown"
+          : null; // keep existing
+
+    const sources = input.date_resolution_sources
+      ? JSON.stringify(input.date_resolution_sources)
+      : null;
+    const projection = input.otm_projection ? JSON.stringify(input.otm_projection) : null;
+
+    const rows = await this.sql`
+      UPDATE injury_entities SET
+        injury_date = COALESCE(${input.injury_date ?? null}::date, injury_date),
+        injury_date_confidence = COALESCE(${input.injury_date_confidence ?? null}, injury_date_confidence),
+        surgery_date = COALESCE(${input.surgery_date ?? null}::date, surgery_date),
+        surgery_confirmed = COALESCE(${input.surgery_confirmed ?? null}::boolean, surgery_confirmed),
+        date_resolution_sources = COALESCE(${sources}::jsonb, date_resolution_sources),
+        otm_projection = COALESCE(${projection}::jsonb, otm_projection),
+        needs_date_review = COALESCE(${needsReview}::boolean, needs_date_review),
+        last_updated_at = NOW(),
+        updated_at = NOW()
+      WHERE id = ${input.entity_id}
+      RETURNING *
+    `;
+    if (rows.length === 0) {
+      throw new McpToolError(
+        `Injury thread ${input.entity_id} not found`,
+        "Verify the entity_id.",
+      );
+    }
+    return rows[0] as InjuryEntity;
+  }
+
+  // Close a thread when the athlete returns (RESOLVED) or retires (RETIRED).
+  // Computes accuracy_record from the frozen otm_projection vs the actual
+  // return. Idempotent: re-closing a RESOLVED thread recomputes in place.
+  async closeThread(input: {
+    entity_id: string;
+    actual_return_date?: string;
+    outcome?: "RESOLVED" | "RETIRED";
+    closed_by?: string;
+  }): Promise<InjuryEntity> {
+    const entity = await this.getEntity(input.entity_id);
+    if (!entity) {
+      throw new McpToolError(
+        `Injury thread ${input.entity_id} not found`,
+        "Verify the entity_id.",
+      );
+    }
+    const outcome = input.outcome ?? "RESOLVED";
+    const actual = input.actual_return_date ?? entity.actual_return_date ?? null;
+    const proj = entity.otm_projection;
+
+    let accuracy: AccuracyRecord | null = null;
+    if (proj) {
+      const projected = proj.projected_return_date ?? null;
+      const errorDays =
+        actual && projected ? daysBetween(projected, actual) : null;
+      let withinRange: boolean | null = null;
+      if (actual && entity.injury_date != null) {
+        const minReturn = addWeeks(entity.injury_date, proj.min_weeks);
+        const maxReturn = addWeeks(entity.injury_date, proj.max_weeks);
+        withinRange = actual >= minReturn && actual <= maxReturn;
+      }
+      accuracy = {
+        projected_return_date: projected,
+        actual_return_date: actual,
+        error_days: errorDays,
+        within_range: withinRange,
+        otm_min_weeks: proj.min_weeks ?? null,
+        otm_max_weeks: proj.max_weeks ?? null,
+      };
+    }
+
+    const rows = await this.sql`
+      UPDATE injury_entities SET
+        status = ${outcome},
+        actual_return_date = COALESCE(${actual}::date, actual_return_date),
+        accuracy_record = ${accuracy ? JSON.stringify(accuracy) : null}::jsonb,
+        returned_at = CASE WHEN ${outcome} = 'RESOLVED' THEN NOW() ELSE returned_at END,
+        closed_at = NOW(),
+        last_updated_at = NOW(),
+        updated_at = NOW()
+      WHERE id = ${input.entity_id}
+      RETURNING *
+    `;
+    const closed = rows[0] as InjuryEntity;
+
+    await this.auditAppend({
+      actor: input.closed_by && input.closed_by !== "system" ? "md" : "system",
+      actor_id: input.closed_by ?? undefined,
+      entity_type: "injury_thread",
+      entity_id: input.entity_id,
+      action: "thread_closed",
+      before: entity,
+      after: closed,
+      payload: { outcome, actual_return_date: actual, accuracy_record: accuracy },
+    });
+
+    return closed;
+  }
+
+  async getThread(
+    entityId: string,
+  ): Promise<{ entity: InjuryEntity; updates: InjuryUpdate[] } | null> {
+    const entity = await this.getEntity(entityId);
+    if (!entity) return null;
+    const updates = await this.listInjuryUpdates(entityId);
+    return { entity, updates };
+  }
+
+  async listThreads(input: {
+    status?: EntityStatus;
+    needs_date_review?: boolean;
+    limit?: number;
+  }): Promise<ThreadListItem[]> {
+    const status = input.status ?? null;
+    const needsReview = input.needs_date_review ?? null;
+    const limit = input.limit ?? 100;
+    const rows = await this.sql`
+      SELECT e.id, e.player_id, e.body_part, e.laterality, e.injury_type, e.status,
+             e.injury_date, e.injury_date_confidence, e.surgery_date, e.surgery_confirmed,
+             e.needs_date_review, e.otm_projection, e.accuracy_record,
+             e.actual_return_date, e.returned_at, e.closed_at,
+             e.first_reported_at, e.last_updated_at,
+             p.full_name AS athlete_name, p.sport AS sport,
+             t.display_name AS team_name
+      FROM injury_entities e
+      JOIN players p ON p.id = e.player_id
+      LEFT JOIN teams t ON t.id = p.current_team_id
+      WHERE (${status}::text IS NULL OR e.status = ${status})
+        AND (${needsReview}::boolean IS NULL OR e.needs_date_review = ${needsReview})
+      ORDER BY e.last_updated_at DESC
+      LIMIT ${limit}
+    `;
+    return rows as ThreadListItem[];
   }
 
   // ── Audit log ────────────────────────────────────────────────────────
