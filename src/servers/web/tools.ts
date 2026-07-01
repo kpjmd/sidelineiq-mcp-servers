@@ -880,6 +880,149 @@ export function registerWebTools(server: McpServer): void {
     },
   );
 
+  // ── Injury threads (Managed Session layer, migration 014) ───────────
+  // A "thread" is an injury_entities row read together with its injury_updates
+  // trajectory. These tools persist the resolved injury/surgery dates, the
+  // frozen OTM projection, and the closure/accuracy record on that entity.
+
+  // ── web_thread_update_dates ─────────────────────────────────────────
+  server.tool(
+    "web_thread_update_dates",
+    "Persist resolved injury/surgery dates and provenance onto an injury thread (the injury_entities row). Called by the pre-OTM date-resolution loop, the post-publish projection patch, and MD manual date entry. Every field is optional and COALESCE'd against the current value — omit a field to leave it untouched. needs_date_review auto-clears when confidence is not 'unknown' unless set explicitly.",
+    {
+      entity_id: z.string().uuid(),
+      injury_date: z.string().date().optional(),
+      injury_date_confidence: z.enum(["unknown", "possible", "probable", "confirmed"]).optional(),
+      surgery_date: z.string().date().optional(),
+      surgery_confirmed: z.boolean().optional(),
+      date_resolution_sources: z
+        .array(
+          z.object({
+            url: z.string().url().optional(),
+            title: z.string().optional(),
+            stage: z.enum(["api", "web_search", "md_manual"]),
+          }),
+        )
+        .optional(),
+      otm_projection: z
+        .object({
+          min_weeks: z.number(),
+          max_weeks: z.number(),
+          probability_week_2: z.number().optional(),
+          probability_week_4: z.number().optional(),
+          probability_week_8: z.number().optional(),
+          projected_return_date: z.string().date().nullable().optional(),
+          created_at: z.string().optional(),
+        })
+        .optional(),
+      needs_date_review: z.boolean().optional(),
+    },
+    async (input) => {
+      try {
+        const entity = await client.updateThreadDates(input);
+        return toolSuccess({ entity });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_thread_append_timeline ──────────────────────────────────────
+  server.tool(
+    "web_thread_append_timeline",
+    "Append a trajectory data-point to a thread before the post is drafted: the reported team timeline, OTM min weeks, severity, and source. Thin wrapper over injury_updates (reported_timeline_weeks maps to team_timeline_weeks); post_id is attached later by entity bookkeeping. Use update_kind INITIAL for the first report on a new thread, TRACKING for subsequent ones.",
+    {
+      entity_id: z.string().uuid(),
+      reported_timeline_weeks: z.number().int().min(0).optional(),
+      otm_min_weeks: z.number().int().min(0).optional(),
+      severity_at_time: severityEnum.optional(),
+      source_url: z.string().url().optional(),
+      description: z.string().optional(),
+      update_kind: z.enum(["INITIAL", "TRACKING", "CONFLICT", "CORRECTION"]).default("TRACKING"),
+    },
+    async (input) => {
+      try {
+        const update = await client.appendInjuryUpdate({
+          entity_id: input.entity_id,
+          update_kind: input.update_kind,
+          severity_at_time: input.severity_at_time,
+          team_timeline_weeks: input.reported_timeline_weeks,
+          otm_min_weeks: input.otm_min_weeks,
+          source_url: input.source_url,
+          description: input.description,
+        });
+        return toolSuccess({ update });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_thread_close ────────────────────────────────────────────────
+  server.tool(
+    "web_thread_close",
+    "Close an injury thread when the athlete returns (RESOLVED) or retires (RETIRED). Records actual_return_date, computes accuracy_record against the stored otm_projection, stamps returned_at/closed_at, writes an audit entry, and sets status. Idempotent: re-closing a RESOLVED thread recomputes the record in place.",
+    {
+      entity_id: z.string().uuid(),
+      actual_return_date: z.string().date().optional(),
+      outcome: z.enum(["RESOLVED", "RETIRED"]).default("RESOLVED"),
+      closed_by: z.string().optional(),
+    },
+    async (input) => {
+      try {
+        const entity = await client.closeThread(input);
+        return toolSuccess({ entity });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_thread_get ──────────────────────────────────────────────────
+  server.tool(
+    "web_thread_get",
+    "Return one injury thread in a single round-trip for the MD detail view: the entity row (resolved dates, OTM projection, accuracy record) plus its full injury_updates trajectory newest-first.",
+    {
+      entity_id: z.string().uuid(),
+    },
+    async (input) => {
+      try {
+        const thread = await client.getThread(input.entity_id);
+        if (!thread) {
+          return handleToolError(
+            new McpToolError(
+              `Injury thread ${input.entity_id} not found`,
+              "Verify the entity_id.",
+            ),
+            logger,
+          );
+        }
+        return toolSuccess(thread);
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_list_threads ────────────────────────────────────────────────
+  server.tool(
+    "web_list_threads",
+    "List injury threads for the MD dashboard, joined with athlete name / sport / team. Filter by status (ACTIVE/RESOLVED/RETIRED) and/or needs_date_review to drive the active, date-review, and accuracy views. Ordered by last_updated_at.",
+    {
+      status: z.enum(["ACTIVE", "RESOLVED", "RETIRED"]).optional(),
+      needs_date_review: z.boolean().optional(),
+      limit: z.number().int().min(1).max(500).default(100),
+    },
+    async (input) => {
+      try {
+        const threads = await client.listThreads(input);
+        return toolSuccess({ threads });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
   // ── web_audit_append ────────────────────────────────────────────────
   // Append-only audit trail. Every pipeline stage and MD action SHOULD write
   // one entry here. before/after are full payloads; the server hashes them
