@@ -3,6 +3,7 @@ import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createLogger } from "../../shared/logger.js";
+import { requireMcpAuth } from "../../shared/auth.js";
 import { registerFarcasterTools } from "./tools.js";
 import { fileURLToPath } from "node:url";
 
@@ -13,6 +14,7 @@ export function createFarcasterServer(): { app: express.Express; port: number } 
 
   const app = express();
   app.use(express.json());
+  app.use("/mcp", requireMcpAuth);
 
   app.post("/mcp", async (req, res) => {
     try {
