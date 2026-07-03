@@ -5,18 +5,22 @@ import { lintDeskPost, type LintFinding } from "./linter.js";
 import type { InjuryPost, MdReview, MdReviewStatus, PostStatus, Sport, ContentType } from "../../shared/types.js";
 
 // ── Date helpers (injury-thread accuracy math) ───────────────────────
-// Both operate on ISO date strings (YYYY-MM-DD) and stay in UTC to avoid
-// timezone drift on date-only values. Return ISO date strings so comparisons
-// against DATE columns are lexical.
-function daysBetween(fromIso: string, toIso: string): number {
-  const from = Date.parse(`${fromIso}T00:00:00Z`);
-  const to = Date.parse(`${toIso}T00:00:00Z`);
-  return Math.round((to - from) / 86_400_000);
+// Inputs may be a 'YYYY-MM-DD' string (tool params) OR a JS Date (the neon
+// driver returns DATE columns as Date objects). toIsoDate normalizes both to a
+// plain 'YYYY-MM-DD' string so comparisons/arithmetic stay in UTC and lexical.
+function toIsoDate(value: string | Date): string {
+  return new Date(value).toISOString().slice(0, 10);
 }
 
-function addWeeks(baseIso: string, weeks: number): string {
-  const base = Date.parse(`${baseIso}T00:00:00Z`);
-  return new Date(base + weeks * 7 * 86_400_000).toISOString().slice(0, 10);
+function daysBetween(from: string | Date, to: string | Date): number {
+  const f = new Date(`${toIsoDate(from)}T00:00:00Z`).getTime();
+  const t = new Date(`${toIsoDate(to)}T00:00:00Z`).getTime();
+  return Math.round((t - f) / 86_400_000);
+}
+
+function addWeeks(base: string | Date, weeks: number): string {
+  const b = new Date(`${toIsoDate(base)}T00:00:00Z`).getTime();
+  return new Date(b + weeks * 7 * 86_400_000).toISOString().slice(0, 10);
 }
 
 // ── Audit log types ──────────────────────────────────────────────────
@@ -1352,23 +1356,31 @@ export class WebDatabaseClient {
       );
     }
     const outcome = input.outcome ?? "RESOLVED";
-    const actual = input.actual_return_date ?? entity.actual_return_date ?? null;
+    // Normalize to 'YYYY-MM-DD' up front: input.actual_return_date is a string,
+    // but entity.actual_return_date / injury_date come off the driver as Dates.
+    const actualIso = input.actual_return_date
+      ? toIsoDate(input.actual_return_date)
+      : entity.actual_return_date
+        ? toIsoDate(entity.actual_return_date)
+        : null;
     const proj = entity.otm_projection;
 
     let accuracy: AccuracyRecord | null = null;
     if (proj) {
-      const projected = proj.projected_return_date ?? null;
+      const projected = proj.projected_return_date
+        ? toIsoDate(proj.projected_return_date)
+        : null;
       const errorDays =
-        actual && projected ? daysBetween(projected, actual) : null;
+        actualIso && projected ? daysBetween(projected, actualIso) : null;
       let withinRange: boolean | null = null;
-      if (actual && entity.injury_date != null) {
+      if (actualIso && entity.injury_date != null) {
         const minReturn = addWeeks(entity.injury_date, proj.min_weeks);
         const maxReturn = addWeeks(entity.injury_date, proj.max_weeks);
-        withinRange = actual >= minReturn && actual <= maxReturn;
+        withinRange = actualIso >= minReturn && actualIso <= maxReturn;
       }
       accuracy = {
         projected_return_date: projected,
-        actual_return_date: actual,
+        actual_return_date: actualIso,
         error_days: errorDays,
         within_range: withinRange,
         otm_min_weeks: proj.min_weeks ?? null,
@@ -1379,7 +1391,7 @@ export class WebDatabaseClient {
     const rows = await this.sql`
       UPDATE injury_entities SET
         status = ${outcome},
-        actual_return_date = COALESCE(${actual}::date, actual_return_date),
+        actual_return_date = COALESCE(${actualIso}::date, actual_return_date),
         accuracy_record = ${accuracy ? JSON.stringify(accuracy) : null}::jsonb,
         returned_at = CASE WHEN ${outcome} = 'RESOLVED' THEN NOW() ELSE returned_at END,
         closed_at = NOW(),
@@ -1398,7 +1410,7 @@ export class WebDatabaseClient {
       action: "thread_closed",
       before: entity,
       after: closed,
-      payload: { outcome, actual_return_date: actual, accuracy_record: accuracy },
+      payload: { outcome, actual_return_date: actualIso, accuracy_record: accuracy },
     });
 
     return closed;
