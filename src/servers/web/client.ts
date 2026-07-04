@@ -2,26 +2,19 @@ import { getDatabase } from "../../shared/database.js";
 import { McpToolError } from "../../shared/errors.js";
 import { hashPayload } from "../../shared/hash.js";
 import { lintDeskPost, type LintFinding } from "./linter.js";
+import {
+  normalizeEntityDates,
+  normalizeThreadListItem,
+  normalizePostDates,
+} from "./date-utils.js";
+import {
+  evaluatePublishGate,
+  computeAccuracyRecord,
+  resolveActualIso,
+  assertCanAttest,
+  slugify,
+} from "./service.js";
 import type { InjuryPost, MdReview, MdReviewStatus, PostStatus, Sport, ContentType } from "../../shared/types.js";
-
-// ── Date helpers (injury-thread accuracy math) ───────────────────────
-// Inputs may be a 'YYYY-MM-DD' string (tool params) OR a JS Date (the neon
-// driver returns DATE columns as Date objects). toIsoDate normalizes both to a
-// plain 'YYYY-MM-DD' string so comparisons/arithmetic stay in UTC and lexical.
-function toIsoDate(value: string | Date): string {
-  return new Date(value).toISOString().slice(0, 10);
-}
-
-function daysBetween(from: string | Date, to: string | Date): number {
-  const f = new Date(`${toIsoDate(from)}T00:00:00Z`).getTime();
-  const t = new Date(`${toIsoDate(to)}T00:00:00Z`).getTime();
-  return Math.round((t - f) / 86_400_000);
-}
-
-function addWeeks(base: string | Date, weeks: number): string {
-  const b = new Date(`${toIsoDate(base)}T00:00:00Z`).getTime();
-  return new Date(b + weeks * 7 * 86_400_000).toISOString().slice(0, 10);
-}
 
 // ── Audit log types ──────────────────────────────────────────────────
 export type AuditActor = "system" | "md" | "automation" | "agent";
@@ -527,23 +520,29 @@ export class WebDatabaseClient {
   // ── Slug helpers ────────────────────────────────────────────────────
   private generateBaseSlug(athleteName: string, injuryType: string, date: Date): string {
     const dateStr = date.toISOString().split("T")[0];
-    return `${athleteName}-${injuryType}-${dateStr}`
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "")
-      .replace(/\s+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "");
+    return slugify(`${athleteName}-${injuryType}-${dateStr}`);
   }
 
-  private async resolveUniqueSlug(baseSlug: string): Promise<string> {
-    let rows = await this.sql`SELECT id FROM injury_posts WHERE slug = ${baseSlug}`;
-    if (rows.length === 0) return baseSlug;
+  // Shared uniqueness loop: append -2..-99, falling back to a timestamp suffix.
+  // Table-specific existence is supplied as a probe so both callers keep tagged
+  // template literals (table names cannot be parameterized).
+  private async resolveUniqueSlugWith(
+    baseSlug: string,
+    exists: (slug: string) => Promise<boolean>,
+  ): Promise<string> {
+    if (!(await exists(baseSlug))) return baseSlug;
     for (let i = 2; i <= 99; i++) {
       const candidate = `${baseSlug}-${i}`;
-      rows = await this.sql`SELECT id FROM injury_posts WHERE slug = ${candidate}`;
-      if (rows.length === 0) return candidate;
+      if (!(await exists(candidate))) return candidate;
     }
     return `${baseSlug}-${Date.now()}`;
+  }
+
+  private resolveUniqueSlug(baseSlug: string): Promise<string> {
+    return this.resolveUniqueSlugWith(
+      baseSlug,
+      async (slug) => (await this.sql`SELECT id FROM injury_posts WHERE slug = ${slug}`).length > 0,
+    );
   }
 
   // ── Posts ────────────────────────────────────────────────────────────
@@ -575,7 +574,7 @@ export class WebDatabaseClient {
       )
       RETURNING *
     `;
-    return rows[0] as InjuryPost;
+    return normalizePostDates(rows[0] as InjuryPost);
   }
 
   async updatePost(
@@ -624,7 +623,7 @@ export class WebDatabaseClient {
       );
     }
 
-    return rows[0] as InjuryPost;
+    return normalizePostDates(rows[0] as InjuryPost);
   }
 
   async countTrackingChildren(parentId: string): Promise<number> {
@@ -668,7 +667,7 @@ export class WebDatabaseClient {
       );
     }
 
-    const post = rows[0] as InjuryPost;
+    const post = normalizePostDates(rows[0] as InjuryPost);
 
     // Keep the md_reviews audit row in sync so the admin dashboard's
     // PENDING queue reflects the approval.
@@ -685,21 +684,21 @@ export class WebDatabaseClient {
     const rows = await this.sql`
       SELECT * FROM injury_posts WHERE id = ${id}
     `;
-    return (rows[0] as InjuryPost) ?? null;
+    return rows[0] ? normalizePostDates(rows[0] as InjuryPost) : null;
   }
 
   async getPostBySlug(slug: string): Promise<InjuryPost | null> {
     const rows = await this.sql`
       SELECT * FROM injury_posts WHERE slug = ${slug}
     `;
-    return (rows[0] as InjuryPost) ?? null;
+    return rows[0] ? normalizePostDates(rows[0] as InjuryPost) : null;
   }
 
   async getPostBySocialId(platform: 'twitter' | 'farcaster', socialId: string): Promise<InjuryPost | null> {
     const rows = platform === 'twitter'
       ? await this.sql`SELECT * FROM injury_posts WHERE twitter_id = ${socialId} LIMIT 1`
       : await this.sql`SELECT * FROM injury_posts WHERE farcaster_hash = ${socialId} LIMIT 1`;
-    return (rows[0] as InjuryPost) ?? null;
+    return rows[0] ? normalizePostDates(rows[0] as InjuryPost) : null;
   }
 
   async flagForMdReview(
@@ -748,7 +747,7 @@ export class WebDatabaseClient {
       VALUES (${id}, ${reason}, 'PENDING')
     `;
 
-    return rows[0] as InjuryPost;
+    return normalizePostDates(rows[0] as InjuryPost);
   }
 
   async listPosts(
@@ -797,7 +796,7 @@ export class WebDatabaseClient {
     const rows = await this.sql(dataQuery, dataValues);
 
     return {
-      posts: rows as InjuryPost[],
+      posts: (rows as InjuryPost[]).map(normalizePostDates),
       total,
     };
   }
@@ -1120,7 +1119,7 @@ export class WebDatabaseClient {
     `;
     const rows = await this.sql(query, [newValue, newSummary, postId]);
     return {
-      post: rows[0] as InjuryPost,
+      post: normalizePostDates(rows[0] as InjuryPost),
       previous_value: previousValue,
     };
   }
@@ -1215,14 +1214,14 @@ export class WebDatabaseClient {
       WHERE u.post_id = ${postId}
       LIMIT 1
     `;
-    return (rows[0] as InjuryEntity) ?? null;
+    return rows[0] ? normalizeEntityDates(rows[0] as InjuryEntity) : null;
   }
 
   async getEntity(entityId: string): Promise<InjuryEntity | null> {
     const rows = await this.sql`
       SELECT * FROM injury_entities WHERE id = ${entityId} LIMIT 1
     `;
-    return (rows[0] as InjuryEntity) ?? null;
+    return rows[0] ? normalizeEntityDates(rows[0] as InjuryEntity) : null;
   }
 
   async listInjuryUpdates(entityId: string): Promise<InjuryUpdate[]> {
@@ -1254,7 +1253,7 @@ export class WebDatabaseClient {
       )
       RETURNING *
     `;
-    return rows[0] as InjuryEntity;
+    return normalizeEntityDates(rows[0] as InjuryEntity);
   }
 
   async appendInjuryUpdate(input: {
@@ -1336,7 +1335,7 @@ export class WebDatabaseClient {
         "Verify the entity_id.",
       );
     }
-    return rows[0] as InjuryEntity;
+    return normalizeEntityDates(rows[0] as InjuryEntity);
   }
 
   // Close a thread when the athlete returns (RESOLVED) or retires (RETIRED).
@@ -1356,37 +1355,10 @@ export class WebDatabaseClient {
       );
     }
     const outcome = input.outcome ?? "RESOLVED";
-    // Normalize to 'YYYY-MM-DD' up front: input.actual_return_date is a string,
-    // but entity.actual_return_date / injury_date come off the driver as Dates.
-    const actualIso = input.actual_return_date
-      ? toIsoDate(input.actual_return_date)
-      : entity.actual_return_date
-        ? toIsoDate(entity.actual_return_date)
-        : null;
-    const proj = entity.otm_projection;
-
-    let accuracy: AccuracyRecord | null = null;
-    if (proj) {
-      const projected = proj.projected_return_date
-        ? toIsoDate(proj.projected_return_date)
-        : null;
-      const errorDays =
-        actualIso && projected ? daysBetween(projected, actualIso) : null;
-      let withinRange: boolean | null = null;
-      if (actualIso && entity.injury_date != null) {
-        const minReturn = addWeeks(entity.injury_date, proj.min_weeks);
-        const maxReturn = addWeeks(entity.injury_date, proj.max_weeks);
-        withinRange = actualIso >= minReturn && actualIso <= maxReturn;
-      }
-      accuracy = {
-        projected_return_date: projected,
-        actual_return_date: actualIso,
-        error_days: errorDays,
-        within_range: withinRange,
-        otm_min_weeks: proj.min_weeks ?? null,
-        otm_max_weeks: proj.max_weeks ?? null,
-      };
-    }
+    // entity dates are already normalized to 'YYYY-MM-DD' by getEntity; the pure
+    // service functions accept strings or Dates either way.
+    const actualIso = resolveActualIso(entity, input.actual_return_date);
+    const accuracy = computeAccuracyRecord(entity, actualIso);
 
     const rows = await this.sql`
       UPDATE injury_entities SET
@@ -1400,7 +1372,7 @@ export class WebDatabaseClient {
       WHERE id = ${input.entity_id}
       RETURNING *
     `;
-    const closed = rows[0] as InjuryEntity;
+    const closed = normalizeEntityDates(rows[0] as InjuryEntity);
 
     await this.auditAppend({
       actor: input.closed_by && input.closed_by !== "system" ? "md" : "system",
@@ -1449,7 +1421,7 @@ export class WebDatabaseClient {
       ORDER BY e.last_updated_at DESC
       LIMIT ${limit}
     `;
-    return rows as ThreadListItem[];
+    return (rows as ThreadListItem[]).map(normalizeThreadListItem);
   }
 
   // ── Audit log ────────────────────────────────────────────────────────
@@ -1692,24 +1664,14 @@ export class WebDatabaseClient {
   // publish) so the gate's equality check is meaningful. Always hash the body
   // string — never draft_json, never an object.
   private deskSlugify(title: string): string {
-    return title
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "")
-      .replace(/\s+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "")
-      .slice(0, 200) || "injury-desk-post";
+    return slugify(title, 200, "injury-desk-post");
   }
 
-  private async resolveUniqueDeskSlug(baseSlug: string): Promise<string> {
-    let rows = await this.sql`SELECT id FROM desk_posts WHERE slug = ${baseSlug}`;
-    if (rows.length === 0) return baseSlug;
-    for (let i = 2; i <= 99; i++) {
-      const candidate = `${baseSlug}-${i}`;
-      rows = await this.sql`SELECT id FROM desk_posts WHERE slug = ${candidate}`;
-      if (rows.length === 0) return candidate;
-    }
-    return `${baseSlug}-${Date.now()}`;
+  private resolveUniqueDeskSlug(baseSlug: string): Promise<string> {
+    return this.resolveUniqueSlugWith(
+      baseSlug,
+      async (slug) => (await this.sql`SELECT id FROM desk_posts WHERE slug = ${slug}`).length > 0,
+    );
   }
 
   // Create a DRAFT desk_post from an ACCEPTED candidate. Writes the v1 version
@@ -1814,9 +1776,18 @@ export class WebDatabaseClient {
         version = ${newVersion},
         status = ${newStatus},
         updated_at = NOW()
-      WHERE id = ${input.desk_post_id}
+      WHERE id = ${input.desk_post_id} AND status = ${prev.status} AND version = ${prev.version}
       RETURNING *
     `;
+    // Optimistic lock: if the row moved (e.g. a concurrent publish/edit) between
+    // the read above and this write, the guarded UPDATE matches nothing rather
+    // than silently mutating a now-PUBLISHED post back to DRAFT.
+    if (updated.length === 0) {
+      throw new McpToolError(
+        `Desk post ${input.desk_post_id} changed concurrently`,
+        "The post was modified since it was read. Re-fetch it with desk_get and retry the edit.",
+      );
+    }
     const post = updated[0] as DeskPost;
 
     await this.sql`
@@ -1867,28 +1838,6 @@ export class WebDatabaseClient {
   // the post at it, and moves the post to READY.
   async attestDeskPost(input: AttestInput): Promise<DeskAttestation> {
     const user = await this.getUser(input.reviewer_user_id);
-    if (!user) {
-      throw new McpToolError(
-        `Reviewer ${input.reviewer_user_id} not found`,
-        "reviewer_user_id must be a known users.id (a UUID = session.user.id).",
-      );
-    }
-    if (user.role !== "md") {
-      throw new McpToolError(
-        `Reviewer ${input.reviewer_user_id} has role '${user.role}', not 'md'`,
-        "Only an MD identity can attest a desk post.",
-      );
-    }
-    if (
-      !input.reviewed_source_reports ||
-      !input.edited_for_accuracy ||
-      !input.framing_confirmed
-    ) {
-      throw new McpToolError(
-        "Cannot attest without confirming all three review steps",
-        "reviewed_source_reports, edited_for_accuracy, and framing_confirmed must all be true.",
-      );
-    }
 
     const postRows = await this.sql`SELECT * FROM desk_posts WHERE id = ${input.desk_post_id}`;
     if (postRows.length === 0) {
@@ -1898,12 +1847,8 @@ export class WebDatabaseClient {
       );
     }
     const post = postRows[0] as DeskPost;
-    if (post.status !== "DRAFT" && post.status !== "READY") {
-      throw new McpToolError(
-        `Desk post ${input.desk_post_id} is ${post.status} and cannot be attested`,
-        "Only DRAFT or READY posts can be attested.",
-      );
-    }
+    // Role (re-derived from DB), the three confirmations, and attestable status.
+    assertCanAttest(user, input, post);
 
     const contentHash = hashPayload(post.markdown_body);
     const attRows = await this.sql`
@@ -1918,12 +1863,21 @@ export class WebDatabaseClient {
     `;
     const attestation = attRows[0] as DeskAttestation;
 
-    await this.sql`
+    // Status-guarded so a publish/retract landing between the read above and
+    // this write can't demote a live post back to READY with a fresh attestation.
+    const moved = await this.sql`
       UPDATE desk_posts
       SET attestation_id = ${attestation.id}, reviewed_by = ${input.reviewer_user_id},
           status = 'READY', updated_at = NOW()
-      WHERE id = ${input.desk_post_id}
+      WHERE id = ${input.desk_post_id} AND status IN ('DRAFT', 'READY')
+      RETURNING id
     `;
+    if (moved.length === 0) {
+      throw new McpToolError(
+        `Desk post ${input.desk_post_id} changed status during attestation`,
+        "The post left DRAFT/READY since it was read. Re-fetch it with desk_get and retry.",
+      );
+    }
 
     await this.auditAppend({
       actor: "md",
@@ -1959,17 +1913,13 @@ export class WebDatabaseClient {
     }
 
     const user = await this.getUser(reviewerUserId);
-    const role_ok = !!user && user.role === "md";
 
-    const attRows = await this.sql`
-      SELECT * FROM desk_attestations
-      WHERE desk_post_id = ${deskPostId}
-      ORDER BY timestamp DESC
-      LIMIT 1
-    `;
+    // Use the attestation the attest flow explicitly pointed the post at — the
+    // deterministic source of truth — not a nondeterministic latest-by-timestamp.
+    const attRows = post.attestation_id
+      ? await this.sql`SELECT * FROM desk_attestations WHERE id = ${post.attestation_id}`
+      : [];
     const latest = attRows.length > 0 ? (attRows[0] as DeskAttestation) : null;
-    const currentHash = hashPayload(post.markdown_body);
-    const hash_match = !!latest && latest.content_hash === currentHash;
 
     const { blockers } = await lintDeskPost({
       title: post.title,
@@ -1979,23 +1929,21 @@ export class WebDatabaseClient {
       disclaimer_present: post.disclaimer_present,
     });
 
-    const reasons: string[] = [];
-    if (!role_ok) reasons.push("reviewer is not an MD");
-    if (!latest) reasons.push("no attestation found");
-    else if (!hash_match) reasons.push("post edited after attestation (content hash mismatch)");
-    for (const b of blockers) reasons.push(`${b.code}: ${b.message}`);
+    const gate = evaluatePublishGate(post, user, latest, blockers);
 
-    const passed = role_ok && hash_match && blockers.length === 0;
-    const gate: PublishGate = { role_ok, hash_match, blockers, passed, reasons };
-
-    if (!passed) {
+    if (!gate.passed) {
       await this.auditAppend({
         actor: "md",
         actor_id: reviewerUserId,
         entity_type: "desk_post",
         entity_id: post.id,
         action: "publish_blocked",
-        payload: { role_ok, hash_match, blocker_count: blockers.length, reasons },
+        payload: {
+          role_ok: gate.role_ok,
+          hash_match: gate.hash_match,
+          blocker_count: blockers.length,
+          reasons: gate.reasons,
+        },
       });
       return { published: false, gate, post: null };
     }
@@ -2006,6 +1954,27 @@ export class WebDatabaseClient {
       WHERE id = ${deskPostId} AND status = 'READY'
       RETURNING *
     `;
+    // If the row left READY between the gate check and this write, the guarded
+    // UPDATE matches nothing. Report a blocked publish (with a concurrency
+    // reason) rather than a false published:true / undefined post — the audit
+    // trail must never record a publish that did not happen.
+    if (updated.length === 0) {
+      const concurrentReason = "post status changed during publish (concurrent modification)";
+      const blockedGate: PublishGate = {
+        ...gate,
+        passed: false,
+        reasons: [...gate.reasons, concurrentReason],
+      };
+      await this.auditAppend({
+        actor: "md",
+        actor_id: reviewerUserId,
+        entity_type: "desk_post",
+        entity_id: post.id,
+        action: "publish_blocked",
+        payload: { role_ok: gate.role_ok, hash_match: gate.hash_match, reasons: blockedGate.reasons },
+      });
+      return { published: false, gate: blockedGate, post: null };
+    }
     const publishedPost = updated[0] as DeskPost;
 
     await this.auditAppend({
@@ -2014,7 +1983,7 @@ export class WebDatabaseClient {
       entity_type: "desk_post",
       entity_id: post.id,
       action: "publish",
-      payload: { attestation_id: latest?.id ?? null, content_hash: currentHash, slug: post.slug },
+      payload: { attestation_id: latest?.id ?? null, content_hash: hashPayload(post.markdown_body), slug: post.slug },
     });
     return { published: true, gate, post: publishedPost };
   }

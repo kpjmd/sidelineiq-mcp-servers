@@ -749,6 +749,7 @@ describe("Web MCP Server", () => {
   };
   const editorUserRow = { ...mdUserRow, id: "770e8400-e29b-41d4-a716-446655440003", role: "editor" };
   const DESK_POST_ID = "880e8400-e29b-41d4-a716-446655440000";
+  const ATTESTATION_ID = "bb0e8400-e29b-41d4-a716-446655440000";
   const CANDIDATE_ID = "990e8400-e29b-41d4-a716-446655440000";
   const ENTITY_ID = "aa0e8400-e29b-41d4-a716-446655440000";
   const AUTHOR_ID = mdUserRow.id;
@@ -787,7 +788,7 @@ describe("Web MCP Server", () => {
 
   function attestation(overrides: Record<string, unknown> = {}) {
     return {
-      id: "bb0e8400-e29b-41d4-a716-446655440000",
+      id: ATTESTATION_ID,
       desk_post_id: DESK_POST_ID,
       reviewer_user_id: mdUserRow.id,
       reviewed_source_reports: true,
@@ -890,6 +891,19 @@ describe("Web MCP Server", () => {
       )) as ToolResult;
       expect(result.isError).toBe(true);
     });
+
+    it("errors when the optimistic-lock UPDATE matches nothing (concurrent change)", async () => {
+      mockSql
+        .mockResolvedValueOnce([deskPost({ status: "DRAFT", version: 1 })]) // select
+        .mockResolvedValueOnce([]); // guarded update matched nothing (row moved)
+      const tool = getTool(createTestServer(), "desk_update_draft");
+      const result = (await tool.handler(
+        { desk_post_id: DESK_POST_ID, edited_by: AUTHOR_ID, markdown_body: BODY + " edit" },
+        {},
+      )) as ToolResult;
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("concurrently");
+    });
   });
 
   describe("desk_lint", () => {
@@ -977,7 +991,7 @@ describe("Web MCP Server", () => {
         .mockResolvedValueOnce([mdUserRow]) // getUser
         .mockResolvedValueOnce([deskPost({ status: "DRAFT" })]) // select post
         .mockResolvedValueOnce([attestation()]) // insert attestation
-        .mockResolvedValueOnce([]) // update post -> READY
+        .mockResolvedValueOnce([{ id: DESK_POST_ID }]) // status-guarded update post -> READY
         .mockResolvedValueOnce([{ id: "audit" }]); // audit
       const tool = getTool(createTestServer(), "desk_attest");
       const result = (await tool.handler(fullInput, {})) as ToolResult;
@@ -991,14 +1005,18 @@ describe("Web MCP Server", () => {
     });
 
     it("rejects a non-MD reviewer (role re-derived from DB)", async () => {
-      mockSql.mockResolvedValueOnce([editorUserRow]); // getUser -> editor
+      mockSql
+        .mockResolvedValueOnce([editorUserRow]) // getUser -> editor
+        .mockResolvedValueOnce([deskPost({ status: "DRAFT" })]); // select post
       const tool = getTool(createTestServer(), "desk_attest");
       const result = (await tool.handler(fullInput, {})) as ToolResult;
       expect(result.isError).toBe(true);
     });
 
     it("rejects when any confirmation is false", async () => {
-      mockSql.mockResolvedValueOnce([mdUserRow]); // getUser
+      mockSql
+        .mockResolvedValueOnce([mdUserRow]) // getUser
+        .mockResolvedValueOnce([deskPost({ status: "DRAFT" })]); // select post
       const tool = getTool(createTestServer(), "desk_attest");
       const result = (await tool.handler(
         { ...fullInput, framing_confirmed: false },
@@ -1008,10 +1026,24 @@ describe("Web MCP Server", () => {
     });
 
     it("rejects an unknown reviewer", async () => {
-      mockSql.mockResolvedValueOnce([]); // getUser -> none
+      mockSql
+        .mockResolvedValueOnce([]) // getUser -> none
+        .mockResolvedValueOnce([deskPost({ status: "DRAFT" })]); // select post
       const tool = getTool(createTestServer(), "desk_attest");
       const result = (await tool.handler(fullInput, {})) as ToolResult;
       expect(result.isError).toBe(true);
+    });
+
+    it("errors when the status-guarded UPDATE matches nothing (concurrent publish)", async () => {
+      mockSql
+        .mockResolvedValueOnce([mdUserRow]) // getUser
+        .mockResolvedValueOnce([deskPost({ status: "DRAFT" })]) // select post
+        .mockResolvedValueOnce([attestation()]) // insert attestation
+        .mockResolvedValueOnce([]); // guarded update -> READY matched nothing
+      const tool = getTool(createTestServer(), "desk_attest");
+      const result = (await tool.handler(fullInput, {})) as ToolResult;
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("changed status");
     });
   });
 
@@ -1020,9 +1052,9 @@ describe("Web MCP Server", () => {
 
     it("publishes when role=md, hash matches, and zero blockers", async () => {
       mockSql
-        .mockResolvedValueOnce([deskPost({ status: "READY" })]) // select post
+        .mockResolvedValueOnce([deskPost({ status: "READY", attestation_id: ATTESTATION_ID })]) // select post
         .mockResolvedValueOnce([mdUserRow]) // getUser
-        .mockResolvedValueOnce([attestation({ content_hash: hashPayload(BODY) })]) // latest attestation
+        .mockResolvedValueOnce([attestation({ content_hash: hashPayload(BODY) })]) // attestation by id
         .mockResolvedValueOnce([deskPost({ status: "PUBLISHED", published_at: "2026-06-12T02:00:00Z" })]) // update
         .mockResolvedValueOnce([{ id: "audit" }]); // audit
       const tool = getTool(createTestServer(), "desk_publish");
@@ -1036,9 +1068,9 @@ describe("Web MCP Server", () => {
 
     it("blocks a non-MD reviewer (published:false, role_ok:false)", async () => {
       mockSql
-        .mockResolvedValueOnce([deskPost({ status: "READY" })]) // select post
+        .mockResolvedValueOnce([deskPost({ status: "READY", attestation_id: ATTESTATION_ID })]) // select post
         .mockResolvedValueOnce([editorUserRow]) // getUser -> editor
-        .mockResolvedValueOnce([attestation({ content_hash: hashPayload(BODY) })]) // attestation
+        .mockResolvedValueOnce([attestation({ content_hash: hashPayload(BODY) })]) // attestation by id
         .mockResolvedValueOnce([{ id: "audit" }]); // publish_blocked audit
       const tool = getTool(createTestServer(), "desk_publish");
       const result = (await tool.handler(input, {})) as ToolResult;
@@ -1050,7 +1082,7 @@ describe("Web MCP Server", () => {
 
     it("blocks when the body was edited after attestation (hash mismatch)", async () => {
       mockSql
-        .mockResolvedValueOnce([deskPost({ status: "READY", markdown_body: "EDITED BODY" })]) // select post
+        .mockResolvedValueOnce([deskPost({ status: "READY", markdown_body: "EDITED BODY", attestation_id: ATTESTATION_ID })]) // select post
         .mockResolvedValueOnce([mdUserRow]) // getUser
         .mockResolvedValueOnce([attestation({ content_hash: hashPayload(BODY) })]) // stale hash
         .mockResolvedValueOnce([{ id: "audit" }]); // blocked audit
@@ -1064,10 +1096,10 @@ describe("Web MCP Server", () => {
     });
 
     it("blocks when there is no attestation", async () => {
+      // attestation_id null → the by-id fetch is skipped; gate sees no attestation.
       mockSql
-        .mockResolvedValueOnce([deskPost({ status: "READY" })]) // select post
+        .mockResolvedValueOnce([deskPost({ status: "READY", attestation_id: null })]) // select post
         .mockResolvedValueOnce([mdUserRow]) // getUser
-        .mockResolvedValueOnce([]) // no attestation
         .mockResolvedValueOnce([{ id: "audit" }]); // blocked audit
       const tool = getTool(createTestServer(), "desk_publish");
       const result = (await tool.handler(input, {})) as ToolResult;
@@ -1092,10 +1124,28 @@ describe("Web MCP Server", () => {
       expect(result.isError).toBe(true);
     });
 
+    it("reports published:false (not a false success) if the row leaves READY before the write", async () => {
+      // Gate passes, but the guarded UPDATE matches nothing — a concurrent
+      // edit/publish moved the row. Must NOT record a publish that didn't happen.
+      mockSql
+        .mockResolvedValueOnce([deskPost({ status: "READY", attestation_id: ATTESTATION_ID })]) // select post
+        .mockResolvedValueOnce([mdUserRow]) // getUser
+        .mockResolvedValueOnce([attestation({ content_hash: hashPayload(BODY) })]) // attestation by id
+        .mockResolvedValueOnce([]) // status-guarded UPDATE matched nothing
+        .mockResolvedValueOnce([{ id: "audit" }]); // publish_blocked audit
+      const tool = getTool(createTestServer(), "desk_publish");
+      const result = (await tool.handler(input, {})) as ToolResult;
+      expect(result.isError).toBeUndefined();
+      const data = JSON.parse(result.content[0].text);
+      expect(data.published).toBe(false);
+      expect(data.post).toBeNull();
+      expect(data.gate.reasons.join(" ")).toContain("concurrent modification");
+    });
+
     it("blocks when the body trips a regex blocker, even with role+hash OK", async () => {
       const dirty = BODY + " His career is over — done for good.";
       mockSql
-        .mockResolvedValueOnce([deskPost({ status: "READY", markdown_body: dirty })]) // select post
+        .mockResolvedValueOnce([deskPost({ status: "READY", markdown_body: dirty, attestation_id: ATTESTATION_ID })]) // select post
         .mockResolvedValueOnce([mdUserRow]) // getUser
         .mockResolvedValueOnce([attestation({ content_hash: hashPayload(dirty) })]) // hash matches
         .mockResolvedValueOnce([{ id: "audit" }]); // blocked audit
@@ -1114,7 +1164,7 @@ describe("Web MCP Server", () => {
         { code: "diagnosis_as_fact", severity: "blocker", message: "paraphrased diagnosis" },
       ]);
       mockSql
-        .mockResolvedValueOnce([deskPost({ status: "READY" })]) // select post (clean regex body)
+        .mockResolvedValueOnce([deskPost({ status: "READY", attestation_id: ATTESTATION_ID })]) // select post (clean regex body)
         .mockResolvedValueOnce([mdUserRow]) // getUser
         .mockResolvedValueOnce([attestation({ content_hash: hashPayload(BODY) })]) // hash matches
         .mockResolvedValueOnce([{ id: "audit" }]); // blocked audit
