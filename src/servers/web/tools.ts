@@ -786,6 +786,27 @@ export function registerWebTools(server: McpServer): void {
     },
   );
 
+  // ── web_get_published_desk_post_for_entity ──────────────────────────
+  // Return Watch primitive: does this entity already have a live Injury Desk
+  // post? sidelineiq-agents calls this after new injury_updates activity to
+  // decide whether the activity is worth proposing as a RETURN_WATCH_UPDATE
+  // candidate rather than a brand-new post.
+  server.tool(
+    "web_get_published_desk_post_for_entity",
+    "Look up the most recent PUBLISHED desk post for an injury entity, or null if the entity has none. Used to detect whether new injury_updates activity on an entity should surface as a Return Watch candidate (append to the existing post) instead of a new-post candidate.",
+    {
+      entity_id: z.string().uuid(),
+    },
+    async (input) => {
+      try {
+        const post = await client.getPublishedDeskPostForEntity(input.entity_id);
+        return toolSuccess({ post });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
   // ── web_list_injury_updates ─────────────────────────────────────────
   server.tool(
     "web_list_injury_updates",
@@ -1091,7 +1112,7 @@ export function registerWebTools(server: McpServer): void {
   // the MD user id when the human clicks "Promote to Injury Desk".
   server.tool(
     "web_propose_candidate",
-    "Propose (or refresh) an Injury Desk promotion candidate for an injury entity. Upserts the single open PROPOSED candidate per entity — re-proposing updates the score/reasons in place rather than creating a duplicate. Does NOT publish anything; it queues the entity for MD triage. promotion_score is 0-100; reasons is the per-term contribution breakdown for display/audit.",
+    "Propose (or refresh) an Injury Desk promotion candidate for an injury entity. Upserts the single open PROPOSED candidate per entity — re-proposing updates the score/reasons in place rather than creating a duplicate. Does NOT publish anything; it queues the entity for MD triage. promotion_score is 0-100; reasons is the per-term contribution breakdown for display/audit. candidate_kind defaults to NEW_POST (create a fresh desk post on accept); RETURN_WATCH_UPDATE (accept appends a dated follow-up to an existing PUBLISHED post) requires target_desk_post_id.",
     {
       entity_id: z.string().uuid(),
       source_post_id: z.string().uuid().optional(),
@@ -1101,9 +1122,40 @@ export function registerWebTools(server: McpServer): void {
         .string()
         .optional()
         .describe("'system' for auto-proposals, or MD user id for manual promote"),
+      candidate_kind: z
+        .enum(["NEW_POST", "RETURN_WATCH_UPDATE"])
+        .optional()
+        .describe("Defaults to NEW_POST. RETURN_WATCH_UPDATE requires target_desk_post_id."),
+      target_desk_post_id: z
+        .string()
+        .uuid()
+        .optional()
+        .describe("The existing PUBLISHED desk post this candidate targets. Required iff candidate_kind is RETURN_WATCH_UPDATE."),
     },
     async (input) => {
       try {
+        if (input.candidate_kind === "RETURN_WATCH_UPDATE" && !input.target_desk_post_id) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: "Error: target_desk_post_id is required when candidate_kind is RETURN_WATCH_UPDATE.",
+              },
+            ],
+            isError: true,
+          };
+        }
+        if ((input.candidate_kind ?? "NEW_POST") === "NEW_POST" && input.target_desk_post_id) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: "Error: target_desk_post_id must be omitted when candidate_kind is NEW_POST.",
+              },
+            ],
+            isError: true,
+          };
+        }
         const candidate = await client.proposeCandidate(input);
         return toolSuccess({ candidate });
       } catch (err) {
@@ -1381,6 +1433,49 @@ export function registerWebTools(server: McpServer): void {
       try {
         const post = await client.retractDeskPost(input.desk_post_id, input.reviewer_user_id);
         return toolSuccess({ post });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── desk_append_update ───────────────────────────────────────────────
+  // Return Watch authoring primitive. MD-only (role re-derived), only on a
+  // PUBLISHED post. Refreshes draft_json (the kpjmd handoff snapshot) so it
+  // never drifts stale relative to updates[]. Pass candidate_id to atomically
+  // close out the RETURN_WATCH_UPDATE candidate that prompted this append.
+  server.tool(
+    "desk_append_update",
+    "Append a dated 'Return Watch' follow-up to an already-PUBLISHED Injury Desk post (e.g. a return-to-play milestone). MD-only — role re-derived from author_id. Refreshes the post's draft_json (kpjmd handoff snapshot) to include the new update. If candidate_id is supplied, that RETURN_WATCH_UPDATE candidate is flipped to PROMOTED in the same call.",
+    {
+      desk_post_id: z.string().uuid(),
+      author_id: z.string().uuid().describe("MD user id (UUID = session.user.id); role re-derived from the DB"),
+      headline: z.string().min(1).max(255),
+      markdown_body: z.string().min(1),
+      occurred_at: z.string().datetime().describe("ISO 8601 real-world date the update reflects"),
+      candidate_id: z.string().uuid().optional().describe("The RETURN_WATCH_UPDATE candidate this append resolves, if any"),
+    },
+    async (input) => {
+      try {
+        const update = await client.appendDeskPostUpdate(input);
+        return toolSuccess({ update });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── desk_list_updates ────────────────────────────────────────────────
+  server.tool(
+    "desk_list_updates",
+    "List a desk post's Return Watch updates newest-first (headline, markdown_body, occurred_at, author_id). Backs the timeline rendered in the /desk editor and the updates[] array of the kpjmd handoff. Empty array is a valid result.",
+    {
+      desk_post_id: z.string().uuid(),
+    },
+    async (input) => {
+      try {
+        const updates = await client.listDeskPostUpdates(input.desk_post_id);
+        return toolSuccess({ updates });
       } catch (err) {
         return handleToolError(err, logger);
       }
