@@ -2,6 +2,7 @@ import { getDatabase } from "../../shared/database.js";
 import { McpToolError } from "../../shared/errors.js";
 import { hashPayload } from "../../shared/hash.js";
 import { lintDeskPost, type LintFinding } from "./linter.js";
+import { assembleDeskHandoff } from "./desk-handoff.js";
 import {
   normalizeEntityDates,
   normalizeThreadListItem,
@@ -323,6 +324,11 @@ export interface MatchingEntityResult {
 
 // ── Desk candidates (Phase 1 promotion path) ─────────────────────────
 export type CandidateStatus = "PROPOSED" | "ACCEPTED" | "DISMISSED" | "PROMOTED";
+// NEW_POST: candidate proposes a brand-new desk_post (the original Phase 1
+// flow). RETURN_WATCH_UPDATE: candidate proposes appending a dated follow-up
+// to an already-PUBLISHED desk_post (target_desk_post_id) instead of creating
+// a new one — see migration 015.
+export type CandidateKind = "NEW_POST" | "RETURN_WATCH_UPDATE";
 
 export interface DeskCandidate {
   id: string;
@@ -331,6 +337,8 @@ export interface DeskCandidate {
   promotion_score: number;
   reasons: unknown;
   status: CandidateStatus;
+  candidate_kind: CandidateKind;
+  target_desk_post_id: string | null;
   proposed_at: string;
   decided_at: string | null;
   decided_by: string | null;
@@ -343,6 +351,9 @@ export interface ProposeCandidateInput {
   reasons?: unknown;
   // Origin of the proposal: 'system' for auto, MD user id for manual promote.
   proposed_by?: string;
+  // Defaults to NEW_POST. RETURN_WATCH_UPDATE requires target_desk_post_id.
+  candidate_kind?: CandidateKind;
+  target_desk_post_id?: string;
 }
 
 // A candidate joined to the display fields the Candidates queue needs so the
@@ -490,6 +501,35 @@ export interface DeskPostDetail {
   attestations: DeskAttestation[];
 }
 
+// ── Desk post updates (Return Watch — migration 015) ─────────────────
+// A dated follow-up appended to an already-PUBLISHED desk_post — the
+// updates[] array of the kpjmd handoff (desk-handoff.ts). Only PUBLISHED
+// posts accept appends (see appendDeskPostUpdate).
+export interface DeskPostUpdate {
+  id: string;
+  desk_post_id: string;
+  headline: string;
+  markdown_body: string;
+  occurred_at: string;
+  author_id: string | null;
+  content_hash: string;
+  created_at: string;
+}
+
+export interface AppendUpdateInput {
+  desk_post_id: string;
+  author_id: string;
+  headline: string;
+  markdown_body: string;
+  occurred_at: string;
+  // When set, and the caller has an OPEN RETURN_WATCH_UPDATE candidate
+  // targeting this post, that candidate is flipped to PROMOTED atomically
+  // with the append — mirrors createDraft's candidate-status-flip so a
+  // Return Watch candidate never lingers ACCEPTED-forever after its update
+  // has actually been authored.
+  candidate_id?: string;
+}
+
 // Lowercase, strip diacritics, remove common suffixes, collapse punctuation.
 // Shared between upsert (write) and resolve (read) so both sides agree.
 export function normalizePlayerName(name: string): string {
@@ -543,6 +583,37 @@ export class WebDatabaseClient {
       baseSlug,
       async (slug) => (await this.sql`SELECT id FROM injury_posts WHERE slug = ${slug}`).length > 0,
     );
+  }
+
+  // Display fields for the kpjmd handoff (desk-handoff.ts) — desk_posts only
+  // carries entity_id, so the athlete's name/sport are one join away via
+  // injury_entities → players, mirroring listDeskPosts'/listCandidates' joins.
+  private async getAthleteDisplayForEntity(
+    entityId: string,
+  ): Promise<{ athlete_name: string | null; sport: string | null }> {
+    const rows = await this.sql`
+      SELECT p.full_name AS athlete_name, p.sport AS sport
+      FROM injury_entities e
+      LEFT JOIN players p ON p.id = e.player_id
+      WHERE e.id = ${entityId}
+    `;
+    const row = rows[0] as { athlete_name: string | null; sport: string | null } | undefined;
+    return row ?? { athlete_name: null, sport: null };
+  }
+
+  // Recompute and persist draft_json (the kpjmd handoff snapshot) for a desk
+  // post from its current row + updates[]. Called at publish and on every
+  // subsequent append so the column never drifts stale (hybrid snapshot/refresh
+  // model — see desk-handoff.ts).
+  private async refreshDraftJson(post: DeskPost): Promise<void> {
+    const [{ athlete_name, sport }, updates] = await Promise.all([
+      this.getAthleteDisplayForEntity(post.entity_id),
+      this.listDeskPostUpdates(post.id),
+    ]);
+    const handoff = assembleDeskHandoff(post, athlete_name, sport, updates);
+    await this.sql`
+      UPDATE desk_posts SET draft_json = ${JSON.stringify(handoff)} WHERE id = ${post.id}
+    `;
   }
 
   // ── Posts ────────────────────────────────────────────────────────────
@@ -1224,6 +1295,20 @@ export class WebDatabaseClient {
     return rows[0] ? normalizeEntityDates(rows[0] as InjuryEntity) : null;
   }
 
+  // The most recent PUBLISHED desk_post for an entity, if any. This is the
+  // lookup Return Watch needs (sidelineiq-agents) to decide whether new
+  // injury_updates activity on an entity is worth surfacing as a
+  // RETURN_WATCH_UPDATE candidate — no other existing tool answers
+  // "does this entity have a live Injury Desk post" by entity_id.
+  async getPublishedDeskPostForEntity(entityId: string): Promise<DeskPost | null> {
+    const rows = await this.sql`
+      SELECT * FROM desk_posts
+      WHERE entity_id = ${entityId} AND status = 'PUBLISHED'
+      ORDER BY published_at DESC LIMIT 1
+    `;
+    return rows.length > 0 ? (rows[0] as DeskPost) : null;
+  }
+
   async listInjuryUpdates(entityId: string): Promise<InjuryUpdate[]> {
     const rows = await this.sql`
       SELECT id, entity_id, post_id, update_kind, severity_at_time,
@@ -1464,19 +1549,36 @@ export class WebDatabaseClient {
   // exists (uniq_open_candidate_per_entity), refresh its score/reasons/source
   // in place instead of inserting a duplicate. Decided rows are untouched.
   async proposeCandidate(input: ProposeCandidateInput): Promise<DeskCandidate> {
+    const kind = input.candidate_kind ?? "NEW_POST";
+    if (kind === "RETURN_WATCH_UPDATE" && !input.target_desk_post_id) {
+      throw new McpToolError(
+        "target_desk_post_id is required for candidate_kind RETURN_WATCH_UPDATE",
+        "Look up the entity's PUBLISHED desk_post (web_get_published_desk_post_for_entity) and pass its id.",
+      );
+    }
+    if (kind === "NEW_POST" && input.target_desk_post_id) {
+      throw new McpToolError(
+        "target_desk_post_id must be omitted for candidate_kind NEW_POST",
+        "Only RETURN_WATCH_UPDATE candidates target an existing desk_post.",
+      );
+    }
     const reasons = input.reasons !== undefined ? JSON.stringify(input.reasons) : null;
     const rows = await this.sql`
       INSERT INTO desk_candidates (
-        entity_id, source_post_id, promotion_score, reasons, status
+        entity_id, source_post_id, promotion_score, reasons, status,
+        candidate_kind, target_desk_post_id
       ) VALUES (
         ${input.entity_id}, ${input.source_post_id ?? null},
-        ${input.promotion_score}, ${reasons}, 'PROPOSED'
+        ${input.promotion_score}, ${reasons}, 'PROPOSED',
+        ${kind}, ${input.target_desk_post_id ?? null}
       )
       ON CONFLICT (entity_id) WHERE status = 'PROPOSED'
       DO UPDATE SET
         source_post_id = EXCLUDED.source_post_id,
         promotion_score = EXCLUDED.promotion_score,
         reasons = EXCLUDED.reasons,
+        candidate_kind = EXCLUDED.candidate_kind,
+        target_desk_post_id = EXCLUDED.target_desk_post_id,
         proposed_at = NOW(),
         updated_at = NOW()
       RETURNING *
@@ -1493,6 +1595,8 @@ export class WebDatabaseClient {
         source_post_id: input.source_post_id ?? null,
         promotion_score: input.promotion_score,
         reasons: input.reasons ?? null,
+        candidate_kind: kind,
+        target_desk_post_id: input.target_desk_post_id ?? null,
       },
     });
     return candidate;
@@ -1976,6 +2080,7 @@ export class WebDatabaseClient {
       return { published: false, gate: blockedGate, post: null };
     }
     const publishedPost = updated[0] as DeskPost;
+    await this.refreshDraftJson(publishedPost);
 
     await this.auditAppend({
       actor: "md",
@@ -2020,6 +2125,74 @@ export class WebDatabaseClient {
       payload: { slug: post.slug },
     });
     return post;
+  }
+
+  // Append a dated Return Watch follow-up to a PUBLISHED post. Identity→gate
+  // pattern cloned from retractDeskPost (role re-derived from users, never
+  // trusted from the caller) — lower-stakes than the three-part attestation
+  // gate, so it does not go through assertCanAttest/evaluatePublishGate.
+  async appendDeskPostUpdate(input: AppendUpdateInput): Promise<DeskPostUpdate> {
+    const user = await this.getUser(input.author_id);
+    if (!user || user.role !== "md") {
+      throw new McpToolError(
+        `Author ${input.author_id} is not an MD`,
+        "Only an MD identity can append a desk post update.",
+      );
+    }
+    const postRows = await this.sql`SELECT * FROM desk_posts WHERE id = ${input.desk_post_id}`;
+    if (postRows.length === 0) {
+      throw new McpToolError(
+        `Desk post ${input.desk_post_id} not found`,
+        "Use desk_list to find a valid desk post id.",
+      );
+    }
+    const post = postRows[0] as DeskPost;
+    if (post.status !== "PUBLISHED") {
+      throw new McpToolError(
+        `Desk post ${input.desk_post_id} is ${post.status}, not PUBLISHED`,
+        "Updates can only be appended to a PUBLISHED post.",
+      );
+    }
+
+    const contentHash = hashPayload(input.markdown_body);
+    const rows = await this.sql`
+      INSERT INTO desk_post_updates (
+        desk_post_id, headline, markdown_body, occurred_at, author_id, content_hash
+      ) VALUES (
+        ${input.desk_post_id}, ${input.headline}, ${input.markdown_body},
+        ${input.occurred_at}, ${input.author_id}, ${contentHash}
+      )
+      RETURNING *
+    `;
+    const update = rows[0] as DeskPostUpdate;
+
+    await this.refreshDraftJson(post);
+
+    if (input.candidate_id) {
+      await this.sql`
+        UPDATE desk_candidates
+        SET status = 'PROMOTED', decided_at = COALESCE(decided_at, NOW()), updated_at = NOW()
+        WHERE id = ${input.candidate_id} AND candidate_kind = 'RETURN_WATCH_UPDATE'
+          AND target_desk_post_id = ${input.desk_post_id} AND status IN ('ACCEPTED', 'PROPOSED')
+      `;
+    }
+
+    await this.auditAppend({
+      actor: "md",
+      actor_id: input.author_id,
+      entity_type: "desk_post_update",
+      entity_id: update.id,
+      action: "append_update",
+      payload: { desk_post_id: input.desk_post_id, content_hash: contentHash, candidate_id: input.candidate_id ?? null },
+    });
+    return update;
+  }
+
+  async listDeskPostUpdates(deskPostId: string): Promise<DeskPostUpdate[]> {
+    const rows = await this.sql`
+      SELECT * FROM desk_post_updates WHERE desk_post_id = ${deskPostId} ORDER BY occurred_at DESC
+    `;
+    return rows as DeskPostUpdate[];
   }
 
   async listDeskPosts(status?: DeskPostStatus, limit = 100): Promise<DeskPostListItem[]> {

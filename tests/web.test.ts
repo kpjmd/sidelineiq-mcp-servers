@@ -1239,6 +1239,182 @@ describe("Web MCP Server", () => {
       expect(result.isError).toBe(true);
     });
   });
+
+  // ── Return Watch (migration 015) ──────────────────────────────────────
+  describe("web_get_published_desk_post_for_entity", () => {
+    it("returns the most recent PUBLISHED desk post for an entity", async () => {
+      mockSql.mockResolvedValueOnce([deskPost({ status: "PUBLISHED" })]);
+      const tool = getTool(createTestServer(), "web_get_published_desk_post_for_entity");
+      const result = (await tool.handler({ entity_id: ENTITY_ID }, {})) as ToolResult;
+      expect(result.isError).toBeUndefined();
+      const data = JSON.parse(result.content[0].text);
+      expect(data.post.status).toBe("PUBLISHED");
+    });
+
+    it("returns null when the entity has no PUBLISHED post", async () => {
+      mockSql.mockResolvedValueOnce([]);
+      const tool = getTool(createTestServer(), "web_get_published_desk_post_for_entity");
+      const result = (await tool.handler({ entity_id: ENTITY_ID }, {})) as ToolResult;
+      expect(result.isError).toBeUndefined();
+      const data = JSON.parse(result.content[0].text);
+      expect(data.post).toBeNull();
+    });
+  });
+
+  describe("web_propose_candidate — candidate_kind", () => {
+    it("rejects RETURN_WATCH_UPDATE without target_desk_post_id", async () => {
+      const tool = getTool(createTestServer(), "web_propose_candidate");
+      const result = (await tool.handler(
+        { entity_id: ENTITY_ID, promotion_score: 60, candidate_kind: "RETURN_WATCH_UPDATE" },
+        {},
+      )) as ToolResult;
+      expect(result.isError).toBe(true);
+      expect(mockSql).not.toHaveBeenCalled();
+    });
+
+    it("rejects NEW_POST with a target_desk_post_id", async () => {
+      const tool = getTool(createTestServer(), "web_propose_candidate");
+      const result = (await tool.handler(
+        {
+          entity_id: ENTITY_ID,
+          promotion_score: 60,
+          candidate_kind: "NEW_POST",
+          target_desk_post_id: DESK_POST_ID,
+        },
+        {},
+      )) as ToolResult;
+      expect(result.isError).toBe(true);
+      expect(mockSql).not.toHaveBeenCalled();
+    });
+
+    it("proposes a RETURN_WATCH_UPDATE candidate targeting an existing post", async () => {
+      mockSql
+        .mockResolvedValueOnce([
+          {
+            id: CANDIDATE_ID,
+            entity_id: ENTITY_ID,
+            source_post_id: null,
+            promotion_score: 60,
+            reasons: null,
+            status: "PROPOSED",
+            candidate_kind: "RETURN_WATCH_UPDATE",
+            target_desk_post_id: DESK_POST_ID,
+            proposed_at: "2026-07-18T00:00:00Z",
+            decided_at: null,
+            decided_by: null,
+          },
+        ]) // insert/upsert candidate
+        .mockResolvedValueOnce([{ id: "audit" }]); // audit
+      const tool = getTool(createTestServer(), "web_propose_candidate");
+      const result = (await tool.handler(
+        {
+          entity_id: ENTITY_ID,
+          promotion_score: 60,
+          candidate_kind: "RETURN_WATCH_UPDATE",
+          target_desk_post_id: DESK_POST_ID,
+        },
+        {},
+      )) as ToolResult;
+      expect(result.isError).toBeUndefined();
+      const data = JSON.parse(result.content[0].text);
+      expect(data.candidate.candidate_kind).toBe("RETURN_WATCH_UPDATE");
+      expect(data.candidate.target_desk_post_id).toBe(DESK_POST_ID);
+    });
+  });
+
+  describe("desk_append_update", () => {
+    const input = {
+      desk_post_id: DESK_POST_ID,
+      author_id: mdUserRow.id,
+      headline: "Day 298: first game back",
+      markdown_body: "Minutes restriction lifted; full participation in shootaround.",
+      occurred_at: "2026-07-18T00:00:00Z",
+    };
+    const updateRow = {
+      id: "cc0e8400-e29b-41d4-a716-446655440000",
+      desk_post_id: DESK_POST_ID,
+      headline: input.headline,
+      markdown_body: input.markdown_body,
+      occurred_at: input.occurred_at,
+      author_id: mdUserRow.id,
+      content_hash: hashPayload(input.markdown_body),
+      created_at: "2026-07-18T00:00:00Z",
+    };
+
+    it("appends an update to a PUBLISHED post and refreshes draft_json", async () => {
+      mockSql
+        .mockResolvedValueOnce([mdUserRow]) // getUser
+        .mockResolvedValueOnce([deskPost({ status: "PUBLISHED" })]) // select post
+        .mockResolvedValueOnce([updateRow]) // insert desk_post_updates
+        .mockResolvedValueOnce([{ athlete_name: "Test Athlete", sport: "NBA" }]) // getAthleteDisplayForEntity
+        .mockResolvedValueOnce([updateRow]) // listDeskPostUpdates
+        .mockResolvedValueOnce([]) // update draft_json
+        .mockResolvedValueOnce([{ id: "audit" }]); // audit
+      const tool = getTool(createTestServer(), "desk_append_update");
+      const result = (await tool.handler(input, {})) as ToolResult;
+      expect(result.isError).toBeUndefined();
+      const data = JSON.parse(result.content[0].text);
+      expect(data.update.headline).toBe(input.headline);
+    });
+
+    it("rejects a non-MD author", async () => {
+      mockSql.mockResolvedValueOnce([editorUserRow]); // getUser -> editor
+      const tool = getTool(createTestServer(), "desk_append_update");
+      const result = (await tool.handler(input, {})) as ToolResult;
+      expect(result.isError).toBe(true);
+    });
+
+    it("rejects appending to a non-PUBLISHED post", async () => {
+      mockSql
+        .mockResolvedValueOnce([mdUserRow]) // getUser
+        .mockResolvedValueOnce([deskPost({ status: "DRAFT" })]); // select post
+      const tool = getTool(createTestServer(), "desk_append_update");
+      const result = (await tool.handler(input, {})) as ToolResult;
+      expect(result.isError).toBe(true);
+    });
+
+    it("flips the linked RETURN_WATCH_UPDATE candidate to PROMOTED when candidate_id is supplied", async () => {
+      mockSql
+        .mockResolvedValueOnce([mdUserRow]) // getUser
+        .mockResolvedValueOnce([deskPost({ status: "PUBLISHED" })]) // select post
+        .mockResolvedValueOnce([updateRow]) // insert desk_post_updates
+        .mockResolvedValueOnce([{ athlete_name: "Test Athlete", sport: "NBA" }]) // getAthleteDisplayForEntity
+        .mockResolvedValueOnce([updateRow]) // listDeskPostUpdates
+        .mockResolvedValueOnce([]) // update draft_json
+        .mockResolvedValueOnce([]) // update candidate -> PROMOTED
+        .mockResolvedValueOnce([{ id: "audit" }]); // audit
+      const tool = getTool(createTestServer(), "desk_append_update");
+      const result = (await tool.handler({ ...input, candidate_id: CANDIDATE_ID }, {})) as ToolResult;
+      expect(result.isError).toBeUndefined();
+      const candidateUpdateCall = mockSql.mock.calls.find(
+        (c) => Array.isArray(c[0]) && c[0].join("").includes("UPDATE desk_candidates"),
+      );
+      expect(candidateUpdateCall).toBeDefined();
+    });
+  });
+
+  describe("desk_list_updates", () => {
+    it("lists a desk post's updates newest-first", async () => {
+      mockSql.mockResolvedValueOnce([
+        { ...deskPost(), id: "u2", occurred_at: "2026-07-18T00:00:00Z" },
+        { ...deskPost(), id: "u1", occurred_at: "2026-06-01T00:00:00Z" },
+      ]);
+      const tool = getTool(createTestServer(), "desk_list_updates");
+      const result = (await tool.handler({ desk_post_id: DESK_POST_ID }, {})) as ToolResult;
+      expect(result.isError).toBeUndefined();
+      const data = JSON.parse(result.content[0].text);
+      expect(data.updates).toHaveLength(2);
+    });
+
+    it("returns an empty array when there are no updates", async () => {
+      mockSql.mockResolvedValueOnce([]);
+      const tool = getTool(createTestServer(), "desk_list_updates");
+      const result = (await tool.handler({ desk_post_id: DESK_POST_ID }, {})) as ToolResult;
+      expect(result.isError).toBeUndefined();
+      const data = JSON.parse(result.content[0].text);
+      expect(data.updates).toEqual([]);
+    });
+  });
 });
 
 // Pure deterministic linter rules — no server, no sql, no network.
