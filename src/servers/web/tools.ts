@@ -1307,6 +1307,44 @@ export function registerWebTools(server: McpServer): void {
     },
   );
 
+  // The kpjmd.com contract, as tool input. The seven sections are PLAIN TEXT —
+  // kpjmd's builder HTML-escapes them and never parses markdown, so the linter
+  // blocks markdown syntax here (see checkMarkdownInSections). Paragraph breaks
+  // are '\n\n'. markdown_body is not an input on either draft tool: it is
+  // derived from these so the stored body can never disagree with what the MD
+  // authored and attested to.
+  const deskSectionsSchema = z.object({
+    snapshot: z.string().describe("Standalone, quotable answer — the AI-Overview citation chunk"),
+    what_happened: z.string(),
+    anatomy: z.string(),
+    treatment: z.string(),
+    timeline: z.string().describe("Prose about the recovery arc, NOT a dated list"),
+    bridge: z.string().describe("Why it matters for a non-athlete reader"),
+    dr_take: z.string().describe("Dr. Johnson's own voice — never the machine draft verbatim"),
+  });
+
+  // kpjmd's optional fields, so the downloaded JSON needs no hand-editing.
+  // Covered by content_hash — editing these after attestation reopens the gate.
+  const deskMetaSchema = z.object({
+    short_title: z.string().optional(),
+    player: z.string().optional(),
+    meta_description: z.string().optional(),
+    treatment_heading: z.string().optional().describe('Overrides "The Treatment", e.g. "The Repair"'),
+    conflict_flag: z
+      .object({
+        team_timeline: z.string(),
+        otm_range: z.string(),
+        rationale: z.string(),
+      })
+      .optional()
+      .describe("Renders the OTM Read aside and links back to SidelineIQ"),
+    relevant_tool: z.string().optional().describe('TOOL_DESTINATIONS key, e.g. "achilles"'),
+    faqs: z.array(z.object({ q: z.string(), a: z.string() })).optional(),
+    related_slugs: z.array(z.string()).optional(),
+    anatomy_diagram: z.string().optional().describe("Owned/licensed assets only — never scraped"),
+    anatomy_diagram_alt: z.string().optional(),
+  });
+
   // ── desk_create_draft ───────────────────────────────────────────────
   // Phase 2C. Turns an ACCEPTED candidate into a DRAFT Injury Desk post and
   // flips the candidate to PROMOTED. author_id is the editing user's id (UUID).
@@ -1317,8 +1355,9 @@ export function registerWebTools(server: McpServer): void {
       candidate_id: z.string().uuid(),
       author_id: z.string().uuid().describe("Editing user's id (UUID = session.user.id)"),
       title: z.string().min(1),
-      markdown_body: z.string().min(1).describe("Canonical markdown body; the content_hash is derived from this"),
-      draft_json: z.unknown().optional().describe("kpjmd handoff artifact (Phase 3 schema)"),
+      sections: deskSectionsSchema,
+      meta: deskMetaSchema.optional(),
+      draft_json: z.unknown().optional().describe("kpjmd handoff artifact (assembled at publish)"),
       source_attribution: z.unknown().optional(),
       disclaimer_present: z.boolean().optional(),
     },
@@ -1339,7 +1378,11 @@ export function registerWebTools(server: McpServer): void {
     {
       desk_post_id: z.string().uuid(),
       edited_by: z.string().uuid().describe("Editing user's id (UUID)"),
-      markdown_body: z.string().min(1),
+      sections: deskSectionsSchema
+        .partial()
+        .optional()
+        .describe("Partial: omitted sections keep their stored value"),
+      meta: deskMetaSchema.optional(),
       title: z.string().min(1).optional(),
       draft_json: z.unknown().optional(),
       source_attribution: z.unknown().optional(),
@@ -1357,11 +1400,10 @@ export function registerWebTools(server: McpServer): void {
   );
 
   // ── desk_lint ───────────────────────────────────────────────────────
-  // Typed seam. 2C returns empty findings; 2D fills in the classifier. The
-  // publish gate consumes the same lint internally — blockers there block publish.
+  // The publish gate consumes the same lint internally — blockers here block publish.
   server.tool(
     "desk_lint",
-    "Lint a desk post's current body for Tier 2 framing violations. Returns {warnings, blockers}; non-empty blockers will block desk_publish. (Phase 2C: stub returning empty arrays; the real rules land in 2D.)",
+    "Lint a desk post for Tier 2 framing violations and kpjmd contract compliance. Returns {warnings, blockers}; non-empty blockers will block desk_publish.",
     {
       desk_post_id: z.string().uuid(),
     },
@@ -1424,7 +1466,7 @@ export function registerWebTools(server: McpServer): void {
   // ── desk_retract ────────────────────────────────────────────────────
   server.tool(
     "desk_retract",
-    "Retract a PUBLISHED desk post (status → RETRACTED). MD-only — role is re-derived from reviewer_user_id. (Phase 3 adds the .retracted.json emission for the kpjmd builder.)",
+    "Retract a PUBLISHED desk post (status → RETRACTED). MD-only — role is re-derived from reviewer_user_id. Refreshes draft_json so _sideline.status becomes RETRACTED; the frontend serves that snapshot as {slug}.retracted.json, which the kpjmd builder renders as a tombstone page at the same URL.",
     {
       desk_post_id: z.string().uuid(),
       reviewer_user_id: z.string().uuid().describe("MD user id (UUID); role re-derived from the DB"),
@@ -1433,6 +1475,27 @@ export function registerWebTools(server: McpServer): void {
       try {
         const post = await client.retractDeskPost(input.desk_post_id, input.reviewer_user_id);
         return toolSuccess({ post });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── desk_confirm_kpjmd_live ─────────────────────────────────────────
+  // The fetch and the DB write are deliberately both server-side: a separate
+  // "record the result" tool would be callable with a fabricated result, making
+  // the confirmation worth no more than the checkbox it replaces.
+  server.tool(
+    "desk_confirm_kpjmd_live",
+    "Verify a PUBLISHED desk post is actually live on kpjmd.com and record the confirmation. Fetches https://kpjmd.com/injury-desk/{slug}/ and requires BOTH a 200 and an x-sideline-content-hash meta tag matching the post's current content_hash (so a stale page from an earlier build cannot pass). Only on success are kpjmd_published_at/kpjmd_url/kpjmd_content_hash set. A failed check is a successful call with ok:false and reasons — never an error.",
+    {
+      desk_post_id: z.string().uuid(),
+      reviewer_user_id: z.string().uuid().describe("MD user id (UUID); role re-derived from the DB"),
+    },
+    async (input) => {
+      try {
+        const result = await client.confirmKpjmdLive(input.desk_post_id, input.reviewer_user_id);
+        return toolSuccess(result);
       } catch (err) {
         return handleToolError(err, logger);
       }

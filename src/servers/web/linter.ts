@@ -11,6 +11,9 @@
 //   3. non_public_scan_detail     (classifier blocker) / scan_detail_review (regex warning)
 //   4. missing_disclaimer         (blocker) — body must carry the canonical Tier 2 footer
 //   5. missing_source_attribution (blocker) — factual body needs a link/<cite> or structured sources
+//   6. incomplete_sections        (blocker) — all seven kpjmd sections must carry prose
+//   7. markdown_in_section        (blocker) — kpjmd escapes section prose; markdown would render literally
+//   8. unknown_relevant_tool / missing_sideline_slug / long_meta_description (warnings)
 //
 // Fail-open: the regex rules ALWAYS apply. If the classifier errors or no
 // ANTHROPIC_API_KEY is set, no classifier blocker is added and a visible
@@ -19,6 +22,13 @@
 
 import { DISCLAIMER_FINGERPRINT } from "./disclaimer.js";
 import { classifierConfigured, classifyDeskPost } from "./linter-classifier.js";
+import {
+  RELEVANT_TOOL_KEYS,
+  SECTION_HEADINGS,
+  SECTION_KEYS,
+  type DeskMeta,
+  type DeskSections,
+} from "./desk-sections.js";
 
 export type LintSeverity = "warning" | "blocker";
 
@@ -39,6 +49,10 @@ export interface LintFinding {
 export interface LintDeskPostInput {
   title: string;
   markdown_body: string;
+  // The kpjmd contract. NULL on rows predating migration 016 — that is itself a
+  // blocker, since such a post cannot produce a valid published/{slug}.json.
+  sections?: DeskSections | null;
+  meta?: DeskMeta | null;
   draft_json?: unknown;
   source_attribution?: unknown;
   disclaimer_present?: boolean;
@@ -167,6 +181,118 @@ export function checkNonPublicDetailRegex(body: string): LintFinding[] {
   ];
 }
 
+// ── kpjmd contract rules ──────────────────────────────────────────────────
+// These mirror validatePost() in KPJMD-website/scripts/build-injury-desk.js so a
+// downloaded JSON can never fail the builder — with one addition the builder
+// cannot make: it checks presence only, never type, so a non-string section
+// passes validation there and then throws in textToHtmlParagraphs.
+
+// Every one of the seven sections must be a non-empty string.
+export function checkSectionsComplete(sections: DeskSections | null | undefined): LintFinding[] {
+  if (!sections) {
+    return [
+      {
+        code: "incomplete_sections",
+        severity: "blocker",
+        message:
+          "This post has no structured sections (it predates the kpjmd handoff contract). Author all seven sections in the editor before publishing.",
+      },
+    ];
+  }
+  const missing = SECTION_KEYS.filter(
+    (k) => typeof sections[k] !== "string" || sections[k].trim() === "",
+  );
+  if (missing.length === 0) return [];
+  return [
+    {
+      code: "incomplete_sections",
+      severity: "blocker",
+      message: `Empty required section(s): ${missing.map((k) => SECTION_HEADINGS[k]).join(", ")}. kpjmd.com's builder rejects a post missing any of the seven.`,
+    },
+  ];
+}
+
+// kpjmd renders section prose through textToHtmlParagraphs — split on blank
+// lines, wrap in <p>, escapeHtml. Markdown is never parsed, so '**bold**' ships
+// as literal asterisks. Blocking here is the only place this is catchable: the
+// builder happily renders the escaped text and the error is only visible live.
+const MARKDOWN_SYNTAX: { re: RegExp; what: string }[] = [
+  { re: /\*\*[^*\n]+\*\*/, what: "bold (**…**)" },
+  { re: /(?:^|\n)#{1,6}\s+\S/, what: "heading (#)" },
+  { re: /\[[^\]]+\]\([^)]+\)/, what: "link ([…](…))" },
+  { re: /(?:^|\n)\s*[-*+]\s+\S/, what: "list item" },
+  { re: /(?:^|\n)>\s+\S/, what: "blockquote (>)" },
+  { re: /`[^`\n]+`/, what: "inline code (`…`)" },
+];
+
+export function checkMarkdownInSections(sections: DeskSections | null | undefined): LintFinding[] {
+  if (!sections) return [];
+  const findings: LintFinding[] = [];
+  for (const key of SECTION_KEYS) {
+    const text = sections[key];
+    if (typeof text !== "string" || text === "") continue;
+    const hits = MARKDOWN_SYNTAX.filter(({ re }) => re.test(text)).map(({ what }) => what);
+    if (hits.length === 0) continue;
+    findings.push({
+      code: "markdown_in_section",
+      severity: "blocker",
+      message: `"${SECTION_HEADINGS[key]}" contains markdown syntax (${hits.join(", ")}). kpjmd.com escapes section prose and does not parse markdown — this would render as literal characters. Use plain text; separate paragraphs with a blank line.`,
+    });
+  }
+  return findings;
+}
+
+// Advisory checks on the optional metadata. All warnings: the builder either
+// warns or silently degrades on each of these, so none should block a publish.
+export function checkMetaAdvisories(meta: DeskMeta | null | undefined): LintFinding[] {
+  if (!meta) return [];
+  const findings: LintFinding[] = [];
+
+  if (meta.relevant_tool && !RELEVANT_TOOL_KEYS.includes(meta.relevant_tool as never)) {
+    findings.push({
+      code: "unknown_relevant_tool",
+      severity: "warning",
+      message: `relevant_tool "${meta.relevant_tool}" is not a known TOOL_DESTINATIONS key. The "If This Were You" CTA will be dropped from the page. Known keys: ${RELEVANT_TOOL_KEYS.join(", ")}.`,
+    });
+  }
+
+  // kpjmd truncates the meta description at 155 chars from `snapshot` when this
+  // is absent; an overlong explicit value gets truncated by search engines instead.
+  if (meta.meta_description && meta.meta_description.length > 160) {
+    findings.push({
+      code: "long_meta_description",
+      severity: "warning",
+      message: `meta_description is ${meta.meta_description.length} chars; search engines truncate near 160. Tighten it or leave it empty to auto-derive from The Snapshot.`,
+    });
+  }
+
+  if (meta.conflict_flag) {
+    const cf = meta.conflict_flag;
+    const blank = (["team_timeline", "otm_range", "rationale"] as const).filter(
+      (k) => !cf[k] || cf[k].trim() === "",
+    );
+    if (blank.length > 0) {
+      findings.push({
+        code: "incomplete_conflict_flag",
+        severity: "warning",
+        message: `conflict_flag is missing ${blank.join(", ")}. The OTM Read aside renders with blanks.`,
+      });
+    }
+  }
+
+  const badFaq = (meta.faqs ?? []).some((f) => !f?.q?.trim() || !f?.a?.trim());
+  if (badFaq) {
+    findings.push({
+      code: "incomplete_faq",
+      severity: "warning",
+      message:
+        "One or more FAQs has an empty question or answer. Empty entries still emit into the FAQPage JSON-LD.",
+    });
+  }
+
+  return findings;
+}
+
 function spansOverlap(a?: LintSpan, b?: LintSpan): boolean {
   // A missing span on either side is treated as overlapping, so a span-less
   // classifier finding dedupes against a same-code regex finding rather than
@@ -196,6 +322,11 @@ export async function lintDeskPost(input: LintDeskPostInput): Promise<LintResult
   route(checkDisclaimer(input));
   route(checkSourceAttribution(input));
   route(checkNonPublicDetailRegex(body));
+
+  // kpjmd contract — structural, no network, always applied.
+  route(checkSectionsComplete(input.sections));
+  route(checkMarkdownInSections(input.sections));
+  route(checkMetaAdvisories(input.meta));
 
   // Probabilistic layer — blocking on success, advisory (warning) on failure.
   if (classifierConfigured()) {
