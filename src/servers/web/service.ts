@@ -9,6 +9,7 @@
 
 import { McpToolError } from "../../shared/errors.js";
 import { hashPayload } from "../../shared/hash.js";
+import { deskContentHash } from "./desk-sections.js";
 import { toIsoDate, daysBetween, addWeeks } from "./date-utils.js";
 import type { LintFinding } from "./linter.js";
 import type {
@@ -24,16 +25,19 @@ import type {
 // ── Publish gate ───────────────────────────────────────────────────────
 // The pure core of publishDeskPost: given the post, the DB-derived reviewer,
 // the pointed-at attestation, and the linter's blockers, decide passed + why.
-// Re-derives the current content hash from the body so an edit after attestation
-// is always caught. Never trusts a caller-supplied role.
+// Re-derives the current content hash so an edit after attestation is always
+// caught. Never trusts a caller-supplied role.
 export function evaluatePublishGate(
-  post: Pick<DeskPost, "markdown_body">,
+  post: Pick<DeskPost, "title" | "markdown_body" | "sections" | "meta">,
   user: User | null,
   attestation: DeskAttestation | null,
   blockers: LintFinding[],
 ): PublishGate {
   const role_ok = !!user && user.role === "md";
-  const currentHash = hashPayload(post.markdown_body);
+  // Covers title + sections + meta, not the prose alone — an MD who attests and
+  // then edits faqs or conflict_flag must fail this check, or unattested content
+  // reaches kpjmd.com. attestDeskPost snapshots via the identical function.
+  const currentHash = deskContentHash(post.title, post.sections, post.meta, post.markdown_body);
   const hash_match = !!attestation && attestation.content_hash === currentHash;
 
   const reasons: string[] = [];

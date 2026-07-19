@@ -3,6 +3,15 @@ import { McpToolError } from "../../shared/errors.js";
 import { hashPayload } from "../../shared/hash.js";
 import { lintDeskPost, type LintFinding } from "./linter.js";
 import { assembleDeskHandoff } from "./desk-handoff.js";
+import { checkKpjmdLive, type LiveCheckResult } from "./kpjmd-live.js";
+import {
+  deskContentHash,
+  normalizeMeta,
+  normalizeSections,
+  serializeSections,
+  type DeskMeta,
+  type DeskSections,
+} from "./desk-sections.js";
 import {
   normalizeEntityDates,
   normalizeThreadListItem,
@@ -413,7 +422,16 @@ export interface DeskPost {
   entity_id: string;
   slug: string;
   title: string;
+  // Derived from `sections` (see serializeSections). Kept as a column because the
+  // linter's prose rules, the audit before/after diff, and desk_post_versions all
+  // operate on a single body string.
   markdown_body: string;
+  // The seven kpjmd sections. NULL on rows predating migration 016 — such a post
+  // lints with a blocker and cannot publish until it is re-sectioned.
+  sections: DeskSections | null;
+  // kpjmd's optional fields. Covered by content_hash, so editing them after
+  // attestation invalidates the publish gate.
+  meta: DeskMeta | null;
   draft_json: unknown;
   status: DeskPostStatus;
   version: number;
@@ -425,7 +443,14 @@ export interface DeskPost {
   disclaimer_present: boolean;
   created_at: string;
   updated_at: string;
+  // Published on SidelineIQ, set by the desk_publish gate.
   published_at: string | null;
+  // Live on kpjmd.com — a SECOND, downstream surface. Only ever set after a
+  // server-side fetch of the live URL confirms a 200 AND a matching
+  // x-sideline-content-hash meta tag. Never set from a client checkbox.
+  kpjmd_published_at: string | null;
+  kpjmd_url: string | null;
+  kpjmd_content_hash: string | null;
 }
 
 export interface DeskAttestation {
@@ -440,11 +465,15 @@ export interface DeskAttestation {
   ip: string | null;
 }
 
+// markdown_body is NOT an input on either of these — it is derived from
+// sections so the stored body can never disagree with the sections the MD
+// actually authored (and attested to).
 export interface CreateDraftInput {
   candidate_id: string;
   author_id: string;
   title: string;
-  markdown_body: string;
+  sections: DeskSections;
+  meta?: DeskMeta;
   draft_json?: unknown;
   source_attribution?: unknown;
   disclaimer_present?: boolean;
@@ -453,7 +482,10 @@ export interface CreateDraftInput {
 export interface UpdateDraftInput {
   desk_post_id: string;
   edited_by: string;
-  markdown_body: string;
+  // Partial: the editor autosaves one section at a time, so an absent key
+  // leaves the stored section untouched rather than blanking it.
+  sections?: Partial<DeskSections>;
+  meta?: DeskMeta;
   title?: string;
   draft_json?: unknown;
   source_attribution?: unknown;
@@ -485,6 +517,13 @@ export interface PublishResult {
   published: boolean;
   gate: PublishGate;
   post: DeskPost | null;
+}
+
+// Like PublishResult, a failed live check is a SUCCESSFUL call with ok:false —
+// "not live yet" is a normal state the editor renders, not an error.
+export interface KpjmdLiveResult {
+  check: LiveCheckResult;
+  post: DeskPost;
 }
 
 // A desk_post joined to display fields the Injury Desk list view needs.
@@ -588,29 +627,33 @@ export class WebDatabaseClient {
   // Display fields for the kpjmd handoff (desk-handoff.ts) — desk_posts only
   // carries entity_id, so the athlete's name/sport are one join away via
   // injury_entities → players, mirroring listDeskPosts'/listCandidates' joins.
-  private async getAthleteDisplayForEntity(
-    entityId: string,
-  ): Promise<{ athlete_name: string | null; sport: string | null }> {
+  private async getAthleteDisplayForEntity(entityId: string): Promise<{
+    athlete_name: string | null;
+    sport: string | null;
+    injury_type: string | null;
+  }> {
     const rows = await this.sql`
-      SELECT p.full_name AS athlete_name, p.sport AS sport
+      SELECT p.full_name AS athlete_name, p.sport AS sport, e.injury_type AS injury_type
       FROM injury_entities e
       LEFT JOIN players p ON p.id = e.player_id
       WHERE e.id = ${entityId}
     `;
-    const row = rows[0] as { athlete_name: string | null; sport: string | null } | undefined;
-    return row ?? { athlete_name: null, sport: null };
+    const row = rows[0] as
+      | { athlete_name: string | null; sport: string | null; injury_type: string | null }
+      | undefined;
+    return row ?? { athlete_name: null, sport: null, injury_type: null };
   }
 
   // Recompute and persist draft_json (the kpjmd handoff snapshot) for a desk
-  // post from its current row + updates[]. Called at publish and on every
-  // subsequent append so the column never drifts stale (hybrid snapshot/refresh
-  // model — see desk-handoff.ts).
+  // post from its current row + updates[]. Called at publish, on every subsequent
+  // append, and at retract, so the column never drifts stale (hybrid
+  // snapshot/refresh model — see desk-handoff.ts).
   private async refreshDraftJson(post: DeskPost): Promise<void> {
-    const [{ athlete_name, sport }, updates] = await Promise.all([
+    const [{ athlete_name, sport, injury_type }, updates] = await Promise.all([
       this.getAthleteDisplayForEntity(post.entity_id),
       this.listDeskPostUpdates(post.id),
     ]);
-    const handoff = assembleDeskHandoff(post, athlete_name, sport, updates);
+    const handoff = assembleDeskHandoff(post, athlete_name, sport, updates, injury_type);
     await this.sql`
       UPDATE desk_posts SET draft_json = ${JSON.stringify(handoff)} WHERE id = ${post.id}
     `;
@@ -1764,9 +1807,11 @@ export class WebDatabaseClient {
   }
 
   // ── Desk posts (Phase 2C) ─────────────────────────────────────────────
-  // content_hash is hashPayload(markdown_body) EVERYWHERE (create/update/attest/
-  // publish) so the gate's equality check is meaningful. Always hash the body
-  // string — never draft_json, never an object.
+  // content_hash is deskContentHash(title, sections, meta, body) EVERYWHERE
+  // (create/update/attest/publish) so the gate's equality check is meaningful.
+  // Route every hash through that one helper — hashing the body alone would
+  // leave `meta` (faqs, conflict_flag, …) editable after attestation, which
+  // silently defeats the gate. See desk-sections.ts for the legacy fallback.
   private deskSlugify(title: string): string {
     return slugify(title, 200, "injury-desk-post");
   }
@@ -1799,18 +1844,23 @@ export class WebDatabaseClient {
     }
 
     const slug = await this.resolveUniqueDeskSlug(this.deskSlugify(input.title));
-    const contentHash = hashPayload(input.markdown_body);
+    const sections = normalizeSections(input.sections);
+    const meta = normalizeMeta(input.meta);
+    const markdownBody = serializeSections(sections, meta);
+    const contentHash = deskContentHash(input.title, sections, meta, markdownBody);
     const draftJson = input.draft_json !== undefined ? JSON.stringify(input.draft_json) : null;
     const sourceAttribution =
       input.source_attribution !== undefined ? JSON.stringify(input.source_attribution) : null;
+    const sectionsJson = JSON.stringify(sections);
+    const metaJson = JSON.stringify(meta);
 
     const postRows = await this.sql`
       INSERT INTO desk_posts (
-        candidate_id, entity_id, slug, title, markdown_body, draft_json,
+        candidate_id, entity_id, slug, title, markdown_body, sections, meta, draft_json,
         status, version, author_id, content_hash, source_attribution, disclaimer_present
       ) VALUES (
         ${input.candidate_id}, ${candidate.entity_id}, ${slug}, ${input.title},
-        ${input.markdown_body}, ${draftJson}, 'DRAFT', 1, ${input.author_id},
+        ${markdownBody}, ${sectionsJson}, ${metaJson}, ${draftJson}, 'DRAFT', 1, ${input.author_id},
         ${contentHash}, ${sourceAttribution}, ${input.disclaimer_present ?? false}
       )
       RETURNING *
@@ -1819,9 +1869,10 @@ export class WebDatabaseClient {
 
     await this.sql`
       INSERT INTO desk_post_versions (
-        desk_post_id, version, markdown_body, draft_json, content_hash, edited_by, edit_diff
+        desk_post_id, version, markdown_body, sections, meta, draft_json, content_hash, edited_by, edit_diff
       ) VALUES (
-        ${post.id}, 1, ${input.markdown_body}, ${draftJson}, ${contentHash}, ${input.author_id}, ${null}
+        ${post.id}, 1, ${markdownBody}, ${sectionsJson}, ${metaJson}, ${draftJson}, ${contentHash},
+        ${input.author_id}, ${null}
       )
     `;
 
@@ -1862,17 +1913,32 @@ export class WebDatabaseClient {
     }
 
     const newVersion = prev.version + 1;
-    const contentHash = hashPayload(input.markdown_body);
+    // Merge partial section edits onto what is stored — the editor autosaves the
+    // section the MD is typing in, not all seven. A legacy row (sections NULL,
+    // migration 016) normalizes to seven empty strings, so the first save after
+    // the migration starts a real section set rather than throwing.
+    const sections = normalizeSections({
+      ...normalizeSections(prev.sections),
+      ...(input.sections ?? {}),
+    });
+    const meta = input.meta !== undefined ? normalizeMeta(input.meta) : normalizeMeta(prev.meta);
+    const title = input.title ?? prev.title;
+    const markdownBody = serializeSections(sections, meta);
+    const contentHash = deskContentHash(title, sections, meta, markdownBody);
     const newStatus: DeskPostStatus = prev.status === "READY" ? "DRAFT" : prev.status;
     const draftJson = input.draft_json !== undefined ? JSON.stringify(input.draft_json) : null;
     const sourceAttribution =
       input.source_attribution !== undefined ? JSON.stringify(input.source_attribution) : null;
     const editDiff = input.edit_diff !== undefined ? JSON.stringify(input.edit_diff) : null;
+    const sectionsJson = JSON.stringify(sections);
+    const metaJson = JSON.stringify(meta);
 
     const updated = await this.sql`
       UPDATE desk_posts SET
-        title = COALESCE(${input.title ?? null}, title),
-        markdown_body = ${input.markdown_body},
+        title = ${title},
+        markdown_body = ${markdownBody},
+        sections = ${sectionsJson},
+        meta = ${metaJson},
         draft_json = COALESCE(${draftJson}, draft_json),
         source_attribution = COALESCE(${sourceAttribution}, source_attribution),
         disclaimer_present = COALESCE(${input.disclaimer_present ?? null}, disclaimer_present),
@@ -1896,10 +1962,10 @@ export class WebDatabaseClient {
 
     await this.sql`
       INSERT INTO desk_post_versions (
-        desk_post_id, version, markdown_body, draft_json, content_hash, edited_by, edit_diff
+        desk_post_id, version, markdown_body, sections, meta, draft_json, content_hash, edited_by, edit_diff
       ) VALUES (
-        ${post.id}, ${newVersion}, ${input.markdown_body}, ${draftJson}, ${contentHash},
-        ${input.edited_by}, ${editDiff}
+        ${post.id}, ${newVersion}, ${markdownBody}, ${sectionsJson}, ${metaJson}, ${draftJson},
+        ${contentHash}, ${input.edited_by}, ${editDiff}
       )
     `;
 
@@ -1910,14 +1976,13 @@ export class WebDatabaseClient {
       entity_id: post.id,
       action: "update_draft",
       before: prev.markdown_body,
-      after: input.markdown_body,
+      after: markdownBody,
       payload: { version: newVersion, reverted_to_draft: newStatus !== prev.status },
     });
     return post;
   }
 
-  // Read-only lint of the current stored body. Backs desk_lint. The real rules
-  // arrive in 2D; today this returns the stub's empty findings.
+  // Read-only lint of the current stored body + sections. Backs desk_lint.
   async lintDeskPostById(deskPostId: string): ReturnType<typeof lintDeskPost> {
     const rows = await this.sql`SELECT * FROM desk_posts WHERE id = ${deskPostId}`;
     if (rows.length === 0) {
@@ -1930,6 +1995,8 @@ export class WebDatabaseClient {
     return await lintDeskPost({
       title: post.title,
       markdown_body: post.markdown_body,
+      sections: post.sections,
+      meta: post.meta,
       draft_json: post.draft_json,
       source_attribution: post.source_attribution,
       disclaimer_present: post.disclaimer_present,
@@ -1954,7 +2021,9 @@ export class WebDatabaseClient {
     // Role (re-derived from DB), the three confirmations, and attestable status.
     assertCanAttest(user, input, post);
 
-    const contentHash = hashPayload(post.markdown_body);
+    // Must match evaluatePublishGate's recomputation exactly, or the gate can
+    // never pass. Both go through deskContentHash.
+    const contentHash = deskContentHash(post.title, post.sections, post.meta, post.markdown_body);
     const attRows = await this.sql`
       INSERT INTO desk_attestations (
         desk_post_id, reviewer_user_id, reviewed_source_reports,
@@ -2028,6 +2097,8 @@ export class WebDatabaseClient {
     const { blockers } = await lintDeskPost({
       title: post.title,
       markdown_body: post.markdown_body,
+      sections: post.sections,
+      meta: post.meta,
       draft_json: post.draft_json,
       source_attribution: post.source_attribution,
       disclaimer_present: post.disclaimer_present,
@@ -2088,13 +2159,19 @@ export class WebDatabaseClient {
       entity_type: "desk_post",
       entity_id: post.id,
       action: "publish",
-      payload: { attestation_id: latest?.id ?? null, content_hash: hashPayload(post.markdown_body), slug: post.slug },
+      payload: {
+        attestation_id: latest?.id ?? null,
+        content_hash: deskContentHash(post.title, post.sections, post.meta, post.markdown_body),
+        slug: post.slug,
+      },
     });
     return { published: true, gate, post: publishedPost };
   }
 
-  // Retract a PUBLISHED post. MD-only (role re-derived). Phase 3 adds the
-  // .retracted.json emission for the kpjmd builder; here it is the status flip.
+  // Retract a PUBLISHED post. MD-only (role re-derived). Refreshes draft_json so
+  // its _sideline.status flips to RETRACTED — that snapshot is what the frontend
+  // serves as {slug}.retracted.json, which the kpjmd builder turns into a
+  // tombstone page at the same URL.
   async retractDeskPost(deskPostId: string, reviewerUserId: string): Promise<DeskPost> {
     const user = await this.getUser(reviewerUserId);
     if (!user || user.role !== "md") {
@@ -2116,6 +2193,10 @@ export class WebDatabaseClient {
       );
     }
     const post = rows[0] as DeskPost;
+    // Without this the retracted post's draft_json keeps reporting PUBLISHED
+    // forever: appends are the only other refresh trigger, and they require
+    // PUBLISHED status, so a retracted post can never refresh on its own.
+    await this.refreshDraftJson(post);
     await this.auditAppend({
       actor: "md",
       actor_id: reviewerUserId,
@@ -2125,6 +2206,73 @@ export class WebDatabaseClient {
       payload: { slug: post.slug },
     });
     return post;
+  }
+
+  // Confirm a desk post is actually live on kpjmd.com and record it.
+  //
+  // The fetch and the write live together here ON PURPOSE. If the frontend
+  // fetched the page and then called a "record it" tool, that tool would be
+  // callable directly with a fabricated result — the confirmation would be worth
+  // no more than the checkbox it replaces. Doing both server-side means
+  // kpjmd_published_at can only ever be set by a verification that really ran.
+  //
+  // Idempotent and re-runnable: a later edit or Return Watch append moves
+  // content_hash, so re-confirming after re-deploying is the intended flow.
+  async confirmKpjmdLive(deskPostId: string, reviewerUserId: string): Promise<KpjmdLiveResult> {
+    const user = await this.getUser(reviewerUserId);
+    if (!user || user.role !== "md") {
+      throw new McpToolError(
+        `Reviewer ${reviewerUserId} is not an MD`,
+        "Only an MD identity can confirm a kpjmd.com publish.",
+      );
+    }
+    const rows = await this.sql`SELECT * FROM desk_posts WHERE id = ${deskPostId}`;
+    if (rows.length === 0) {
+      throw new McpToolError(
+        `Desk post ${deskPostId} not found`,
+        "Use desk_list to find a valid desk post id.",
+      );
+    }
+    const post = rows[0] as DeskPost;
+    if (post.status !== "PUBLISHED") {
+      throw new McpToolError(
+        `Desk post ${deskPostId} is ${post.status}, not PUBLISHED`,
+        "Publish the post on SidelineIQ before confirming it live on kpjmd.com.",
+      );
+    }
+
+    const check = await checkKpjmdLive(post.slug, post.content_hash);
+
+    // A failed check changes nothing — no partial state, no optimistic write.
+    if (check.ok) {
+      await this.sql`
+        UPDATE desk_posts SET
+          kpjmd_published_at = NOW(),
+          kpjmd_url = ${check.url},
+          kpjmd_content_hash = ${check.expected_content_hash},
+          updated_at = NOW()
+        WHERE id = ${deskPostId}
+      `;
+    }
+
+    await this.auditAppend({
+      actor: "md",
+      actor_id: reviewerUserId,
+      entity_type: "desk_post",
+      entity_id: post.id,
+      action: check.ok ? "confirm_kpjmd_live" : "confirm_kpjmd_live_failed",
+      payload: {
+        slug: post.slug,
+        url: check.url,
+        http_status: check.http_status,
+        live_content_hash: check.live_content_hash,
+        expected_content_hash: check.expected_content_hash,
+        reasons: check.reasons,
+      },
+    });
+
+    const after = await this.sql`SELECT * FROM desk_posts WHERE id = ${deskPostId}`;
+    return { check, post: after[0] as DeskPost };
   }
 
   // Append a dated Return Watch follow-up to a PUBLISHED post. Identity→gate

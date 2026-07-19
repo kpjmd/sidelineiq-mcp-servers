@@ -21,6 +21,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerWebTools } from "../src/servers/web/tools.js";
 import { hashPayload } from "../src/shared/hash.js";
 import { TIER2_DISCLAIMER } from "../src/servers/web/disclaimer.js";
+import { deskContentHash, serializeSections } from "../src/servers/web/desk-sections.js";
 import { classifierConfigured, classifyDeskPost } from "../src/servers/web/linter-classifier.js";
 import {
   checkCareerPrognosis,
@@ -753,35 +754,63 @@ describe("Web MCP Server", () => {
   const CANDIDATE_ID = "990e8400-e29b-41d4-a716-446655440000";
   const ENTITY_ID = "aa0e8400-e29b-41d4-a716-446655440000";
   const AUTHOR_ID = mdUserRow.id;
-  // A lint-clean body: hedged framing, a markdown source link, and the canonical
-  // Tier 2 disclaimer. Keeping it clean means the existing publish/attest tests
-  // (which rely on zero blockers) stay green now that the linter is real.
-  const BODY =
-    "Public reporting indicates a left knee issue. According to " +
-    "[ESPN](https://espn.com/story), the team has not shared a timeline. " +
-    "This is general educational analysis. " +
-    TIER2_DISCLAIMER;
+  const TITLE = "Test Athlete Knee";
+
+  // A lint-clean set of the seven kpjmd sections: hedged framing, plain text
+  // only. kpjmd escapes section prose and never parses markdown, so the linter
+  // blocks markdown syntax — which is why attribution now comes from
+  // source_attribution rather than the inline markdown link this fixture used
+  // before sections existed. Keeping it clean means the publish/attest tests,
+  // which rely on zero blockers, stay green.
+  const SECTIONS = {
+    snapshot: "Public reporting indicates a left knee issue, with no timeline shared.",
+    what_happened: "According to public reports, the issue emerged during practice.",
+    anatomy: "The knee carries load through several ligaments and the meniscus.",
+    treatment: "Management of this category of injury ranges from rest to surgery.",
+    timeline: "Recovery timelines vary widely and depend on the confirmed grade.",
+    bridge: "For a recreational athlete, persistent knee swelling warrants evaluation.",
+    dr_take: "This is general educational analysis, not a diagnosis of this athlete.",
+  };
+
+  // The body is DERIVED from the sections (serializeSections appends the Tier 2
+  // disclaimer), and content_hash covers title+sections+meta. So a test that
+  // wants to simulate an edit-after-attestation must vary `sections`, not
+  // `markdown_body` — changing the body alone no longer moves the hash.
+  const BODY = serializeSections(SECTIONS, {});
+  const SOURCES = [{ url: "https://espn.com/story", outlet: "ESPN" }];
+  // What attestDeskPost snapshots and evaluatePublishGate recomputes for an
+  // un-overridden fixture post.
+  const CLEAN_HASH = deskContentHash(TITLE, SECTIONS, {}, BODY);
 
   function deskPost(overrides: Record<string, unknown> = {}) {
+    const sections = (overrides.sections ?? SECTIONS) as typeof SECTIONS;
+    const meta = (overrides.meta ?? {}) as Record<string, unknown>;
+    const title = (overrides.title ?? TITLE) as string;
+    const markdown_body = (overrides.markdown_body ?? serializeSections(sections, meta)) as string;
     return {
       id: DESK_POST_ID,
       candidate_id: CANDIDATE_ID,
       entity_id: ENTITY_ID,
       slug: "test-athlete-knee",
-      title: "Test Athlete Knee",
-      markdown_body: BODY,
+      title,
+      markdown_body,
+      sections,
+      meta,
       draft_json: null,
       status: "DRAFT",
       version: 1,
       author_id: AUTHOR_ID,
       reviewed_by: null,
       attestation_id: null,
-      content_hash: hashPayload(BODY),
-      source_attribution: null,
+      content_hash: deskContentHash(title, sections, meta, markdown_body),
+      source_attribution: SOURCES,
       disclaimer_present: false,
       created_at: "2026-06-12T00:00:00Z",
       updated_at: "2026-06-12T00:00:00Z",
       published_at: null,
+      kpjmd_published_at: null,
+      kpjmd_url: null,
+      kpjmd_content_hash: null,
       ...overrides,
     };
   }
@@ -794,7 +823,7 @@ describe("Web MCP Server", () => {
       reviewed_source_reports: true,
       edited_for_accuracy: true,
       framing_confirmed: true,
-      content_hash: hashPayload(BODY),
+      content_hash: CLEAN_HASH,
       timestamp: "2026-06-12T01:00:00Z",
       ip: null,
       ...overrides,
@@ -815,7 +844,7 @@ describe("Web MCP Server", () => {
 
       const tool = getTool(createTestServer(), "desk_create_draft");
       const result = (await tool.handler(
-        { candidate_id: CANDIDATE_ID, author_id: AUTHOR_ID, title: "Test Athlete Knee", markdown_body: BODY },
+        { candidate_id: CANDIDATE_ID, author_id: AUTHOR_ID, title: TITLE, sections: SECTIONS },
         {},
       )) as ToolResult;
 
@@ -832,7 +861,7 @@ describe("Web MCP Server", () => {
       mockSql.mockResolvedValueOnce([{ id: CANDIDATE_ID, entity_id: ENTITY_ID, status: "PROPOSED" }]);
       const tool = getTool(createTestServer(), "desk_create_draft");
       const result = (await tool.handler(
-        { candidate_id: CANDIDATE_ID, author_id: AUTHOR_ID, title: "x", markdown_body: BODY },
+        { candidate_id: CANDIDATE_ID, author_id: AUTHOR_ID, title: "x", sections: SECTIONS },
         {},
       )) as ToolResult;
       expect(result.isError).toBe(true);
@@ -842,7 +871,7 @@ describe("Web MCP Server", () => {
       mockSql.mockResolvedValueOnce([]);
       const tool = getTool(createTestServer(), "desk_create_draft");
       const result = (await tool.handler(
-        { candidate_id: CANDIDATE_ID, author_id: AUTHOR_ID, title: "x", markdown_body: BODY },
+        { candidate_id: CANDIDATE_ID, author_id: AUTHOR_ID, title: "x", sections: SECTIONS },
         {},
       )) as ToolResult;
       expect(result.isError).toBe(true);
@@ -858,7 +887,7 @@ describe("Web MCP Server", () => {
         .mockResolvedValueOnce([{ id: "audit" }]); // audit
       const tool = getTool(createTestServer(), "desk_update_draft");
       const result = (await tool.handler(
-        { desk_post_id: DESK_POST_ID, edited_by: AUTHOR_ID, markdown_body: BODY + " edit" },
+        { desk_post_id: DESK_POST_ID, edited_by: AUTHOR_ID, sections: { snapshot: SECTIONS.snapshot + " Edited." } },
         {},
       )) as ToolResult;
       expect(result.isError).toBeUndefined();
@@ -872,7 +901,7 @@ describe("Web MCP Server", () => {
         .mockResolvedValueOnce([{ id: "audit" }]); // audit
       const tool = getTool(createTestServer(), "desk_update_draft");
       await tool.handler(
-        { desk_post_id: DESK_POST_ID, edited_by: AUTHOR_ID, markdown_body: BODY + " edit" },
+        { desk_post_id: DESK_POST_ID, edited_by: AUTHOR_ID, sections: { snapshot: SECTIONS.snapshot + " Edited." } },
         {},
       );
       const updateCall = mockSql.mock.calls.find(
@@ -886,7 +915,7 @@ describe("Web MCP Server", () => {
       mockSql.mockResolvedValueOnce([deskPost({ status: "PUBLISHED" })]);
       const tool = getTool(createTestServer(), "desk_update_draft");
       const result = (await tool.handler(
-        { desk_post_id: DESK_POST_ID, edited_by: AUTHOR_ID, markdown_body: BODY },
+        { desk_post_id: DESK_POST_ID, edited_by: AUTHOR_ID, sections: SECTIONS },
         {},
       )) as ToolResult;
       expect(result.isError).toBe(true);
@@ -898,7 +927,7 @@ describe("Web MCP Server", () => {
         .mockResolvedValueOnce([]); // guarded update matched nothing (row moved)
       const tool = getTool(createTestServer(), "desk_update_draft");
       const result = (await tool.handler(
-        { desk_post_id: DESK_POST_ID, edited_by: AUTHOR_ID, markdown_body: BODY + " edit" },
+        { desk_post_id: DESK_POST_ID, edited_by: AUTHOR_ID, sections: { snapshot: SECTIONS.snapshot + " Edited." } },
         {},
       )) as ToolResult;
       expect(result.isError).toBe(true);
@@ -919,8 +948,14 @@ describe("Web MCP Server", () => {
     });
 
     it("blocks a body that violates every deterministic rule", async () => {
+      // source_attribution is cleared too: the fixture now carries structured
+      // sources (sections cannot hold a markdown link — kpjmd escapes them), so
+      // the attribution blocker only fires when there is genuinely no source.
       mockSql.mockResolvedValueOnce([
-        deskPost({ markdown_body: "He tore his ACL and is done for good." }),
+        deskPost({
+          markdown_body: "He tore his ACL and is done for good.",
+          source_attribution: null,
+        }),
       ]);
       const tool = getTool(createTestServer(), "desk_lint");
       const result = (await tool.handler({ desk_post_id: DESK_POST_ID }, {})) as ToolResult;
@@ -997,7 +1032,7 @@ describe("Web MCP Server", () => {
       const result = (await tool.handler(fullInput, {})) as ToolResult;
       expect(result.isError).toBeUndefined();
       const data = JSON.parse(result.content[0].text);
-      expect(data.attestation.content_hash).toBe(hashPayload(BODY));
+      expect(data.attestation.content_hash).toBe(CLEAN_HASH);
       const updateCall = mockSql.mock.calls.find(
         (c) => Array.isArray(c[0]) && c[0].join("").includes("UPDATE desk_posts"),
       );
@@ -1054,7 +1089,7 @@ describe("Web MCP Server", () => {
       mockSql
         .mockResolvedValueOnce([deskPost({ status: "READY", attestation_id: ATTESTATION_ID })]) // select post
         .mockResolvedValueOnce([mdUserRow]) // getUser
-        .mockResolvedValueOnce([attestation({ content_hash: hashPayload(BODY) })]) // attestation by id
+        .mockResolvedValueOnce([attestation({ content_hash: CLEAN_HASH })]) // attestation by id
         .mockResolvedValueOnce([deskPost({ status: "PUBLISHED", published_at: "2026-06-12T02:00:00Z" })]) // update
         .mockResolvedValueOnce([{ id: "audit" }]); // audit
       const tool = getTool(createTestServer(), "desk_publish");
@@ -1070,7 +1105,7 @@ describe("Web MCP Server", () => {
       mockSql
         .mockResolvedValueOnce([deskPost({ status: "READY", attestation_id: ATTESTATION_ID })]) // select post
         .mockResolvedValueOnce([editorUserRow]) // getUser -> editor
-        .mockResolvedValueOnce([attestation({ content_hash: hashPayload(BODY) })]) // attestation by id
+        .mockResolvedValueOnce([attestation({ content_hash: CLEAN_HASH })]) // attestation by id
         .mockResolvedValueOnce([{ id: "audit" }]); // publish_blocked audit
       const tool = getTool(createTestServer(), "desk_publish");
       const result = (await tool.handler(input, {})) as ToolResult;
@@ -1080,11 +1115,12 @@ describe("Web MCP Server", () => {
       expect(data.gate.role_ok).toBe(false);
     });
 
-    it("blocks when the body was edited after attestation (hash mismatch)", async () => {
+    it("blocks when a section was edited after attestation (hash mismatch)", async () => {
+      const edited = { ...SECTIONS, snapshot: SECTIONS.snapshot + " Edited after attestation." };
       mockSql
-        .mockResolvedValueOnce([deskPost({ status: "READY", markdown_body: "EDITED BODY", attestation_id: ATTESTATION_ID })]) // select post
+        .mockResolvedValueOnce([deskPost({ status: "READY", sections: edited, attestation_id: ATTESTATION_ID })]) // select post
         .mockResolvedValueOnce([mdUserRow]) // getUser
-        .mockResolvedValueOnce([attestation({ content_hash: hashPayload(BODY) })]) // stale hash
+        .mockResolvedValueOnce([attestation({ content_hash: CLEAN_HASH })]) // stale hash
         .mockResolvedValueOnce([{ id: "audit" }]); // blocked audit
       const tool = getTool(createTestServer(), "desk_publish");
       const result = (await tool.handler(input, {})) as ToolResult;
@@ -1130,7 +1166,7 @@ describe("Web MCP Server", () => {
       mockSql
         .mockResolvedValueOnce([deskPost({ status: "READY", attestation_id: ATTESTATION_ID })]) // select post
         .mockResolvedValueOnce([mdUserRow]) // getUser
-        .mockResolvedValueOnce([attestation({ content_hash: hashPayload(BODY) })]) // attestation by id
+        .mockResolvedValueOnce([attestation({ content_hash: CLEAN_HASH })]) // attestation by id
         .mockResolvedValueOnce([]) // status-guarded UPDATE matched nothing
         .mockResolvedValueOnce([{ id: "audit" }]); // publish_blocked audit
       const tool = getTool(createTestServer(), "desk_publish");
@@ -1142,12 +1178,32 @@ describe("Web MCP Server", () => {
       expect(data.gate.reasons.join(" ")).toContain("concurrent modification");
     });
 
-    it("blocks when the body trips a regex blocker, even with role+hash OK", async () => {
-      const dirty = BODY + " His career is over — done for good.";
+    // The reason deskContentHash covers `meta` and not just the prose: without
+    // it, an MD could attest, then add an FAQ or a conflict_flag, and publish
+    // content that was never attested to. The gate must catch a meta-only edit
+    // exactly as it catches a prose edit.
+    it("blocks when only meta was edited after attestation (hash mismatch)", async () => {
+      const withFaq = { faqs: [{ q: "Added after attestation?", a: "Yes." }] };
       mockSql
-        .mockResolvedValueOnce([deskPost({ status: "READY", markdown_body: dirty, attestation_id: ATTESTATION_ID })]) // select post
+        .mockResolvedValueOnce([deskPost({ status: "READY", meta: withFaq, attestation_id: ATTESTATION_ID })]) // select post
         .mockResolvedValueOnce([mdUserRow]) // getUser
-        .mockResolvedValueOnce([attestation({ content_hash: hashPayload(dirty) })]) // hash matches
+        .mockResolvedValueOnce([attestation({ content_hash: CLEAN_HASH })]) // attested before the FAQ existed
+        .mockResolvedValueOnce([{ id: "audit" }]); // blocked audit
+      const tool = getTool(createTestServer(), "desk_publish");
+      const result = (await tool.handler(input, {})) as ToolResult;
+      const data = JSON.parse(result.content[0].text);
+      expect(data.published).toBe(false);
+      expect(data.gate.role_ok).toBe(true);
+      expect(data.gate.hash_match).toBe(false);
+    });
+
+    it("blocks when the body trips a regex blocker, even with role+hash OK", async () => {
+      const dirtySections = { ...SECTIONS, dr_take: "His career is over — done for good." };
+      const dirty = serializeSections(dirtySections, {});
+      mockSql
+        .mockResolvedValueOnce([deskPost({ status: "READY", sections: dirtySections, attestation_id: ATTESTATION_ID })]) // select post
+        .mockResolvedValueOnce([mdUserRow]) // getUser
+        .mockResolvedValueOnce([attestation({ content_hash: deskContentHash(TITLE, dirtySections, {}, dirty) })]) // hash matches
         .mockResolvedValueOnce([{ id: "audit" }]); // blocked audit
       const tool = getTool(createTestServer(), "desk_publish");
       const result = (await tool.handler(input, {})) as ToolResult;
@@ -1166,7 +1222,7 @@ describe("Web MCP Server", () => {
       mockSql
         .mockResolvedValueOnce([deskPost({ status: "READY", attestation_id: ATTESTATION_ID })]) // select post (clean regex body)
         .mockResolvedValueOnce([mdUserRow]) // getUser
-        .mockResolvedValueOnce([attestation({ content_hash: hashPayload(BODY) })]) // hash matches
+        .mockResolvedValueOnce([attestation({ content_hash: CLEAN_HASH })]) // hash matches
         .mockResolvedValueOnce([{ id: "audit" }]); // blocked audit
       const tool = getTool(createTestServer(), "desk_publish");
       const result = (await tool.handler(input, {})) as ToolResult;
