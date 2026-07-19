@@ -61,10 +61,17 @@ describe("evaluateLiveCheck", () => {
     expect(r.live_content_hash).toBe("b".repeat(64));
   });
 
-  it("fails on 200 from a builder that predates the hash tag", () => {
+  // Reached two ways — an old builder, or a hand-authored post whose JSON has no
+  // _sideline block. The response cannot distinguish them, so the reason must
+  // name both: blaming the builder is wrong for a legacy post that was rebuilt
+  // by the current one minutes ago.
+  it("fails on 200 with no hash tag, naming both possible causes", () => {
     const r = evaluateLiveCheck(URL, HASH, 200, "<html><head></head><body>old</body></html>");
     expect(r.ok).toBe(false);
-    expect(r.reasons.join(" ")).toContain("no x-sideline-content-hash");
+    const why = r.reasons.join(" ");
+    expect(why).toContain("no x-sideline-content-hash");
+    expect(why).toContain("predates the Phase 3 builder");
+    expect(why).toContain("_sideline");
   });
 
   // A transient kpjmd.com outage is "not confirmed yet", not an error.

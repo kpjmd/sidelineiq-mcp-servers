@@ -69,8 +69,13 @@ export function evaluateLiveCheck(
   } else if (httpStatus !== 200) {
     reasons.push(`kpjmd.com returned HTTP ${httpStatus}`);
   } else if (liveHash === null) {
+    // Two causes look identical from here, and the response cannot tell them
+    // apart — so name both rather than asserting one. Guessing "old builder" is
+    // actively misleading on a legacy hand-authored post, whose page may have
+    // been rebuilt minutes ago by the current builder and still carry no tag,
+    // because the tag comes from the JSON's _sideline block, not the builder.
     reasons.push(
-      `live page has no ${CONTENT_HASH_META} meta tag — it was built by a builder predating the Phase 3 changes. Rebuild with the current build-injury-desk.js.`,
+      `live page carries no ${CONTENT_HASH_META} meta tag, so it cannot be matched to this post. Either the page predates the Phase 3 builder (rebuild and rsync), or its JSON has no _sideline block — which is the case for posts written by hand rather than downloaded from /desk. A hand-authored post cannot be confirmed; re-publish it through /desk to make it verifiable.`,
     );
   } else if (liveHash !== expectedHash) {
     reasons.push(
