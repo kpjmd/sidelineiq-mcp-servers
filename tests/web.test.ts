@@ -998,6 +998,137 @@ describe("Web MCP Server", () => {
     });
   });
 
+  // ── Player contract salary (migration 019) ───────────────────────────
+  //
+  // mockSql ignores the SQL text, so behaviour here is asserted through the
+  // captured template strings. That is weaker than a real DB, but it is the
+  // only guard that exists for the two failure modes below, both of which are
+  // silent in production: a transposed COALESCE that wipes salaries every 6h
+  // cycle, and the no-ESPN-id branch quietly not writing the column at all.
+  describe("player salary", () => {
+    const samplePlayer = {
+      id: "dd0e8400-e29b-41d4-a716-446655440000",
+      sport: "NFL",
+      espn_athlete_id: "3929630",
+      full_name: "Saquon Barkley",
+      normalized_name: "saquon barkley",
+      current_team_id: null,
+      position: "RB",
+      jersey: "26",
+      prominence_tier: null,
+      prominence_source: "espn",
+      salary: 16750100,
+      last_synced_at: "2026-08-12T00:00:00Z",
+      retired_at: null,
+    };
+
+    function capturedSql(): string {
+      return mockSql.mock.calls
+        .filter((c) => Array.isArray(c[0]))
+        .map((c) => (c[0] as string[]).join(""))
+        .join("\n");
+    }
+
+    it("writes salary on the ESPN-id branch, preserving a known value when omitted", async () => {
+      mockSql.mockResolvedValueOnce([samplePlayer]);
+      const tool = getTool(createTestServer(), "web_upsert_player");
+
+      const result = (await tool.handler(
+        {
+          sport: "NFL",
+          espn_athlete_id: "3929630",
+          full_name: "Saquon Barkley",
+          salary: 16750100,
+        },
+        {},
+      )) as { isError?: boolean };
+
+      expect(result.isError).toBeUndefined();
+      const sql = capturedSql();
+      expect(sql).toContain("prominence_source, salary,");
+      // Argument ORDER is the assertion, not merely the presence of a COALESCE.
+      // ESPN omits contract for ~32% of NFL athletes, so roster-sync sends no
+      // salary on most rows every cycle. Transposed, those cycles would blank
+      // every salary we already hold and silently demote those athletes.
+      expect(sql).toContain("salary = COALESCE(EXCLUDED.salary, players.salary)");
+      expect(sql).not.toContain("salary = COALESCE(players.salary, EXCLUDED.salary)");
+      expect(sql).not.toContain("salary = EXCLUDED.salary,");
+    });
+
+    it("writes salary on the no-ESPN-id branch, in BOTH the update and the insert", async () => {
+      // The silent-no-op guard. This branch is a SELECT-then-write and its
+      // UPDATE previously propagated only prominence_tier/prominence_source,
+      // so a column added to the insert alone would never update for
+      // override-list players (import-athlete-tiers.ts takes this path).
+      mockSql.mockResolvedValueOnce([samplePlayer]); // SELECT finds an existing row
+      mockSql.mockResolvedValueOnce([samplePlayer]); // UPDATE
+      const tool = getTool(createTestServer(), "web_upsert_player");
+
+      await tool.handler(
+        { sport: "NFL", full_name: "Saquon Barkley", salary: 16750100 },
+        {},
+      );
+
+      const updateSql = capturedSql();
+      expect(updateSql).toContain("salary = COALESCE(");
+      expect(updateSql.slice(updateSql.indexOf("UPDATE players SET"))).toContain("salary");
+
+      mockSql.mockClear();
+      mockSql.mockResolvedValueOnce([]); // SELECT finds nothing
+      mockSql.mockResolvedValueOnce([samplePlayer]); // INSERT
+      const insertTool = getTool(createTestServer(), "web_upsert_player");
+
+      await insertTool.handler(
+        { sport: "NFL", full_name: "Saquon Barkley", salary: 16750100 },
+        {},
+      );
+
+      expect(capturedSql()).toContain("prominence_source, salary,");
+    });
+
+    it("list_players selects salary", async () => {
+      // listPlayers has an explicit column list, so the column is invisible to
+      // the agents-side snapshot unless it is named here.
+      mockSql.mockResolvedValueOnce([{ ...samplePlayer, total_count: "1" }]);
+      const tool = getTool(createTestServer(), "web_list_players");
+
+      await tool.handler({ coverage: "all", limit: 100, offset: 0 }, {});
+
+      expect(capturedSql()).toContain("p.salary");
+    });
+
+    it("resolve_player deliberately does NOT select salary", async () => {
+      // The asymmetry with list_players is intentional: resolve is the
+      // per-event publish-path lookup and has no salary consumer. Pinned so
+      // that "completing" it reads as a deliberate change.
+      mockSql.mockResolvedValueOnce([]);
+      const tool = getTool(createTestServer(), "web_resolve_player");
+
+      await tool.handler({ name: "Saquon Barkley", sport: "NFL" }, {});
+
+      expect(capturedSql()).not.toContain("p.salary");
+    });
+
+    it("rejects a zero or negative salary, accepts omission", () => {
+      // 0 is not a salary. Letting it through would flow into the tier bands
+      // as a genuine value instead of falling back to the flat default —
+      // migration 019 carries the matching CHECK constraint.
+      // Asserted against inputSchema for the same reason as the espn_team_id
+      // case above: these tests call the raw callback, which the SDK does not
+      // run Zod over.
+      const tool = getTool(createTestServer(), "web_upsert_player") as unknown as {
+        inputSchema: { safeParse(v: unknown): { success: boolean } };
+      };
+      const base = { sport: "NFL", full_name: "Saquon Barkley" };
+
+      expect(tool.inputSchema.safeParse({ ...base, salary: 0 }).success).toBe(false);
+      expect(tool.inputSchema.safeParse({ ...base, salary: -1 }).success).toBe(false);
+      expect(tool.inputSchema.safeParse({ ...base, salary: 1.5 }).success).toBe(false);
+      expect(tool.inputSchema.safeParse({ ...base, salary: 16750100 }).success).toBe(true);
+      expect(tool.inputSchema.safeParse(base).success).toBe(true);
+    });
+  });
+
   // ── Coverage scope (migration 018) ───────────────────────────────────
   describe("coverage scope", () => {
     function capturedSql(): string {
