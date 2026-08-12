@@ -788,6 +788,13 @@ export function registerWebTools(server: McpServer): void {
       jersey: z.string().optional(),
       prominence_tier: z.number().int().min(1).max(4).optional(),
       prominence_source: z.enum(["espn", "override", "default"]).optional(),
+      // Whole USD. Omit when ESPN reports no contract — omitted preserves any
+      // previously stored value, and NULL means "no contract reported", which
+      // is the majority for NBA depth players and universal for soccer. The
+      // salary -> prominence mapping is NOT here: it lives in the agents repo's
+      // significance config and is applied at read time, so that re-banding is
+      // a config edit rather than a backfill.
+      salary: z.number().int().positive().optional(),
     },
     {
       readOnlyHint: false,
@@ -900,7 +907,7 @@ export function registerWebTools(server: McpServer): void {
   // espn_athlete_id. This is the diagnostic view that shows them.
   server.tool(
     "web_list_players",
-    "List player rows with their ESPN athlete ids, optionally filtered by sport, team, and the coverage state of their current team. Unlike web_resolve_player this does not hide players on out-of-coverage clubs — it is the inspection surface for roster repair, not a publish-path lookup.",
+    "List player rows with their ESPN athlete ids and contract salary, optionally filtered by sport, team, and the coverage state of their current team. Unlike web_resolve_player this does not hide players on out-of-coverage clubs — it is the inspection surface for roster repair, not a publish-path lookup. A null salary means ESPN reported no contract, which is common (~30% of NFL/NBA) and universal for soccer; it does not mean zero.",
     {
       sport: sportEnum.optional(),
       team_id: z.string().uuid().optional(),

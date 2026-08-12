@@ -185,6 +185,9 @@ export interface UpsertPlayerInput {
   jersey?: string;
   prominence_tier?: number;
   prominence_source?: string;
+  // ESPN's reported annual contract salary, whole USD. Omit when ESPN reports
+  // no contract — see 019_players_salary.sql for why NULL is not 0.
+  salary?: number;
 }
 
 export interface Player {
@@ -198,6 +201,7 @@ export interface Player {
   jersey: string | null;
   prominence_tier: number | null;
   prominence_source: string | null;
+  salary: number | null;
   last_synced_at: string;
   retired_at: string | null;
 }
@@ -1117,13 +1121,13 @@ export class WebDatabaseClient {
       const rows = await this.sql`
         INSERT INTO players (
           sport, espn_athlete_id, full_name, normalized_name, current_team_id,
-          position, jersey, prominence_tier, prominence_source,
+          position, jersey, prominence_tier, prominence_source, salary,
           last_synced_at, updated_at
         ) VALUES (
           ${input.sport}, ${input.espn_athlete_id}, ${input.full_name}, ${normalized},
           ${input.current_team_id ?? null}, ${input.position ?? null},
           ${input.jersey ?? null}, ${input.prominence_tier ?? null},
-          ${input.prominence_source ?? null}, NOW(), NOW()
+          ${input.prominence_source ?? null}, ${input.salary ?? null}, NOW(), NOW()
         )
         ON CONFLICT (sport, espn_athlete_id) DO UPDATE SET
           full_name = EXCLUDED.full_name,
@@ -1133,6 +1137,13 @@ export class WebDatabaseClient {
           jersey = COALESCE(EXCLUDED.jersey, players.jersey),
           prominence_tier = COALESCE(EXCLUDED.prominence_tier, players.prominence_tier),
           prominence_source = COALESCE(EXCLUDED.prominence_source, players.prominence_source),
+          -- Argument order is load-bearing: EXCLUDED first, existing second.
+          -- ESPN omits contract for ~32% of NFL and ~26% of NBA athletes, and
+          -- for every soccer athlete, so roster-sync legitimately sends no
+          -- salary on most rows. Transposed -- or written as a bare assignment
+          -- from EXCLUDED -- every 6h cycle would wipe a known salary back to
+          -- NULL and silently demote that athlete to the flat default.
+          salary = COALESCE(EXCLUDED.salary, players.salary),
           last_synced_at = NOW(),
           updated_at = NOW()
         RETURNING *
@@ -1151,6 +1162,7 @@ export class WebDatabaseClient {
         UPDATE players SET
           prominence_tier = COALESCE(${input.prominence_tier ?? null}, prominence_tier),
           prominence_source = COALESCE(${input.prominence_source ?? null}, prominence_source),
+          salary = COALESCE(${input.salary ?? null}, salary),
           updated_at = NOW()
         WHERE id = ${id}
         RETURNING *
@@ -1160,13 +1172,13 @@ export class WebDatabaseClient {
     const rows = await this.sql`
       INSERT INTO players (
         sport, full_name, normalized_name, current_team_id,
-        position, jersey, prominence_tier, prominence_source,
+        position, jersey, prominence_tier, prominence_source, salary,
         last_synced_at, updated_at
       ) VALUES (
         ${input.sport}, ${input.full_name}, ${normalized},
         ${input.current_team_id ?? null}, ${input.position ?? null},
         ${input.jersey ?? null}, ${input.prominence_tier ?? null},
-        ${input.prominence_source ?? null}, NOW(), NOW()
+        ${input.prominence_source ?? null}, ${input.salary ?? null}, NOW(), NOW()
       )
       RETURNING *
     `;
@@ -1260,7 +1272,7 @@ export class WebDatabaseClient {
     const rows = await this.sql`
       SELECT p.id, p.sport, p.espn_athlete_id, p.full_name, p.normalized_name,
              p.current_team_id, p.position, p.jersey, p.prominence_tier,
-             p.prominence_source, p.last_synced_at, p.retired_at,
+             p.prominence_source, p.salary, p.last_synced_at, p.retired_at,
              count(*) OVER () AS total_count
       FROM players p
       LEFT JOIN teams t ON t.id = p.current_team_id
@@ -1334,6 +1346,12 @@ export class WebDatabaseClient {
   // Filtering here happens BEFORE the LIMIT 5, so excluding an out-of-coverage
   // duplicate can turn confidence 'ambiguous' back into 'normalized'. That is
   // intended: the remaining row is the only one we would publish about.
+  //
+  // Deliberately does NOT select salary, unlike listPlayers. The asymmetry is
+  // intentional, not an oversight: this is the per-event publish-path lookup,
+  // and the only salary consumer reads a whole-table snapshot on its own 6h
+  // TTL (agents/src/agents/injury-intelligence/salary-snapshot.ts). Adding
+  // salary here would put a column on the hot path that nothing reads.
   async resolvePlayer(name: string, sport?: string): Promise<ResolvedPlayer | null> {
     const normalized = normalizePlayerName(name);
     const rows = sport

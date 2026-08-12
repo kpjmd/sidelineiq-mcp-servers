@@ -1,0 +1,126 @@
+-- 019_players_salary.sql
+-- Gives players a place to hold ESPN's reported contract salary, so that an
+-- athlete's default prominence tier can be DERIVED instead of defaulted flat.
+--
+-- The defect: lookupAthleteTier (agents/src/agents/injury-intelligence/
+-- significance.ts) returns tier 3 for every athlete absent from
+-- agents/data/athlete-tiers.json. That file holds 219 hand-curated rows (113
+-- NFL, 106 NBA, zero PREMIER_LEAGUE, zero UFC) and was last reviewed
+-- 2026-04-29, so "tier 3" is not a statement about an athlete — it is the
+-- absence of one. A.J. Brown ($29.0M) and a practice-squad receiver score
+-- identically on prominence, which is 35% of the composite significance score.
+-- The 2026-08-10 calibration review found 87% of gate PROCESS decisions were
+-- tier-3 BREAKING rows landing inside one 7-point band, i.e. the bar's
+-- position, not the athlete, was deciding everything. Three separate rules are
+-- blunted by the same hole: TRACKING.require_tier_1_or_2,
+-- concussion.require_tier_1_or_2, and thresholds.default.max_tier.
+--
+-- ESPN's roster endpoint, already polled every 6h by agents/src/monitoring/
+-- roster-sync.ts, carries a per-athlete contract salary. Measured against live
+-- rosters before writing this: NFL 2025/2989 athletes (68%), NBA 407/547 (74%),
+-- soccer/eng.1 0/35 (0% — soccer athletes carry no contract key at all).
+--
+-- RAW NUMBER, NOT A DERIVED TIER. This column stores dollars. The salary->tier
+-- band mapping lives in agents/data/significance-config.json under the
+-- top-level `salary_tiers` key and is applied at read time by
+-- significance.ts tierFromSalary(). Storing a derived tier here instead would
+-- put the same policy in two places: re-banding would need a full backfill, and
+-- until it finished the DB and the config would disagree about the same
+-- athlete. That divergence shape — one fact, two stores, silently drifting — is
+-- the one this codebase has now fixed seven times. Do not "optimize" this into
+-- a tier column.
+--
+-- BIGINT, WHOLE US DOLLARS. Not cents, not a minor unit, not a numeric with a
+-- scale. The largest value observed is $62.59M, which fits INTEGER comfortably,
+-- but currency columns attract a cents variant later and a reader who assumes
+-- cents would divide every athlete's prominence by 100 without any error ever
+-- being raised. The unit is stated here because the type cannot state it.
+-- Non-USD leagues are not a concern: the two leagues with bands are both USD,
+-- and eng.1 reports no contract at all.
+--
+-- NULL MEANS "ESPN REPORTED NO CONTRACT". It does not mean zero, and the two
+-- must never be conflated, because 0 would flow through the bands as a genuine
+-- salary rather than falling through to the default. NULL is the MODAL value
+-- for some populations, not an exception: 21 of the 22 hand-curated NBA tier-4
+-- athletes have no salary, and every soccer athlete lacks the field entirely.
+-- The CHECK below makes that structural rather than a convention the next
+-- writer has to know about. It is added NOT VALID so applying this file cannot
+-- be blocked by pre-existing rows; there are none today (the column is new), so
+-- this is belt-and-braces against a re-run against a partially migrated DB.
+--
+-- WHY NULLABLE AND NOT DEFAULT 0. See above — a default would erase the
+-- distinction on the very first upsert.
+--
+-- NO NEW INDEX, deliberately, for the same reason 018 gives. The only reader is
+-- listPlayers, which pages the whole table and evaluates salary on rows it has
+-- already fetched; a predicate on an already-fetched row cannot use an index.
+-- Adding one would be pure write overhead against the ~3,500 player upserts
+-- every 6h roster cycle performs.
+--
+-- REJECTED ALTERNATIVES.
+--   * Store the derived tier. See RAW NUMBER above.
+--   * Store both salary and derived tier. Same divergence risk, plus the stored
+--     tier can silently disagree with the config that produced it.
+--   * Reuse prominence_tier with prominence_source = 'salary'. Collapses the
+--     override list and the derived default into one column, so an override
+--     would be overwritten by the next roster sync and there would be no way to
+--     recover it. prominence_tier stays what it is: the override channel.
+--   * A separate player_contracts table with history. Honest modeling, and
+--     genuinely better if we ever want salary-over-time. Today there is exactly
+--     one consumer that wants exactly one current number, and a nullable column
+--     answers it without a join on the read path.
+--   * Derive tier from ESPN's own depth chart instead. The /depthchart endpoint
+--     returns empty for every team tried; it is not usable.
+--
+-- KNOWN RESIDUAL GAPS, deliberate:
+--   * Salary measures market value, not fame. Rookie-scale deals systematically
+--     understate the highest-profile draftees (Luther Burden III $1.34M, Drake
+--     Maye $4.1M, Caleb Williams $4.4M, C.J. Stroud $5.7M) and declining
+--     veterans on restructured deals (Damian Lillard $13.4M). This is precisely
+--     why athlete-tiers.json remains authoritative as an OVERRIDE and must stay
+--     maintained. The derived tier is a DEFAULT, never an override.
+--   * The column carries no as-of timestamp of its own. last_synced_at already
+--     moves on every roster upsert, and a salary is only ever written by that
+--     same path, so it is a sufficient staleness proxy. A traded player's row
+--     refreshes within one 6h cycle.
+--   * Nothing here prevents a future writer other than roster-sync from setting
+--     salary. If import-athlete-tiers.ts is ever changed to write it, note that
+--     the agents-side index deliberately indexes ONLY salary-bearing rows in
+--     order to disambiguate an athlete's ESPN row from an override-imported
+--     no-ESPN row; giving both rows a salary would start defeating that guard.
+--
+-- APPLY BEFORE the matching code change. Migration-first is inert: the column
+-- is all-NULL, nothing writes it, and no reader exists. Code-first raises 42703
+-- undefined_column inside upsertPlayer and listPlayers — and note the failure
+-- shape, because it is NOT a visible outage. roster-sync.ts catches per player
+-- and only increments summary.errors, so a whole roster cycle silently fails
+-- and reads as a flaky sync rather than a schema mismatch.
+-- Applied manually like 001-018: psql $DATABASE_URL -f this file.
+
+-- Pre-flight, expected to return all zeros immediately after apply.
+--   SELECT sport,
+--          count(*) AS players,
+--          count(*) FILTER (WHERE salary IS NOT NULL) AS with_salary
+--   FROM players GROUP BY 1 ORDER BY 1;
+
+ALTER TABLE players
+  ADD COLUMN IF NOT EXISTS salary BIGINT;
+
+-- 0 is not a salary. Keeping it unrepresentable is cheaper than remembering.
+ALTER TABLE players
+  DROP CONSTRAINT IF EXISTS players_salary_positive;
+ALTER TABLE players
+  ADD CONSTRAINT players_salary_positive
+  CHECK (salary IS NULL OR salary > 0) NOT VALID;
+
+-- Post-apply check, to run after ONE roster-sync cycle has completed
+-- (POST /admin/roster-sync, or wait 6h). Expected shape, from live ESPN as of
+-- 2026-08-12: NFL ~2025/2989, NBA ~407/547, PREMIER_LEAGUE 0/N.
+-- A PREMIER_LEAGUE count above zero means ESPN changed the soccer shape and the
+-- band config should be revisited; an NFL or NBA count near zero means the
+-- contract shape moved and extractSalary needs updating.
+--   SELECT sport,
+--          count(*) AS players,
+--          count(*) FILTER (WHERE salary IS NOT NULL) AS with_salary,
+--          round(100.0 * count(*) FILTER (WHERE salary IS NOT NULL) / count(*), 1) AS pct
+--   FROM players WHERE retired_at IS NULL GROUP BY 1 ORDER BY 1;
