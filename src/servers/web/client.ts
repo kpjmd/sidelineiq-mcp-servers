@@ -167,6 +167,10 @@ export interface Team {
   location: string | null;
   display_name: string | null;
   conference: string | null;
+  /** NULL = in editorial coverage. Non-NULL = the club exists but is outside
+   *  the leagues we poll, so its players are withheld from resolvePlayer.
+   *  Not a tombstone and not a soft delete. See migration 018. */
+  left_coverage_at: string | null;
   last_synced_at: string;
   created_at: string;
   updated_at: string;
@@ -204,6 +208,10 @@ export interface ResolvedPlayer {
   current_team_id: string | null;
   current_team_name: string | null;
   current_team_abbreviation: string | null;
+  /** When the team row was last refreshed from ESPN. Lets a consumer weigh how
+   *  old the team assignment is instead of treating it as timeless ground
+   *  truth. NULL when the player has no team. */
+  current_team_synced_at: string | null;
   prominence_tier: number | null;
   confidence: "exact" | "normalized" | "ambiguous" | "miss";
   match_count: number;
@@ -1027,6 +1035,14 @@ export class WebDatabaseClient {
   }
 
   // ── Teams & players ──────────────────────────────────────────────────
+  // The ESPN branch clears left_coverage_at (migration 018). A club reappearing
+  // in the feed is PRESENCE, which is trustworthy, and clearing on presence is
+  // what makes promotion self-heal — without it, relegation would be a one-way
+  // door and we would have traded a stale-club bug for a permanently-hidden-club
+  // bug. The reverse is never automated: fetchTeams returns [] on any error, so
+  // absence is not evidence. Deliberately NOT mirrored in the no-ESPN branch —
+  // a hand-entered club must not re-enter coverage as a side effect of a partial
+  // upsert. Setting the flag is web_set_team_coverage's job alone.
   async upsertTeam(input: UpsertTeamInput): Promise<Team> {
     if (input.espn_team_id) {
       const rows = await this.sql`
@@ -1044,6 +1060,7 @@ export class WebDatabaseClient {
           location = EXCLUDED.location,
           display_name = EXCLUDED.display_name,
           conference = COALESCE(EXCLUDED.conference, teams.conference),
+          left_coverage_at = NULL,
           last_synced_at = NOW(),
           updated_at = NOW()
         RETURNING *
@@ -1156,6 +1173,120 @@ export class WebDatabaseClient {
     return rows[0] as Player;
   }
 
+  // Coverage state is the ONLY team field with a manual write path. Everything
+  // else on teams is ESPN-authoritative and flows through upsertTeam. A general
+  // web_update_team was rejected: it would expose espn_team_id as writable, and
+  // writing it lifts a row out of the partial index that arbitrates it so the
+  // next upsert inserts a twin (017's documented residual gap, handed to an LLM
+  // as an affordance).
+  //
+  // The COALESCE is what makes idempotentHint honest. callToolWithRetry replays
+  // an identical payload on any throw, so a bare NOW() would rewrite the
+  // timestamp on every retry and the recorded "when" would drift.
+  async setTeamCoverage(teamId: string, inCoverage: boolean): Promise<Team> {
+    const rows = await this.sql`
+      UPDATE teams
+      SET left_coverage_at = CASE
+            WHEN ${inCoverage} THEN NULL
+            ELSE COALESCE(teams.left_coverage_at, NOW())
+          END,
+          updated_at = NOW()
+      WHERE id = ${teamId}
+      RETURNING *
+    `;
+    if (rows.length === 0) {
+      throw new McpToolError(
+        `Team ${teamId} not found`,
+        "Verify the team id is correct.",
+      );
+    }
+    return rows[0] as Team;
+  }
+
+  async listTeams(opts: {
+    sport?: string;
+    coverage?: "in" | "out" | "all";
+    limit?: number;
+    offset?: number;
+  }): Promise<{ teams: Team[]; total: number; has_more: boolean; next_offset: number }> {
+    const coverage = opts.coverage ?? "in";
+    const limit = opts.limit ?? 100;
+    const offset = opts.offset ?? 0;
+    const sport = opts.sport ?? null;
+    const rows = await this.sql`
+      SELECT *, count(*) OVER () AS total_count
+      FROM teams
+      WHERE (${sport}::text IS NULL OR sport = ${sport})
+        AND (
+          ${coverage} = 'all'
+          OR (${coverage} = 'in' AND left_coverage_at IS NULL)
+          OR (${coverage} = 'out' AND left_coverage_at IS NOT NULL)
+        )
+      ORDER BY sport, name
+      LIMIT ${limit} OFFSET ${offset}
+    `;
+    const total = rows.length > 0 ? Number((rows[0] as { total_count: string }).total_count) : 0;
+    const teams = rows.map((r) => {
+      const { total_count: _drop, ...team } = r as Record<string, unknown>;
+      return team as unknown as Team;
+    });
+    return {
+      teams,
+      total,
+      has_more: offset + teams.length < total,
+      next_offset: offset + teams.length,
+    };
+  }
+
+  // Unlike resolvePlayer this returns espn_athlete_id, which the reconcile
+  // script needs to probe ESPN's athlete endpoint. Coverage defaults to "all"
+  // here (not "in") because every caller is diagnostic tooling whose whole job
+  // is inspecting the rows resolvePlayer hides.
+  //
+  // Note the coverage filter uses the same null-test semantics as resolvePlayer:
+  // "in" therefore also admits players with no team at all.
+  async listPlayers(opts: {
+    sport?: string;
+    team_id?: string;
+    coverage?: "in" | "out" | "all";
+    limit?: number;
+    offset?: number;
+  }): Promise<{ players: Player[]; total: number; has_more: boolean; next_offset: number }> {
+    const coverage = opts.coverage ?? "all";
+    const limit = opts.limit ?? 100;
+    const offset = opts.offset ?? 0;
+    const sport = opts.sport ?? null;
+    const teamId = opts.team_id ?? null;
+    const rows = await this.sql`
+      SELECT p.id, p.sport, p.espn_athlete_id, p.full_name, p.normalized_name,
+             p.current_team_id, p.position, p.jersey, p.prominence_tier,
+             p.prominence_source, p.last_synced_at, p.retired_at,
+             count(*) OVER () AS total_count
+      FROM players p
+      LEFT JOIN teams t ON t.id = p.current_team_id
+      WHERE (${sport}::text IS NULL OR p.sport = ${sport})
+        AND (${teamId}::uuid IS NULL OR p.current_team_id = ${teamId}::uuid)
+        AND (
+          ${coverage} = 'all'
+          OR (${coverage} = 'in' AND t.left_coverage_at IS NULL)
+          OR (${coverage} = 'out' AND t.left_coverage_at IS NOT NULL)
+        )
+      ORDER BY p.full_name
+      LIMIT ${limit} OFFSET ${offset}
+    `;
+    const total = rows.length > 0 ? Number((rows[0] as { total_count: string }).total_count) : 0;
+    const players = rows.map((r) => {
+      const { total_count: _drop, ...player } = r as Record<string, unknown>;
+      return player as unknown as Player;
+    });
+    return {
+      players,
+      total,
+      has_more: offset + players.length < total,
+      next_offset: offset + players.length,
+    };
+  }
+
   async setPlayerProminence(
     playerId: string,
     tier: number,
@@ -1178,6 +1309,31 @@ export class WebDatabaseClient {
     return rows[0] as Player;
   }
 
+  // Resolves to the canonical player record we are willing to PUBLISH about, so
+  // players on out-of-coverage clubs are withheld (migration 018).
+  //
+  // "AND t.left_coverage_at IS NULL" lives in WHERE, and must stay there. Two
+  // things about it look wrong and are not:
+  //
+  //  1. It is a null-TEST, not a comparison, so it never yields UNKNOWN. Under
+  //     the LEFT JOIN a player with no team at all gets an all-NULL t.* row and
+  //     NULL IS NULL is TRUE, so teamless players stay resolvable. Production
+  //     had 30 of them (27 NFL, 3 NBA). No COALESCE and no "t.id IS NULL OR ..."
+  //     is needed; adding one is harmless noise, removing the predicate is not.
+  //  2. Moving it into the LEFT JOIN's ON clause would NOT filter the player
+  //     out — it would suppress the join and return them with a null team, which
+  //     silently converts a hidden-by-design row into an unverifiable one. That
+  //     is a semantic change no type checker catches, so tests/web.test.ts pins
+  //     the predicate's absence from the ON clause.
+  //
+  // Unconditional, with no include_out_of_coverage escape hatch: this tool is
+  // LLM-facing and an optional flag that disables the guard will eventually be
+  // set by a model reasoning that it needs more results. Callers that genuinely
+  // need those rows (the seasonal reconcile script) use web_list_players.
+  //
+  // Filtering here happens BEFORE the LIMIT 5, so excluding an out-of-coverage
+  // duplicate can turn confidence 'ambiguous' back into 'normalized'. That is
+  // intended: the remaining row is the only one we would publish about.
   async resolvePlayer(name: string, sport?: string): Promise<ResolvedPlayer | null> {
     const normalized = normalizePlayerName(name);
     const rows = sport
@@ -1185,22 +1341,26 @@ export class WebDatabaseClient {
           SELECT
             p.id AS player_id, p.full_name, p.prominence_tier,
             p.current_team_id, t.name AS current_team_name, t.abbreviation AS current_team_abbreviation,
+            t.last_synced_at AS current_team_synced_at,
             p.retired_at
           FROM players p
           LEFT JOIN teams t ON t.id = p.current_team_id
           WHERE p.sport = ${sport} AND p.normalized_name = ${normalized}
             AND p.retired_at IS NULL
+            AND t.left_coverage_at IS NULL
           LIMIT 5
         `
       : await this.sql`
           SELECT
             p.id AS player_id, p.full_name, p.prominence_tier,
             p.current_team_id, t.name AS current_team_name, t.abbreviation AS current_team_abbreviation,
+            t.last_synced_at AS current_team_synced_at,
             p.retired_at
           FROM players p
           LEFT JOIN teams t ON t.id = p.current_team_id
           WHERE p.normalized_name = ${normalized}
             AND p.retired_at IS NULL
+            AND t.left_coverage_at IS NULL
           LIMIT 5
         `;
 

@@ -978,6 +978,156 @@ describe("Web MCP Server", () => {
         tool.inputSchema.safeParse({ sport: "NBA", name: "Test Club", espn_team_id: "17" }).success,
       ).toBe(true);
     });
+
+    it("clears left_coverage_at on the ESPN path but not the no-ESPN path", async () => {
+      // Presence in the ESPN feed restores a club to coverage — this is what
+      // makes promotion self-heal, so without it relegation is a one-way door.
+      // The no-ESPN path must NOT do this: a hand-entered club should not
+      // re-enter coverage as a side effect of a partial upsert.
+      mockSql.mockResolvedValueOnce([{ ...sampleTeam, espn_team_id: "17" }]);
+      const espnTool = getTool(createTestServer(), "web_upsert_team");
+      await espnTool.handler({ sport: "NBA", espn_team_id: "17", name: "Test Club" }, {});
+      expect(capturedSql()).toContain("left_coverage_at = NULL");
+
+      mockSql.mockClear();
+      mockSql.mockResolvedValueOnce([sampleTeam]);
+      const nameTool = getTool(createTestServer(), "web_upsert_team");
+      await nameTool.handler({ sport: "NBA", name: "Test Club" }, {});
+      const sql = capturedSql();
+      expect(sql.slice(sql.indexOf("DO UPDATE SET"))).not.toContain("left_coverage_at");
+    });
+  });
+
+  // ── Coverage scope (migration 018) ───────────────────────────────────
+  describe("coverage scope", () => {
+    function capturedSql(): string {
+      return mockSql.mock.calls
+        .filter((c) => Array.isArray(c[0]))
+        .map((c) => (c[0] as string[]).join(""))
+        .join("\n");
+    }
+
+    const coverageTeamRow = {
+      id: "cc0e8400-e29b-41d4-a716-446655440000",
+      sport: "PREMIER_LEAGUE",
+      espn_team_id: "379",
+      name: "Burnley",
+      abbreviation: "BUR",
+      location: null,
+      display_name: "Burnley",
+      conference: null,
+      left_coverage_at: null,
+      last_synced_at: "2026-06-19T00:00:00Z",
+      created_at: "2026-06-19T00:00:00Z",
+      updated_at: "2026-06-19T00:00:00Z",
+    };
+
+    const resolvedRow = {
+      player_id: "aa0e8400-e29b-41d4-a716-446655440000",
+      full_name: "Test Player",
+      prominence_tier: 2,
+      current_team_id: "cc0e8400-e29b-41d4-a716-446655440000",
+      current_team_name: "Test Club",
+      current_team_abbreviation: "TC",
+      current_team_synced_at: "2026-08-12T00:00:00Z",
+      retired_at: null,
+    };
+
+    it.each([
+      ["with a sport filter", { name: "Test Player", sport: "NBA" }],
+      ["without a sport filter", { name: "Test Player" }],
+    ])("resolve_player excludes out-of-coverage teams %s", async (_label, args) => {
+      mockSql.mockResolvedValueOnce([resolvedRow]);
+      const tool = getTool(createTestServer(), "web_resolve_player");
+
+      await tool.handler(args, {});
+
+      expect(capturedSql()).toContain("AND t.left_coverage_at IS NULL");
+    });
+
+    it("puts the coverage predicate in WHERE, never in the LEFT JOIN's ON clause", async () => {
+      // This is the assertion that matters most and the one a type checker can
+      // never make. In the ON clause the predicate does NOT filter the player
+      // out — it suppresses the join, returning them with a null team. That
+      // converts a row hidden by design into one the fact-validator cannot
+      // check, which is the exact fail-open this whole change exists to close.
+      mockSql.mockResolvedValueOnce([resolvedRow]);
+      const tool = getTool(createTestServer(), "web_resolve_player");
+
+      await tool.handler({ name: "Test Player", sport: "NBA" }, {});
+
+      const sql = capturedSql();
+      expect(sql).toContain("LEFT JOIN teams t ON t.id = p.current_team_id\n");
+      expect(sql).not.toContain("ON t.id = p.current_team_id AND");
+      // The predicate must sit after WHERE, not before it.
+      expect(sql.indexOf("left_coverage_at")).toBeGreaterThan(sql.indexOf("WHERE"));
+    });
+
+    it("resolve_player returns the team's sync timestamp", async () => {
+      mockSql.mockResolvedValueOnce([resolvedRow]);
+      const tool = getTool(createTestServer(), "web_resolve_player");
+
+      const result = (await tool.handler({ name: "Test Player", sport: "NBA" }, {})) as {
+        content: Array<{ text: string }>;
+      };
+
+      expect(capturedSql()).toContain("t.last_synced_at AS current_team_synced_at");
+      const data = JSON.parse(result.content[0].text);
+      expect(data.player.current_team_synced_at).toBe("2026-08-12T00:00:00Z");
+    });
+
+    it("set_team_coverage COALESCEs the timestamp so a replay cannot move it", async () => {
+      // callToolWithRetry replays an identical payload on any throw. A bare
+      // NOW() would rewrite the recorded departure date every retry, which
+      // would make idempotentHint: true a lie.
+      mockSql.mockResolvedValueOnce([
+        { ...coverageTeamRow, left_coverage_at: "2026-08-12T00:00:00Z" },
+      ]);
+      const tool = getTool(createTestServer(), "web_set_team_coverage");
+
+      await tool.handler(
+        { team_id: "cc0e8400-e29b-41d4-a716-446655440000", in_coverage: false },
+        {},
+      );
+
+      expect(capturedSql()).toContain("COALESCE(teams.left_coverage_at, NOW())");
+    });
+
+    it("set_team_coverage errors on an unknown team id", async () => {
+      mockSql.mockResolvedValueOnce([]);
+      const tool = getTool(createTestServer(), "web_set_team_coverage");
+
+      const result = (await tool.handler(
+        { team_id: "cc0e8400-e29b-41d4-a716-446655440000", in_coverage: false },
+        {},
+      )) as { isError?: boolean };
+
+      expect(result.isError).toBe(true);
+    });
+
+    it("list_teams defaults to in-coverage, list_players defaults to all", () => {
+      // Opposite defaults on purpose: list_teams feeds a diff against the ESPN
+      // feed, where already-known departures would read as fresh drift every
+      // cycle; list_players is diagnostic tooling for the hidden rows.
+      const teams = getTool(createTestServer(), "web_list_teams") as unknown as {
+        inputSchema: { parse(v: unknown): { coverage: string } };
+      };
+      const players = getTool(createTestServer(), "web_list_players") as unknown as {
+        inputSchema: { parse(v: unknown): { coverage: string } };
+      };
+
+      expect(teams.inputSchema.parse({}).coverage).toBe("in");
+      expect(players.inputSchema.parse({}).coverage).toBe("all");
+    });
+
+    it("rejects an unknown coverage value at the schema boundary", () => {
+      const tool = getTool(createTestServer(), "web_list_teams") as unknown as {
+        inputSchema: { safeParse(v: unknown): { success: boolean } };
+      };
+
+      expect(tool.inputSchema.safeParse({ coverage: "maybe" }).success).toBe(false);
+      expect(tool.inputSchema.safeParse({ coverage: "out" }).success).toBe(true);
+    });
   });
 
   // ── Phase 2C — desk posts + the publish gate ─────────────────────────
