@@ -17,6 +17,14 @@ export function registerTwitterTools(server: McpServer): void {
       text: z.string().min(1).max(25000).describe("Tweet content. Premium account supports up to 25,000 characters. Twitter counts URLs as 23 chars (t.co shortening)."),
       reply_to_id: z.string().optional().describe("Tweet ID to reply to"),
     },
+    // Additive, but NOT idempotent. Twitter's own duplicate-content rejection
+    // (client.ts) blunts a retry in practice; it is not a contract we can lean on.
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
     async (input) => {
       try {
         const result = await client.publishTweet(input.text, input.reply_to_id);
@@ -37,6 +45,14 @@ export function registerTwitterTools(server: McpServer): void {
         .min(2)
         .max(10)
         .describe("Ordered thread content (2-10 tweets). Premium account supports up to 25,000 characters per tweet. Twitter counts URLs as 23 chars (t.co shortening)."),
+    },
+    // A mid-thread failure leaves the earlier tweets live, so a retry both
+    // duplicates them and orphans the partial thread.
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
     },
     async (input) => {
       try {
@@ -70,6 +86,12 @@ export function registerTwitterTools(server: McpServer): void {
     {
       id: z.string().describe("The tweet ID to retrieve"),
     },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
     async (input) => {
       try {
         const result = await client.getTweet(input.id);
@@ -89,6 +111,12 @@ export function registerTwitterTools(server: McpServer): void {
       since_id: z.string().optional().describe("Only return mentions newer than this tweet ID (pagination cursor)"),
       max_results: z.number().int().min(5).max(100).default(10).optional().describe("Max mentions to return (5-100, default 10)"),
     },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
     async (input) => {
       try {
         const result = await client.getMentions(input.user_id, input.since_id, input.max_results ?? 10);
@@ -105,6 +133,14 @@ export function registerTwitterTools(server: McpServer): void {
     "Delete a published tweet by ID. Use when MD review flags a post for removal after publication.",
     {
       id: z.string().describe("The tweet ID to delete"),
+    },
+    // Destructive AND idempotent are not in tension: the delete is irreversible
+    // externally, but re-deleting the same id converges on the same end state.
+    {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: true,
     },
     async (input) => {
       try {

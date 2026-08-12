@@ -64,6 +64,12 @@ export function registerWebTools(server: McpServer): void {
         .optional()
         .describe("ISO 8601 date (YYYY-MM-DD) when the injury or surgery originally occurred"),
     },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         const result = await client.createPost({
@@ -135,6 +141,14 @@ export function registerWebTools(server: McpServer): void {
         .describe("Fields to update"),
       update_reason: z.string().min(1).describe("Why this post is being updated"),
     },
+    // Overwrites fields in place with no version-history table, so prior values
+    // are unrecoverable; version increments on every call.
+    {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         const result = await client.updatePost(
@@ -170,6 +184,12 @@ export function registerWebTools(server: McpServer): void {
         .describe(
           "If true, cascade-delete all TRACKING descendants and md_reviews. Required when the post has children.",
         ),
+    },
+    {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async (input) => {
       try {
@@ -208,6 +228,12 @@ export function registerWebTools(server: McpServer): void {
     {
       post_id: z.string().uuid().describe("The post ID to retrieve"),
     },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         const result = await client.getPost(input.post_id);
@@ -235,6 +261,12 @@ export function registerWebTools(server: McpServer): void {
     "Retrieve an injury post by its URL slug. Used by the frontend for slug-based routing.",
     {
       slug: z.string().min(1).describe("The URL slug to look up"),
+    },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async (input) => {
       try {
@@ -264,6 +296,12 @@ export function registerWebTools(server: McpServer): void {
     {
       platform: z.enum(["twitter", "farcaster"]).describe("The platform the social ID belongs to"),
       social_id: z.string().min(1).describe("Twitter tweet ID or Farcaster cast hash"),
+    },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async (input) => {
       try {
@@ -310,6 +348,14 @@ export function registerWebTools(server: McpServer): void {
           "When true, do NOT flip post status to PENDING_REVIEW. Use for retrospective flags on already-published posts.",
         ),
     },
+    // Not idempotent: appends a NEW md_reviews PENDING row on every call, so
+    // repeated flags pile up duplicate review rows.
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         const result = await client.flagForMdReview(
@@ -342,6 +388,12 @@ export function registerWebTools(server: McpServer): void {
       status: statusEnum.optional().describe("Filter by post status"),
       limit: z.number().int().min(1).max(50).default(20).describe("Results per page (max 50)"),
       offset: z.number().int().min(0).default(0).describe("Pagination offset"),
+    },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async (input) => {
       try {
@@ -379,6 +431,12 @@ export function registerWebTools(server: McpServer): void {
         .optional()
         .describe("Filter by review status (PENDING, APPROVED, REJECTED)"),
     },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         const reviews = await client.listMdReviews(input.status);
@@ -402,6 +460,12 @@ export function registerWebTools(server: McpServer): void {
         .string()
         .optional()
         .describe("Optional notes from the reviewing physician"),
+    },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async (input) => {
       try {
@@ -431,6 +495,14 @@ export function registerWebTools(server: McpServer): void {
     {
       confirm: z.literal(true).describe("Must be true to execute the purge"),
       reason: z.string().min(1).describe("Why the purge is being performed"),
+    },
+    // Unqualified DELETE FROM injury_posts. Idempotent only in the sense that a
+    // second purge finds nothing left to destroy.
+    {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async (input) => {
       try {
@@ -464,6 +536,12 @@ export function registerWebTools(server: McpServer): void {
     {
       key: z.string().describe("The state key to read"),
     },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         const value = await client.getSocialState(input.key);
@@ -482,6 +560,12 @@ export function registerWebTools(server: McpServer): void {
       key: z.string().describe("The state key to write"),
       value: z.string().describe("The value to store"),
     },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         await client.setSocialState(input.key, input.value);
@@ -499,6 +583,12 @@ export function registerWebTools(server: McpServer): void {
     {
       platform: z.string().describe("Platform: 'twitter' or 'farcaster'"),
       mention_id: z.string().describe("Tweet ID or cast hash"),
+    },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async (input) => {
       try {
@@ -526,6 +616,12 @@ export function registerWebTools(server: McpServer): void {
       reply_content: z.string().optional().describe("Text of the reply posted"),
       reply_post_id: z.string().optional().describe("ID of the reply tweet or cast hash"),
       raw_payload: z.record(z.unknown()).optional().describe("Raw platform API response for audit"),
+    },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async (input) => {
       try {
@@ -563,6 +659,12 @@ export function registerWebTools(server: McpServer): void {
       new_value: z.string().describe("The corrected value from the user"),
       submitted_by_handle: z.string().describe("@handle of the user who submitted the correction"),
     },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         const data: InsertPendingCorrectionInput = {
@@ -589,6 +691,12 @@ export function registerWebTools(server: McpServer): void {
     {
       status: z.enum(["PENDING", "APPROVED", "DISMISSED"]).optional().describe("Filter by status (default: all)"),
     },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         const corrections = await client.listPendingCorrections(input.status);
@@ -605,6 +713,14 @@ export function registerWebTools(server: McpServer): void {
     "One-click approve a PENDING_REVIEW injury post. Flips status to PUBLISHED and marks the linked md_reviews row as APPROVED. Returns the full post row for downstream social publishing (Farcaster, Twitter). No reviewer notes required — for richer reviews with notes, use web_update_md_review.",
     {
       post_id: z.string().describe("The post ID to approve"),
+    },
+    // The status guard (WHERE status = 'PENDING_REVIEW') throws before any write
+    // on a repeat call, so re-running leaves no trace.
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async (input) => {
       try {
@@ -632,6 +748,15 @@ export function registerWebTools(server: McpServer): void {
       display_name: z.string().optional(),
       conference: z.string().optional(),
     },
+    // NOT idempotent despite the name: upsertTeam only uses ON CONFLICT when
+    // espn_team_id is supplied. Without it the method falls through to a bare
+    // INSERT that appends a duplicate team row on every call.
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         const team = await client.upsertTeam(input);
@@ -656,6 +781,12 @@ export function registerWebTools(server: McpServer): void {
       prominence_tier: z.number().int().min(1).max(4).optional(),
       prominence_source: z.enum(["espn", "override", "default"]).optional(),
     },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         const player = await client.upsertPlayer(input);
@@ -677,6 +808,12 @@ export function registerWebTools(server: McpServer): void {
       tier: z.number().int().min(1).max(4),
       source: z.string().min(1).default("override"),
     },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         const player = await client.setPlayerProminence(input.player_id, input.tier, input.source);
@@ -697,6 +834,12 @@ export function registerWebTools(server: McpServer): void {
     {
       name: z.string().min(1),
       sport: sportEnum.optional(),
+    },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async (input) => {
       try {
@@ -726,6 +869,14 @@ export function registerWebTools(server: McpServer): void {
       new_value: z.string().min(1),
       note: z.string().min(1).describe("Public-facing reason for the correction"),
     },
+    // Appends the correction note into the public clinical_summary. Re-calling
+    // visibly duplicates the note in published content, and there is no undo.
+    {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         const result = await client.applyCorrection(
@@ -748,6 +899,12 @@ export function registerWebTools(server: McpServer): void {
     {
       post_id: z.string().uuid(),
     },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         const entity = await client.getEntityForPost(input.post_id);
@@ -764,6 +921,12 @@ export function registerWebTools(server: McpServer): void {
     "Resolve an injury entity by id (player_id, body_part, laterality, injury_type, status, canonical_post_id, return date). Lets the Injury Desk walk a desk post's entity_id → canonical_post_id → web_get_post for fact-validation context.",
     {
       entity_id: z.string().uuid(),
+    },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async (input) => {
       try {
@@ -797,6 +960,12 @@ export function registerWebTools(server: McpServer): void {
     {
       entity_id: z.string().uuid(),
     },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         const post = await client.getPublishedDeskPostForEntity(input.entity_id);
@@ -813,6 +982,12 @@ export function registerWebTools(server: McpServer): void {
     "List an injury entity's timeline updates newest-first (update_kind, severity_at_time, team_timeline_weeks, otm_min_weeks, source_url, description). Backs the Injury Desk entity-timeline panel. An empty array is a valid result, not an error.",
     {
       entity_id: z.string().uuid(),
+    },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async (input) => {
       try {
@@ -839,6 +1014,12 @@ export function registerWebTools(server: McpServer): void {
       injury_type: z.string().optional(),
       recency_days: z.number().int().min(1).max(365).default(21),
     },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         const result = await client.findMatchingEntity(input);
@@ -859,6 +1040,12 @@ export function registerWebTools(server: McpServer): void {
       laterality: z.enum(["LEFT", "RIGHT", "BILATERAL", "UNSPECIFIED"]).optional(),
       injury_type: z.string().optional(),
       canonical_post_id: z.string().uuid().optional(),
+    },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
     },
     async (input) => {
       try {
@@ -890,6 +1077,13 @@ export function registerWebTools(server: McpServer): void {
       otm_min_weeks: z.number().int().min(0).optional(),
       source_url: z.string().url().optional(),
       description: z.string().optional(),
+    },
+    // Append-only by design: a new injury_updates row every call.
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
     },
     async (input) => {
       try {
@@ -938,6 +1132,12 @@ export function registerWebTools(server: McpServer): void {
         .optional(),
       needs_date_review: z.boolean().optional(),
     },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         const entity = await client.updateThreadDates(input);
@@ -960,6 +1160,12 @@ export function registerWebTools(server: McpServer): void {
       source_url: z.string().url().optional(),
       description: z.string().optional(),
       update_kind: z.enum(["INITIAL", "TRACKING", "CONFLICT", "CORRECTION"]).default("TRACKING"),
+    },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
     },
     async (input) => {
       try {
@@ -989,6 +1195,12 @@ export function registerWebTools(server: McpServer): void {
       outcome: z.enum(["RESOLVED", "RETIRED"]).default("RESOLVED"),
       closed_by: z.string().optional(),
     },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         const entity = await client.closeThread(input);
@@ -1005,6 +1217,12 @@ export function registerWebTools(server: McpServer): void {
     "Return one injury thread in a single round-trip for the MD detail view: the entity row (resolved dates, OTM projection, accuracy record) plus its full injury_updates trajectory newest-first.",
     {
       entity_id: z.string().uuid(),
+    },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async (input) => {
       try {
@@ -1033,6 +1251,12 @@ export function registerWebTools(server: McpServer): void {
       status: z.enum(["ACTIVE", "RESOLVED", "RETIRED"]).optional(),
       needs_date_review: z.boolean().optional(),
       limit: z.number().int().min(1).max(500).default(100),
+    },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async (input) => {
       try {
@@ -1072,6 +1296,14 @@ export function registerWebTools(server: McpServer): void {
         .optional()
         .describe("Free-form context (validation result codes, MD notes, etc.)"),
     },
+    // The append-only ledger IS this tool's subject, so a new row per call is the
+    // point — unlike the other mutators, where the audit row is a side effect.
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         const entry = await client.auditAppend(input);
@@ -1090,6 +1322,12 @@ export function registerWebTools(server: McpServer): void {
       entity_type: z.string().min(1).describe("Domain of the entity"),
       entity_id: z.string().uuid().describe("Entity row id"),
       limit: z.number().int().min(1).max(500).default(100),
+    },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async (input) => {
       try {
@@ -1132,6 +1370,12 @@ export function registerWebTools(server: McpServer): void {
         .optional()
         .describe("The existing PUBLISHED desk post this candidate targets. Required iff candidate_kind is RETURN_WATCH_UPDATE."),
     },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         if (input.candidate_kind === "RETURN_WATCH_UPDATE" && !input.target_desk_post_id) {
@@ -1172,6 +1416,12 @@ export function registerWebTools(server: McpServer): void {
       status: z.enum(["PROPOSED", "ACCEPTED", "DISMISSED", "PROMOTED"]).optional(),
       limit: z.number().int().min(1).max(500).default(100),
     },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         const candidates = await client.listCandidates(input.status, input.limit);
@@ -1193,6 +1443,12 @@ export function registerWebTools(server: McpServer): void {
       candidate_id: z.string().uuid(),
       decision: z.enum(["ACCEPTED", "DISMISSED"]),
       decided_by: z.string().min(1).describe("MD user id (or 'md' until NextAuth lands in Phase 2)"),
+    },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async (input) => {
       try {
@@ -1221,6 +1477,12 @@ export function registerWebTools(server: McpServer): void {
     {
       user_id: z.string().uuid(),
     },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         const user = await client.getUser(input.user_id);
@@ -1237,6 +1499,12 @@ export function registerWebTools(server: McpServer): void {
     "Look up a verified user by email (case-insensitive). Used by the NextAuth adapter to resolve the signing-in identity and its role. Returns null if not found.",
     {
       email: z.string().email(),
+    },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async (input) => {
       try {
@@ -1257,6 +1525,12 @@ export function registerWebTools(server: McpServer): void {
       role: z.enum(["md", "editor"]),
       name: z.string().min(1).optional(),
     },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         const user = await client.upsertUser(input);
@@ -1276,6 +1550,13 @@ export function registerWebTools(server: McpServer): void {
       token: z.string().min(1).describe("Hashed verification token"),
       expires: z.string().datetime().describe("ISO 8601 expiry timestamp"),
     },
+    // Plain INSERT with no conflict clause — a repeat with the same token errors.
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         const verification_token = await client.createVerificationToken(input);
@@ -1293,6 +1574,14 @@ export function registerWebTools(server: McpServer): void {
     {
       identifier: z.string().min(1).describe("Recipient email (Auth.js identifier)"),
       token: z.string().min(1).describe("Hashed verification token to consume"),
+    },
+    // Destructive despite the name: this is a DELETE ... RETURNING, a single-use
+    // consume-on-read. A second call returns null.
+    {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async (input) => {
       try {
@@ -1361,6 +1650,12 @@ export function registerWebTools(server: McpServer): void {
       source_attribution: z.unknown().optional(),
       disclaimer_present: z.boolean().optional(),
     },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         const post = await client.createDraft(input);
@@ -1389,6 +1684,14 @@ export function registerWebTools(server: McpServer): void {
       disclaimer_present: z.boolean().optional(),
       edit_diff: z.unknown().optional(),
     },
+    // Not destructive — every save writes a desk_post_versions row, so the prior
+    // body stays recoverable. Not idempotent for that same reason.
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         const post = await client.updateDraft(input);
@@ -1406,6 +1709,15 @@ export function registerWebTools(server: McpServer): void {
     "Lint a desk post for Tier 2 framing violations and kpjmd contract compliance. Returns {warnings, blockers}; non-empty blockers will block desk_publish.",
     {
       desk_post_id: z.string().uuid(),
+    },
+    // Read-only at the SQL level, but open-world: the classifier calls Haiku
+    // (linter-classifier.ts). Output is non-deterministic; the environment is
+    // unchanged either way.
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
     },
     async (input) => {
       try {
@@ -1432,6 +1744,14 @@ export function registerWebTools(server: McpServer): void {
       framing_confirmed: z.boolean(),
       ip: z.string().optional(),
     },
+    // Appends a new desk_attestations row on every call — domain content, not
+    // ledger, so this is genuinely not idempotent.
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         const attestation = await client.attestDeskPost(input);
@@ -1453,6 +1773,15 @@ export function registerWebTools(server: McpServer): void {
       desk_post_id: z.string().uuid(),
       reviewer_user_id: z.string().uuid().describe("MD user id (UUID); role re-derived from the DB"),
     },
+    // Open-world: runs the linter (Haiku) on every invocation. The status guard
+    // throws before any write on a repeat call. Not destructive — publishing adds
+    // to the world rather than destroying state; desk_retract is the inverse.
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
     async (input) => {
       try {
         const result = await client.publishDeskPost(input.desk_post_id, input.reviewer_user_id);
@@ -1470,6 +1799,14 @@ export function registerWebTools(server: McpServer): void {
     {
       desk_post_id: z.string().uuid(),
       reviewer_user_id: z.string().uuid().describe("MD user id (UUID); role re-derived from the DB"),
+    },
+    // Destructive because it removes live public content. The guard
+    // (WHERE status = 'PUBLISHED') throws before any write on a repeat call.
+    {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async (input) => {
       try {
@@ -1491,6 +1828,14 @@ export function registerWebTools(server: McpServer): void {
     {
       desk_post_id: z.string().uuid(),
       reviewer_user_id: z.string().uuid().describe("MD user id (UUID); role re-derived from the DB"),
+    },
+    // Open-world: fetches https://kpjmd.com/injury-desk/{slug}/. Re-running after
+    // a redeploy is the intended flow — see the note above confirmKpjmdLive.
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
     },
     async (input) => {
       try {
@@ -1518,6 +1863,12 @@ export function registerWebTools(server: McpServer): void {
       occurred_at: z.string().datetime().describe("ISO 8601 real-world date the update reflects"),
       candidate_id: z.string().uuid().optional().describe("The RETURN_WATCH_UPDATE candidate this append resolves, if any"),
     },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         const update = await client.appendDeskPostUpdate(input);
@@ -1534,6 +1885,12 @@ export function registerWebTools(server: McpServer): void {
     "List a desk post's Return Watch updates newest-first (headline, markdown_body, occurred_at, author_id). Backs the timeline rendered in the /desk editor and the updates[] array of the kpjmd handoff. Empty array is a valid result.",
     {
       desk_post_id: z.string().uuid(),
+    },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async (input) => {
       try {
@@ -1553,6 +1910,12 @@ export function registerWebTools(server: McpServer): void {
       status: z.enum(["DRAFT", "READY", "PUBLISHED", "RETRACTED"]).optional(),
       limit: z.number().int().min(1).max(500).default(100),
     },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async (input) => {
       try {
         const posts = await client.listDeskPosts(input.status, input.limit);
@@ -1569,6 +1932,12 @@ export function registerWebTools(server: McpServer): void {
     "Fetch one desk post by id plus its attestations (newest first) for the Injury Desk editor view.",
     {
       desk_post_id: z.string().uuid(),
+    },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async (input) => {
       try {

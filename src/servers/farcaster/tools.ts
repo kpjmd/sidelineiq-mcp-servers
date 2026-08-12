@@ -23,6 +23,14 @@ export function registerFarcasterTools(server: McpServer): void {
         .describe("Link embeds (max 2)"),
       parent_cast_hash: z.string().optional().describe("Parent cast hash for replies"),
     },
+    // Additive (destroys nothing), but NOT idempotent: no idempotency key is
+    // sent to Neynar, so a retry publishes a second identical cast.
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
     async (input) => {
       try {
         const result = await client.publishCast(input.text, {
@@ -53,6 +61,14 @@ export function registerFarcasterTools(server: McpServer): void {
         .max(2)
         .optional()
         .describe("Embeds on first cast only"),
+    },
+    // A mid-thread failure leaves the earlier casts live, so a retry both
+    // duplicates them and orphans the partial thread.
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
     },
     async (input) => {
       try {
@@ -87,6 +103,12 @@ export function registerFarcasterTools(server: McpServer): void {
     {
       hash: z.string().describe("The cast hash to retrieve"),
     },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
     async (input) => {
       try {
         const result = await client.getCast(input.hash);
@@ -106,6 +128,12 @@ export function registerFarcasterTools(server: McpServer): void {
       cursor: z.string().optional().describe("Pagination cursor from previous call"),
       limit: z.number().int().min(1).max(50).default(25).optional().describe("Max notifications to return (1-50, default 25)"),
     },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
     async (input) => {
       try {
         const result = await client.getNotifications(input.fid, input.cursor, input.limit ?? 25);
@@ -122,6 +150,14 @@ export function registerFarcasterTools(server: McpServer): void {
     "Delete a published cast by hash. Use when MD review flags a post for removal after publication.",
     {
       hash: z.string().describe("The cast hash to delete"),
+    },
+    // Destructive AND idempotent are not in tension: the delete is irreversible
+    // externally, but re-deleting the same hash converges on the same end state.
+    {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: true,
     },
     async (input) => {
       try {
