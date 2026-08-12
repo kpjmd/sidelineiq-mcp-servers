@@ -1421,6 +1421,12 @@ export class WebDatabaseClient {
   // manual entry all call this with different subsets). needs_date_review is
   // auto-derived from confidence ('unknown' → needs review) unless the caller
   // sets it explicitly, or omitted entirely to keep the current value.
+  //
+  // canonical_post_id is the one field whose COALESCE runs the other way: it is
+  // a backfill of a NULL, not an update. Entities created pre-publish by the
+  // Injury Thread Manager have no canonical post yet, so the first post to land
+  // fills it. An already-set canonical is never overwritten — otherwise a thread
+  // would get repointed at its most recent follow-up instead of its origin.
   async updateThreadDates(input: {
     entity_id: string;
     injury_date?: string;
@@ -1429,6 +1435,7 @@ export class WebDatabaseClient {
     surgery_confirmed?: boolean;
     date_resolution_sources?: DateResolutionSource[];
     otm_projection?: OtmProjection;
+    canonical_post_id?: string;
     needs_date_review?: boolean;
   }): Promise<InjuryEntity> {
     const needsReview =
@@ -1451,6 +1458,9 @@ export class WebDatabaseClient {
         surgery_confirmed = COALESCE(${input.surgery_confirmed ?? null}::boolean, surgery_confirmed),
         date_resolution_sources = COALESCE(${sources}::jsonb, date_resolution_sources),
         otm_projection = COALESCE(${projection}::jsonb, otm_projection),
+        -- Inverted on purpose: column first, param second. Fills only when the
+        -- canonical is still NULL; never repoints an established thread.
+        canonical_post_id = COALESCE(canonical_post_id, ${input.canonical_post_id ?? null}::uuid),
         needs_date_review = COALESCE(${needsReview}::boolean, needs_date_review),
         last_updated_at = NOW(),
         updated_at = NOW()

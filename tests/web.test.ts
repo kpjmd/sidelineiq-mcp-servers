@@ -391,6 +391,112 @@ describe("Web MCP Server", () => {
     });
   });
 
+  // canonical_post_id is a fill-if-null backfill, unlike every other field in
+  // this statement. mockSql ignores the SQL text (it just returns queued rows),
+  // so a mock can't evaluate COALESCE itself — the direction of the clause IS
+  // the behaviour, and asserting on the generated SQL is the only way to pin it.
+  // Transposing the two arguments would repoint every thread at its most recent
+  // post instead of its originating one, silently and irreversibly.
+  describe("web_thread_update_dates", () => {
+    const ORIGINAL_POST_ID = samplePost.id;
+    const NEW_POST_ID = "550e8400-e29b-41d4-a716-4466554400ff";
+
+    // The tagged template arrives at mockSql as (strings, ...values).
+    function lastQuery(): { text: string; values: unknown[] } {
+      const call = mockSql.mock.calls[mockSql.mock.calls.length - 1] as [
+        string[],
+        ...unknown[],
+      ];
+      const [strings, ...values] = call;
+      return { text: strings.join("?"), values };
+    }
+
+    it("backfills canonical_post_id when the thread has none", async () => {
+      mockSql.mockResolvedValue([
+        { ...sampleEntity, canonical_post_id: NEW_POST_ID },
+      ]);
+
+      const server = createTestServer();
+      const tool = getTool(server, "web_thread_update_dates");
+
+      const result = (await tool.handler(
+        { entity_id: sampleEntity.id, canonical_post_id: NEW_POST_ID },
+        {},
+      )) as { content: Array<{ text: string }> };
+
+      const { text, values } = lastQuery();
+      expect(text).toContain("canonical_post_id = COALESCE(canonical_post_id,");
+      expect(values).toContain(NEW_POST_ID);
+
+      const data = JSON.parse(result.content[0].text);
+      expect(data.entity.canonical_post_id).toBe(NEW_POST_ID);
+    });
+
+    it("never overwrites an already-set canonical_post_id", async () => {
+      // Row comes back with the ORIGINAL canonical even though a different post
+      // id was passed — that is the COALESCE keeping the established value.
+      mockSql.mockResolvedValue([
+        { ...sampleEntity, canonical_post_id: ORIGINAL_POST_ID },
+      ]);
+
+      const server = createTestServer();
+      const tool = getTool(server, "web_thread_update_dates");
+
+      const result = (await tool.handler(
+        { entity_id: sampleEntity.id, canonical_post_id: NEW_POST_ID },
+        {},
+      )) as { content: Array<{ text: string }> };
+
+      const { text } = lastQuery();
+      // Column first, param second. Anything else is the overwrite direction.
+      expect(text).toMatch(
+        /canonical_post_id\s*=\s*COALESCE\(\s*canonical_post_id\s*,\s*\?::uuid\s*\)/,
+      );
+      expect(text).not.toMatch(
+        /canonical_post_id\s*=\s*COALESCE\(\s*\?[^,)]*,\s*canonical_post_id\s*\)/,
+      );
+
+      const data = JSON.parse(result.content[0].text);
+      expect(data.entity.canonical_post_id).toBe(ORIGINAL_POST_ID);
+    });
+
+    it("binds null for canonical_post_id when the caller omits it", async () => {
+      // The resolveThreadAndDates() shape — dates only, no post exists yet.
+      mockSql.mockResolvedValue([sampleEntity]);
+
+      const server = createTestServer();
+      const tool = getTool(server, "web_thread_update_dates");
+
+      await tool.handler(
+        { entity_id: sampleEntity.id, injury_date: "2026-03-24" },
+        {},
+      );
+
+      const { text, values } = lastQuery();
+      expect(text).toContain("canonical_post_id = COALESCE(canonical_post_id,");
+      // COALESCE(col, NULL) → column untouched.
+      expect(values).toContain(null);
+      expect(values).not.toContain(NEW_POST_ID);
+    });
+
+    it("leaves the other fields on the incoming-value-wins direction", async () => {
+      mockSql.mockResolvedValue([sampleEntity]);
+
+      const server = createTestServer();
+      const tool = getTool(server, "web_thread_update_dates");
+
+      await tool.handler(
+        { entity_id: sampleEntity.id, injury_date: "2026-03-24" },
+        {},
+      );
+
+      // Guards against A1 having inverted the whole statement by accident.
+      const { text } = lastQuery();
+      expect(text).toMatch(/injury_date = COALESCE\(\?::date, injury_date\)/);
+      expect(text).toMatch(/otm_projection = COALESCE\(\?::jsonb, otm_projection\)/);
+    });
+  });
+
   describe("web_list_injury_updates", () => {
     it("should list updates newest-first", async () => {
       mockSql.mockResolvedValue(sampleUpdates);
