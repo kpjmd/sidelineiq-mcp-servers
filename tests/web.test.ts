@@ -846,6 +846,140 @@ describe("Web MCP Server", () => {
     });
   });
 
+  describe("web_upsert_team", () => {
+    // These assertions read the SQL text captured by mockSql. That proves which
+    // branch ran and exactly what clause it emitted — it does NOT prove the
+    // arbiter infers against a real index, that a second call updates instead
+    // of inserting, or that COALESCE preserves prior values. Those need live
+    // Postgres and are covered by the manual check in migration 017's header.
+    const sampleTeam = {
+      id: "cc0e8400-e29b-41d4-a716-446655440000",
+      sport: "NBA",
+      espn_team_id: null,
+      name: "Test Club",
+      abbreviation: "TC",
+      location: null,
+      display_name: null,
+      conference: null,
+      last_synced_at: "2026-08-12T00:00:00Z",
+      created_at: "2026-08-12T00:00:00Z",
+      updated_at: "2026-08-12T00:00:00Z",
+    };
+
+    function capturedSql(): string {
+      return mockSql.mock.calls
+        .filter((c) => Array.isArray(c[0]))
+        .map((c) => (c[0] as string[]).join(""))
+        .join("\n");
+    }
+
+    it("arbitrates on (sport, espn_team_id) when an ESPN id is present", async () => {
+      mockSql.mockResolvedValueOnce([{ ...sampleTeam, espn_team_id: "17" }]);
+      const tool = getTool(createTestServer(), "web_upsert_team");
+
+      const result = (await tool.handler(
+        { sport: "NBA", espn_team_id: "17", name: "Test Club" },
+        {},
+      )) as { content: Array<{ text: string }>; isError?: boolean };
+
+      expect(result.isError).toBeUndefined();
+      const sql = capturedSql();
+      expect(sql).toContain("ON CONFLICT (sport, espn_team_id)");
+      expect(sql).not.toContain("lower(btrim(name))");
+    });
+
+    it("arbitrates on the partial name index when no ESPN id is supplied", async () => {
+      mockSql.mockResolvedValueOnce([sampleTeam]);
+      const tool = getTool(createTestServer(), "web_upsert_team");
+
+      const result = (await tool.handler({ sport: "NBA", name: "Test Club" }, {})) as {
+        content: Array<{ text: string }>;
+        isError?: boolean;
+      };
+
+      expect(result.isError).toBeUndefined();
+      // Character-identical to uniq_teams_sport_name_no_espn in migration 017.
+      // These two strings must stay in sync; any drift is a runtime 42P10, not
+      // a compile error, and this assertion is the only automated guard.
+      expect(capturedSql()).toContain(
+        "ON CONFLICT (sport, lower(btrim(name))) WHERE espn_team_id IS NULL DO UPDATE SET",
+      );
+    });
+
+    it("issues exactly one statement on the no-ESPN-id path", async () => {
+      // The regression guard: upsertPlayer's no-ESPN fallback is a racy
+      // SELECT-then-write. A single statement is what proves that pattern was
+      // not copied here.
+      mockSql.mockResolvedValueOnce([sampleTeam]);
+      const tool = getTool(createTestServer(), "web_upsert_team");
+
+      await tool.handler({ sport: "NBA", name: "Test Club" }, {});
+
+      expect(mockSql).toHaveBeenCalledOnce();
+    });
+
+    it("never writes espn_team_id on the no-ESPN-id path", async () => {
+      // Setting it would lift the row out of the partial index's predicate, so
+      // the next call would insert a twin instead of updating.
+      mockSql.mockResolvedValueOnce([sampleTeam]);
+      const tool = getTool(createTestServer(), "web_upsert_team");
+
+      await tool.handler({ sport: "NBA", name: "Test Club" }, {});
+
+      const sql = capturedSql();
+      expect(sql).toContain(
+        "INSERT INTO teams (sport, name, abbreviation, location, display_name, conference, last_synced_at, updated_at)",
+      );
+      expect(sql.slice(sql.indexOf("DO UPDATE SET"))).not.toContain("espn_team_id");
+    });
+
+    it("preserves previously-populated optionals on the no-ESPN-id path", async () => {
+      // The textual stand-in for the destructiveHint: false guarantee — a
+      // minimal {sport, name} call must not blank fields a richer call set.
+      mockSql.mockResolvedValueOnce([sampleTeam]);
+      const tool = getTool(createTestServer(), "web_upsert_team");
+
+      await tool.handler({ sport: "NBA", name: "Test Club" }, {});
+
+      const sql = capturedSql();
+      expect(sql).toContain("abbreviation = COALESCE(EXCLUDED.abbreviation, teams.abbreviation)");
+      expect(sql).toContain("location = COALESCE(EXCLUDED.location, teams.location)");
+      expect(sql).toContain("display_name = COALESCE(EXCLUDED.display_name, teams.display_name)");
+      expect(sql).toContain("conference = COALESCE(EXCLUDED.conference, teams.conference)");
+      // name is NOT NULL and .min(1), so a COALESCE there would be dead code.
+      expect(sql).toContain("name = EXCLUDED.name");
+    });
+
+    it("returns the upserted row", async () => {
+      mockSql.mockResolvedValueOnce([sampleTeam]);
+      const tool = getTool(createTestServer(), "web_upsert_team");
+
+      const result = (await tool.handler({ sport: "NBA", name: "Test Club" }, {})) as {
+        content: Array<{ text: string }>;
+      };
+
+      const data = JSON.parse(result.content[0].text);
+      expect(data.team.id).toBe(sampleTeam.id);
+    });
+
+    it("rejects an empty espn_team_id at the schema boundary", () => {
+      // Asserted against inputSchema rather than through handler(): these tests
+      // call the raw callback, which the SDK does not run Zod over. Without
+      // .min(1), "" is falsy and would silently take the name path while the
+      // caller believes it supplied an ESPN id.
+      const tool = getTool(createTestServer(), "web_upsert_team") as unknown as {
+        inputSchema: { safeParse(v: unknown): { success: boolean } };
+      };
+
+      expect(
+        tool.inputSchema.safeParse({ sport: "NBA", name: "Test Club", espn_team_id: "" }).success,
+      ).toBe(false);
+      expect(
+        tool.inputSchema.safeParse({ sport: "NBA", name: "Test Club", espn_team_id: "17" }).success,
+      ).toBe(true);
+    });
+  });
+
   // ── Phase 2C — desk posts + the publish gate ─────────────────────────
   const mdUserRow = {
     id: "770e8400-e29b-41d4-a716-446655440002",

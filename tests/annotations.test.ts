@@ -115,8 +115,9 @@ const WEB: Record<string, Hints> = {
   web_insert_pending_correction: [false, false, false, false],
   web_list_pending_corrections: READ,
   web_approve_injury_post: [false, false, true, false],
-  // Only an upsert when espn_team_id is supplied; otherwise a duplicating INSERT.
-  web_upsert_team: [false, false, false, false],
+  // A true upsert on both paths: (sport, espn_team_id), else the partial unique
+  // index on (sport, lower(btrim(name))) WHERE espn_team_id IS NULL.
+  web_upsert_team: [false, false, true, false],
   web_upsert_player: [false, false, true, false],
   web_set_player_prominence: [false, false, true, false],
   web_resolve_player: READ,
