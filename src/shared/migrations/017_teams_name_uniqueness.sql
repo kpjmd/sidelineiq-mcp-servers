@@ -1,0 +1,71 @@
+-- 017_teams_name_uniqueness.sql
+-- Closes a latent duplicate-row bug in upsertTeam (servers/web/client.ts).
+--
+-- 008 gave teams exactly one uniqueness rule: UNIQUE (sport, espn_team_id).
+-- upsertTeam therefore only had an arbiter for the ESPN path; without an
+-- espn_team_id it fell through to a bare INSERT that appended a fresh UUID row
+-- on every call — same sport, same name, no error, a plausible Team returned
+-- to the caller. The mechanism is that UNIQUE (sport, espn_team_id) is
+-- NULLS DISTINCT (the Postgres default), so unlimited rows with a NULL
+-- espn_team_id coexist for the same (sport, name) and nothing ever conflicts.
+--
+-- Nothing in the platform currently drives that path — the sole caller,
+-- agents/src/monitoring/roster-sync.ts, always sends an ESPN id (its producer
+-- skips any ESPN payload with no id), and production holds zero rows with
+-- espn_team_id IS NULL. So this is a trap being disarmed before something
+-- springs it, not an outage being repaired.
+--
+-- The fix is a real constraint rather than the SELECT-then-UPDATE-else-INSERT
+-- that upsertPlayer uses for its own no-ESPN-id case: that pattern is racy, and
+-- callToolWithRetry (agents/src/utils/mcp-client-manager.ts) replays the
+-- identical payload on any throw, straight back into the same window.
+--
+-- PARTIAL, because ESPN-sourced rows must stay free to share a name: a rebrand
+-- or relocation can transiently collide two live teams on name while their
+-- espn_team_id values remain distinct and authoritative. Those rows are
+-- arbitrated by (sport, espn_team_id) and are excluded here.
+--
+-- NORMALIZED on lower(btrim(name)), matching how players are keyed off
+-- normalized_name in the same method pair. The rows that reach this branch are
+-- hand- or agent-authored — precisely the ones that drift on casing and stray
+-- whitespace. Verified before writing this: zero collisions under
+-- (sport, lower(btrim(name))) across all 85 existing rows, NULL espn_team_id or
+-- not, so the index applies to today's data with no dedupe and no backfill.
+-- Both lower() and btrim() are IMMUTABLE, so the expression is index-eligible.
+--
+-- KNOWN RESIDUAL GAP, deliberate: this index covers only espn_team_id IS NULL
+-- rows. A team first created without an ESPN id that ESPN later begins
+-- publishing will insert a SECOND row — the ESPN branch arbitrates on
+-- (sport, espn_team_id), finds no match, and appends. Neither index prevents
+-- that, by construction. Do not try to close it inside upsertTeam; a name-based
+-- pre-lookup is the racy pattern this migration exists to avoid. If it ever
+-- arises, handle it as a deliberate merge that repoints players.current_team_id
+-- BEFORE deleting the orphan — that FK is ON DELETE SET NULL, so a careless
+-- delete silently orphans roster rows instead of failing.
+--
+-- The ON CONFLICT clause in upsertTeam must name this expression AND this
+-- predicate verbatim; any divergence is a hard 42P10 at runtime, not a compile
+-- error. tests/web.test.ts pins the arbiter as an exact substring to catch that.
+--
+-- Not CONCURRENTLY: 85 rows build in microseconds, CREATE INDEX CONCURRENTLY
+-- cannot run inside a transaction block, and a failed concurrent build leaves
+-- an INVALID index behind that a hand-run migration has no way to clean up.
+--
+-- Apply before deploying the matching code change. Migration-first is inert
+-- (the index simply sits unused); code-first raises 42P10 on the no-ESPN path.
+-- Applied manually like 001-016: psql $DATABASE_URL -f this file.
+
+-- Pre-flight, expected to return zero rows. CREATE UNIQUE INDEX below fails
+-- loudly with 23505 and changes nothing if it does not, so no dedupe step is
+-- built into this file.
+--   SELECT sport, lower(btrim(name)) AS key, count(*)
+--   FROM teams WHERE espn_team_id IS NULL
+--   GROUP BY 1, 2 HAVING count(*) > 1;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_teams_sport_name_no_espn
+  ON teams (sport, lower(btrim(name)))
+  WHERE espn_team_id IS NULL;
+
+-- idx_teams_sport_name (008) is deliberately NOT dropped. It is non-unique and
+-- covers every row; this one is unique, expression-based, and covers only the
+-- espn_team_id IS NULL subset. Neither subsumes the other.

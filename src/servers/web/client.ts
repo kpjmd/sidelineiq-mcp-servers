@@ -1050,6 +1050,30 @@ export class WebDatabaseClient {
       `;
       return rows[0] as Team;
     }
+    // No ESPN id (hand-entered or non-ESPN-sourced team). Upsert on
+    // (sport, lower(btrim(name))), arbitrated by the partial unique index from
+    // migration 017:
+    //   uniq_teams_sport_name_no_espn ON teams (sport, lower(btrim(name)))
+    //     WHERE espn_team_id IS NULL
+    // The conflict target below must repeat that expression and that predicate
+    // verbatim — a mismatch is 42P10 at runtime, not a type error.
+    //
+    // Every optional column is COALESCEd here, unlike the ESPN branch above.
+    // That branch consumes a complete record from the teams endpoint, so
+    // overwriting is a correct full refresh that lets a rebrand propagate. This
+    // input is partial by construction — abbreviation, location, display_name
+    // and conference are all optional on the tool schema — so an outright
+    // overwrite would let a minimal {sport, name} call blank out fields a
+    // richer earlier call had populated. That would be data loss on a tool
+    // annotated destructiveHint: false.
+    //
+    // name is not COALESCEd: it is NOT NULL and z.string().min(1), so
+    // EXCLUDED.name is never null. Under a normalized arbiter this line is a
+    // casing/whitespace canonicalizer — the key is unchanged, so the row never
+    // moves out of its own index slot.
+    //
+    // espn_team_id is never written: setting it would lift the row out of the
+    // partial index that arbitrates it, so the next call would insert a twin.
     const rows = await this.sql`
       INSERT INTO teams (sport, name, abbreviation, location, display_name, conference, last_synced_at, updated_at)
       VALUES (
@@ -1057,6 +1081,14 @@ export class WebDatabaseClient {
         ${input.location ?? null}, ${input.display_name ?? null},
         ${input.conference ?? null}, NOW(), NOW()
       )
+      ON CONFLICT (sport, lower(btrim(name))) WHERE espn_team_id IS NULL DO UPDATE SET
+        name = EXCLUDED.name,
+        abbreviation = COALESCE(EXCLUDED.abbreviation, teams.abbreviation),
+        location = COALESCE(EXCLUDED.location, teams.location),
+        display_name = COALESCE(EXCLUDED.display_name, teams.display_name),
+        conference = COALESCE(EXCLUDED.conference, teams.conference),
+        last_synced_at = NOW(),
+        updated_at = NOW()
       RETURNING *
     `;
     return rows[0] as Team;

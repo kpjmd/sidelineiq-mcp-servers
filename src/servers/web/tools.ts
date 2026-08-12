@@ -738,23 +738,31 @@ export function registerWebTools(server: McpServer): void {
   // ── web_upsert_team ─────────────────────────────────────────────────
   server.tool(
     "web_upsert_team",
-    "Upsert a team row from ESPN's teams endpoint. Conflict resolution: (sport, espn_team_id). Used by the roster-sync cycle that runs every 6h to keep teams current with trades and rebrands.",
+    "Upsert a team row from ESPN's teams endpoint. Conflict resolution: (sport, espn_team_id) when the ESPN id is present, else (sport, name) case- and whitespace-insensitively among rows that have no ESPN id. Used by the roster-sync cycle that runs every 6h to keep teams current with trades and rebrands.",
     {
       sport: sportEnum,
-      espn_team_id: z.string().optional(),
-      name: z.string().min(1),
+      // .min(1) so an empty string cannot slip through: "" is falsy, so it
+      // would silently route a caller that believes it supplied an ESPN id
+      // down the name path. Still optional — hand-entered teams are a
+      // supported case, matching web_upsert_player's override-list path.
+      espn_team_id: z.string().min(1).optional(),
+      // .trim() before .min(1) (Zod applies checks in declaration order) so a
+      // whitespace-only name is rejected rather than stored. The index still
+      // btrims independently — rows can arrive via psql.
+      name: z.string().trim().min(1),
       abbreviation: z.string().optional(),
       location: z.string().optional(),
       display_name: z.string().optional(),
       conference: z.string().optional(),
     },
-    // NOT idempotent despite the name: upsertTeam only uses ON CONFLICT when
-    // espn_team_id is supplied. Without it the method falls through to a bare
-    // INSERT that appends a duplicate team row on every call.
+    // Idempotent on both paths. (sport, espn_team_id) arbitrates ESPN rows; the
+    // partial unique index uniq_teams_sport_name_no_espn (migration 017)
+    // arbitrates the rest. This matters concretely: callToolWithRetry in the
+    // agents repo replays the identical payload on any throw.
     {
       readOnlyHint: false,
       destructiveHint: false,
-      idempotentHint: false,
+      idempotentHint: true,
       openWorldHint: false,
     },
     async (input) => {
