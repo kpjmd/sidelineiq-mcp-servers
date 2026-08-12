@@ -862,6 +862,103 @@ export function registerWebTools(server: McpServer): void {
     },
   );
 
+  // ── web_list_teams ──────────────────────────────────────────────────
+  // Teams were write-only before this: nothing could enumerate them, so nothing
+  // could diff the DB against the ESPN feed to notice a club that stopped being
+  // returned. That is how three relegated Premier League clubs sat stale for two
+  // months (migration 018).
+  server.tool(
+    "web_list_teams",
+    "List team rows, optionally filtered by sport and by coverage state. coverage='in' (default) returns clubs inside our editorial coverage, 'out' returns clubs that still exist upstream but have left it (e.g. relegated), 'all' returns both. Used by roster-sync drift detection and the seasonal coverage-reconcile script.",
+    {
+      sport: sportEnum.optional(),
+      // Defaults to "in", not "all": the primary caller diffs this against the
+      // ESPN feed, and defaulting to "all" would count already-known
+      // out-of-coverage clubs as fresh drift on every single cycle.
+      coverage: z.enum(["in", "out", "all"]).default("in"),
+      limit: z.number().int().min(1).max(200).default(100),
+      offset: z.number().int().min(0).default(0),
+    },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    async (input) => {
+      try {
+        return toolSuccess(await client.listTeams(input));
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_list_players ────────────────────────────────────────────────
+  // Complements web_resolve_player rather than duplicating it: resolve is the
+  // publish-path lookup and deliberately hides out-of-coverage rows and omits
+  // espn_athlete_id. This is the diagnostic view that shows them.
+  server.tool(
+    "web_list_players",
+    "List player rows with their ESPN athlete ids, optionally filtered by sport, team, and the coverage state of their current team. Unlike web_resolve_player this does not hide players on out-of-coverage clubs — it is the inspection surface for roster repair, not a publish-path lookup.",
+    {
+      sport: sportEnum.optional(),
+      team_id: z.string().uuid().optional(),
+      // Defaults to "all" (unlike web_list_teams): every caller here is
+      // diagnostic tooling whose purpose is inspecting the hidden rows.
+      coverage: z.enum(["in", "out", "all"]).default("all"),
+      limit: z.number().int().min(1).max(200).default(100),
+      offset: z.number().int().min(0).default(0),
+    },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    async (input) => {
+      try {
+        return toolSuccess(await client.listPlayers(input));
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_set_team_coverage ───────────────────────────────────────────
+  // The ONLY manual write path on teams. Setting a club out of coverage is
+  // never inferred from its absence in the ESPN feed — fetchTeams returns [] on
+  // any error, so one bad response is indistinguishable from a mass relegation.
+  // Clearing happens automatically in upsertTeam on presence. See migration 018.
+  server.tool(
+    "web_set_team_coverage",
+    "Mark a team as inside or outside our editorial coverage. Out-of-coverage clubs keep their row and their player links — the club still exists (e.g. relegated to a league we do not poll) — but its players stop resolving via web_resolve_player. Reversible: in_coverage=true restores it, and a club reappearing in the ESPN feed is restored automatically by web_upsert_team.",
+    {
+      team_id: z.string().uuid(),
+      in_coverage: z.boolean(),
+      // Free-text provenance for the audit trail; not persisted on the row.
+      reason: z.string().min(1).optional(),
+    },
+    // destructiveHint tracks recoverability, not SQL shape: this hides players
+    // from resolution but destroys nothing, and one call reverses it.
+    // Idempotent because the timestamp is COALESCEd — a replayed call cannot
+    // move an already-recorded departure date.
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    async (input) => {
+      try {
+        const team = await client.setTeamCoverage(input.team_id, input.in_coverage);
+        return toolSuccess({ team });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
   // ── web_apply_correction ────────────────────────────────────────────
   // Used by the legacy fact sweep (and any future manual correction tool).
   // Updates one allowlisted field on a published post, bumps correction_count,

@@ -1,0 +1,129 @@
+-- 018_teams_coverage_scope.sql
+-- Gives teams a way to say "this club still exists, but it is no longer inside
+-- our editorial coverage."
+--
+-- The defect: teams held 23 PREMIER_LEAGUE rows while ESPN's eng.1 teams
+-- endpoint returned 20. The three extras — Burnley (379), West Ham United (371),
+-- Wolverhampton Wanderers (380) — were relegated at the end of 2025/26. They sat
+-- frozen at last_synced_at = 2026-06-19 while every other PL row refreshed, and
+-- between them they held 85 players, all retired_at IS NULL. syncSport
+-- (agents/src/monitoring/roster-sync.ts) only upserts teams ESPN returns, so
+-- nothing would ever revisit those rows again. Downstream, fact-validator
+-- checks a reported team against resolvePlayer's current_team_name, so those 85
+-- players were being validated against two-month-stale roster data.
+--
+-- Verified against ESPN before writing this: all three clubs are still served
+-- under eng.2 (the Championship) with the SAME espn ids — ESPN soccer team ids
+-- are global, not league-scoped. They were RELEGATED, not deleted. Probing all
+-- 85 players individually via the league-agnostic athlete endpoint
+-- (site.web.api.espn.com/apis/common/v3/sports/soccer/athletes/{id}, which
+-- returns the player's true current club anywhere in the world) gave: 75 still
+-- at the same now-Championship club, 10 genuinely moved, 0 lookup failures.
+-- None of the 10 moved into a club still in the PL, which is why roster sync
+-- could never have healed this on its own.
+--
+-- So the model is COVERAGE, not existence. Burnley exists; it left our scope.
+--
+-- The invariant this column is designed around:
+--   players.current_team_id always points at the player's TRUE current club.
+--   Coverage is a property of CLUBS, not of players.
+-- Under that invariant nothing ever needs its team link nulled, which matters:
+-- fact-validator's team check has no roster team to compare against when
+-- current_team_id IS NULL, so nulling a link converts a detectable staleness
+-- into an unverifiable event.
+--
+-- SEMANTICS. NULL = in coverage (every existing row, hence this migration is
+-- inert on apply). Non-NULL = the club exists and its roster may well be
+-- accurate, but it is outside the leagues we poll, so its players are withheld
+-- from web_resolve_player. This is NOT a tombstone and NOT a soft delete.
+--
+-- SET/CLEAR ASYMMETRY, the part most likely to be "helpfully" broken later:
+-- presence in the ESPN feed is trustworthy, absence is not. fetchTeams
+-- (agents/src/monitoring/sports/espn-base.ts) returns [] on any non-OK HTTP
+-- status, any throw, and any shape change under sports[0].leagues[0] — its
+-- failure mode is spurious ABSENCE. One bad response is therefore
+-- indistinguishable from twenty simultaneous relegations. Consequently:
+--   * CLEARED automatically, by upsertTeam's ESPN branch. Presence is proof, and
+--     this is what makes promotion self-heal. Without it, relegation would be a
+--     one-way door and we would have traded a stale-club bug for a
+--     permanently-hidden-club bug.
+--   * SET only by hand, via web_set_team_coverage, driven by the seasonal script
+--     agents/src/scripts/reconcile-coverage-scope.ts. Never inferred from
+--     absence inside the 6h loop.
+--
+-- WHY A COLUMN AND NOT A DELETE. players.current_team_id is
+-- REFERENCES teams(id) ON DELETE SET NULL (008:35), so deleting these three rows
+-- would silently null all 85 links and raise nothing — 017:41-44 flags this same
+-- FK for the same reason. It would also destroy the 75 links that are CORRECT,
+-- and forfeit both the UUID and the (sport, espn_team_id) slot needed to restore
+-- the club on promotion.
+--
+-- REJECTED ALTERNATIVES.
+--   * Delete the rows. See above.
+--   * Age out the player links instead. Leaves the team row still asserting PL
+--     membership, and answers nothing about where any individual player went.
+--   * teams.active BOOLEAN. Same cost, less information: a timestamp records
+--     WHEN, which is what makes an annual relegation cycle auditable.
+--   * players.retired_at. It means retired-from-the-sport, and these players are
+--     playing — Ward-Prowse moved Burnley -> West Ham. Note that retired_at is
+--     currently written by NOTHING in the system (it is read as a filter in
+--     resolvePlayer and backs idx_players_sport_active, both presently dead
+--     weight). Repurposing it would be the cheap move; a dead column with clear
+--     semantics is worth more than a live one with muddled semantics.
+--   * A separate covered_leagues table. Honest modeling, but sport already
+--     conflates sport-and-league throughout the schema and one nullable
+--     timestamp resolves today's defect without a schema-wide refactor.
+--
+-- NO NEW INDEX, deliberately. The only hot-path reader is resolvePlayer, which
+-- reaches teams by primary key through an existing LEFT JOIN; a predicate on an
+-- already-fetched row cannot use an index. The only other reader is
+-- web_list_teams, scanning ~85-100 rows. A partial index here would be pure
+-- write overhead against the ~82 upserts every 6h cycle performs.
+--
+-- uniq_teams_sport_name_no_espn (017) is deliberately NOT narrowed. Adding
+-- "AND left_coverage_at IS NULL" to its predicate is the tempting edit and it is
+-- a regression: it would let an out-of-coverage club and a live one collide on
+-- (sport, lower(btrim(name))), which is exactly the duplicate-row trap 017
+-- exists to disarm. Coverage state is orthogonal to identity.
+--
+-- KNOWN RESIDUAL GAPS, deliberate:
+--   * The column cannot express WHICH league a club moved to. If that is ever
+--     needed, it is a new column, not an overload of this one.
+--   * Clubs outside our four leagues are created under the sport of the player
+--     who moved there (so Galatasaray lands under 'PREMIER_LEAGUE'). sport is
+--     functionally a coverage-namespace already — the three relegated clubs sit
+--     under PREMIER_LEAGUE while playing in the Championship — and since ESPN
+--     soccer ids are global, (PREMIER_LEAGUE, espn_team_id) is a stable,
+--     collision-free key for any club on earth. Introducing a truer sport key
+--     later would insert a SECOND row for such a club under the new key while
+--     players still point at the old one, and nothing would catch it.
+--   * Nothing enforces that a player's team shares the player's sport.
+--   * Relegation recurs every May. This is a runbook item, not a fix.
+--
+-- APPLY BEFORE the matching code change. Migration-first is inert (the column is
+-- all-NULL and every predicate over it is a tautology). Code-first raises 42703
+-- undefined_column inside resolvePlayer — and note the failure shape, because it
+-- is NOT a visible outage: the agent's resolvePlayer wrapper (poller.ts) catches
+-- and returns null, so every event in every sport degrades to
+-- identity_unresolvable + team_unverified soft fails and quietly floods the MD
+-- review queue.
+-- Applied manually like 001-017: psql $DATABASE_URL -f this file.
+
+-- Pre-flight, expected to return all zeros immediately after apply.
+--   SELECT sport,
+--          count(*) AS teams,
+--          count(*) FILTER (WHERE left_coverage_at IS NOT NULL) AS out_of_coverage
+--   FROM teams GROUP BY 1 ORDER BY 1;
+
+ALTER TABLE teams
+  ADD COLUMN IF NOT EXISTS left_coverage_at TIMESTAMP WITH TIME ZONE;
+
+-- Post-apply check, the one the mocked test harness structurally cannot make.
+-- resolvePlayer LEFT JOINs teams, so a player with no team at all yields an
+-- all-NULL t.* row; "t.left_coverage_at IS NULL" is a null-TEST and returns TRUE
+-- for those, which is what keeps teamless players resolvable. Confirm it, rather
+-- than trusting the reasoning — production had 30 such rows (27 NFL, 3 NBA):
+--   SELECT count(*) FROM players p
+--   LEFT JOIN teams t ON t.id = p.current_team_id
+--   WHERE p.current_team_id IS NULL AND p.retired_at IS NULL
+--     AND t.left_coverage_at IS NULL;   -- must equal the teamless count, not 0

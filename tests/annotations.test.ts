@@ -121,6 +121,13 @@ const WEB: Record<string, Hints> = {
   web_upsert_player: [false, false, true, false],
   web_set_player_prominence: [false, false, true, false],
   web_resolve_player: READ,
+  web_list_teams: READ,
+  web_list_players: READ,
+  // Reversible flag flip, not a delete: the row and every player link survive,
+  // in_coverage=true restores it, and web_upsert_team restores it automatically
+  // when the club reappears in the ESPN feed. Idempotent because the timestamp
+  // is COALESCEd, so a replay cannot move an already-recorded departure date.
+  web_set_team_coverage: [false, false, true, false],
   // Appends the correction note into the public clinical_summary; no undo.
   web_apply_correction: [false, true, false, false],
   web_get_entity_for_post: READ,
@@ -185,7 +192,7 @@ const TWITTER: Record<string, Hints> = {
 };
 
 const SERVERS = [
-  { label: "web", register: registerWebTools, expected: WEB, count: 56 },
+  { label: "web", register: registerWebTools, expected: WEB, count: 59 },
   { label: "farcaster", register: registerFarcasterTools, expected: FARCASTER, count: 5 },
   { label: "twitter", register: registerTwitterTools, expected: TWITTER, count: 5 },
 ] as const;
@@ -242,6 +249,6 @@ describe("annotation coverage across all servers", () => {
       0,
     );
 
-    expect(total).toBe(66);
+    expect(total).toBe(69);
   });
 });
