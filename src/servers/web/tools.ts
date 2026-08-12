@@ -909,7 +909,7 @@ export function registerWebTools(server: McpServer): void {
   // ── web_thread_update_dates ─────────────────────────────────────────
   server.tool(
     "web_thread_update_dates",
-    "Persist resolved injury/surgery dates and provenance onto an injury thread (the injury_entities row). Called by the pre-OTM date-resolution loop, the post-publish projection patch, and MD manual date entry. Every field is optional and COALESCE'd against the current value — omit a field to leave it untouched. needs_date_review auto-clears when confidence is not 'unknown' unless set explicitly.",
+    "Persist resolved injury/surgery dates and provenance onto an injury thread (the injury_entities row). Called by the pre-OTM date-resolution loop, the post-publish projection patch, and MD manual date entry. Every field is optional and COALESCE'd against the current value — omit a field to leave it untouched. needs_date_review auto-clears when confidence is not 'unknown' unless set explicitly. canonical_post_id is the one exception to that rule: it is fill-if-null, not overwrite. It backfills threads created before their first post existed, so passing it when the thread already has a canonical is a no-op — an established thread is never repointed at a later follow-up post.",
     {
       entity_id: z.string().uuid(),
       injury_date: z.string().date().optional(),
@@ -936,6 +936,8 @@ export function registerWebTools(server: McpServer): void {
           created_at: z.string().optional(),
         })
         .optional(),
+      // Fill-if-null backfill, not an update — see the tool description.
+      canonical_post_id: z.string().uuid().optional(),
       needs_date_review: z.boolean().optional(),
     },
     async (input) => {
