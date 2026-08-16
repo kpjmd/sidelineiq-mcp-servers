@@ -1352,7 +1352,68 @@ export class WebDatabaseClient {
   // and the only salary consumer reads a whole-table snapshot on its own 6h
   // TTL (agents/src/agents/injury-intelligence/salary-snapshot.ts). Adding
   // salary here would put a column on the hot path that nothing reads.
-  async resolvePlayer(name: string, sport?: string): Promise<ResolvedPlayer | null> {
+  //
+  // espnAthleteId, when supplied, is tried FIRST and the name is only consulted
+  // if it finds nothing. The id is the stronger key in exactly the case names
+  // are weakest: two different fighters really are both called "Bruno Silva",
+  // and a name-only lookup returns them as 'ambiguous' forever, which drops the
+  // caller onto its degraded path with no way out. Sources that carry an id
+  // (ESPN's news categories tag one per athlete) should pass it; sources that
+  // do not are unaffected, since the parameter is optional and the fallback is
+  // the original query verbatim.
+  //
+  // The id path repeats the same LEFT JOIN + WHERE-clause coverage predicate
+  // rather than sharing a helper: the two queries are tagged template literals
+  // and the predicate's POSITION is the thing under test (see the note above),
+  // so it has to be visible in each one.
+  async resolvePlayer(
+    name: string,
+    sport?: string,
+    espnAthleteId?: string,
+  ): Promise<ResolvedPlayer | null> {
+    if (espnAthleteId) {
+      const byId = sport
+        ? await this.sql`
+            SELECT
+              p.id AS player_id, p.full_name, p.prominence_tier,
+              p.current_team_id, t.name AS current_team_name, t.abbreviation AS current_team_abbreviation,
+              t.last_synced_at AS current_team_synced_at,
+              p.retired_at
+            FROM players p
+            LEFT JOIN teams t ON t.id = p.current_team_id
+            WHERE p.sport = ${sport} AND p.espn_athlete_id = ${espnAthleteId}
+              AND p.retired_at IS NULL
+              AND t.left_coverage_at IS NULL
+            LIMIT 5
+          `
+        : await this.sql`
+            SELECT
+              p.id AS player_id, p.full_name, p.prominence_tier,
+              p.current_team_id, t.name AS current_team_name, t.abbreviation AS current_team_abbreviation,
+              t.last_synced_at AS current_team_synced_at,
+              p.retired_at
+            FROM players p
+            LEFT JOIN teams t ON t.id = p.current_team_id
+            WHERE p.espn_athlete_id = ${espnAthleteId}
+              AND p.retired_at IS NULL
+              AND t.left_coverage_at IS NULL
+            LIMIT 5
+          `;
+      if (byId.length > 0) {
+        const first = byId[0] as Omit<ResolvedPlayer, "confidence" | "match_count">;
+        // 'exact' rather than 'normalized': nothing was normalized, and callers
+        // that treat 'ambiguous' as a degraded signal should see that this match
+        // did not go through name matching at all. UNIQUE (sport, espn_athlete_id)
+        // means the sport-scoped form can only ever return one row; the
+        // sportless form is left able to report ambiguity rather than pick.
+        return {
+          ...first,
+          confidence: byId.length > 1 ? "ambiguous" : "exact",
+          match_count: byId.length,
+        };
+      }
+    }
+
     const normalized = normalizePlayerName(name);
     const rows = sport
       ? await this.sql`
