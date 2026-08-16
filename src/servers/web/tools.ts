@@ -845,10 +845,11 @@ export function registerWebTools(server: McpServer): void {
   // validator can compare reportedTeamName against the actual current team.
   server.tool(
     "web_resolve_player",
-    "Resolve an athlete name to a canonical player record (with current team). Returns confidence='normalized' on a unique match, 'ambiguous' on multiple matches (caller should escalate to review), null on miss. This is the lookup that catches Luka-tagged-Lakers-class errors at ingestion time.",
+    "Resolve an athlete name to a canonical player record (with current team). Pass espn_athlete_id when the source carries one — it is tried first and returns confidence='exact', which is the only way to separate two athletes who share a name. Returns confidence='normalized' on a unique name match, 'ambiguous' on multiple matches (caller should escalate to review), null on miss. This is the lookup that catches Luka-tagged-Lakers-class errors at ingestion time.",
     {
       name: z.string().min(1),
       sport: sportEnum.optional(),
+      espn_athlete_id: z.string().min(1).optional(),
     },
     {
       readOnlyHint: true,
@@ -858,7 +859,11 @@ export function registerWebTools(server: McpServer): void {
     },
     async (input) => {
       try {
-        const player = await client.resolvePlayer(input.name, input.sport);
+        const player = await client.resolvePlayer(
+          input.name,
+          input.sport,
+          input.espn_athlete_id,
+        );
         if (!player) {
           return toolSuccess({ resolved: false, player: null });
         }

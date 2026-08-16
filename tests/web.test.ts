@@ -1194,6 +1194,73 @@ describe("Web MCP Server", () => {
       expect(sql.indexOf("left_coverage_at")).toBeGreaterThan(sql.indexOf("WHERE"));
     });
 
+    // ── Resolution by ESPN athlete id ──────────────────────────────────
+    // UFC is the motivating case: fighters carry no team, so the name is the
+    // only key a name-only lookup has, and MMA has genuine duplicate names
+    // (two Bruno Silvas) that would pin the caller on 'ambiguous' permanently.
+    it("resolve_player queries espn_athlete_id first and reports confidence 'exact'", async () => {
+      mockSql.mockResolvedValueOnce([
+        { ...resolvedRow, current_team_id: null, current_team_name: null },
+      ]);
+      const tool = getTool(createTestServer(), "web_resolve_player");
+
+      const result = (await tool.handler(
+        { name: "Conor McGregor", sport: "UFC", espn_athlete_id: "3022677" },
+        {},
+      )) as { content: Array<{ text: string }> };
+
+      const sql = capturedSql();
+      expect(sql).toContain("p.espn_athlete_id = ");
+      // The name query must not have run at all — a hit on the id is final.
+      expect(sql).not.toContain("p.normalized_name = ");
+      const data = JSON.parse(result.content[0].text);
+      expect(data.resolved).toBe(true);
+      expect(data.player.confidence).toBe("exact");
+    });
+
+    it("resolve_player carries the coverage predicate into the id query too", async () => {
+      // Same fail-open as the name path: in the ON clause this would return the
+      // player with a null team instead of withholding them.
+      mockSql.mockResolvedValueOnce([resolvedRow]);
+      const tool = getTool(createTestServer(), "web_resolve_player");
+
+      await tool.handler(
+        { name: "Test Player", sport: "NBA", espn_athlete_id: "12345" },
+        {},
+      );
+
+      const sql = capturedSql();
+      expect(sql).toContain("AND t.left_coverage_at IS NULL");
+      expect(sql).not.toContain("ON t.id = p.current_team_id AND");
+      expect(sql.indexOf("left_coverage_at")).toBeGreaterThan(sql.indexOf("WHERE"));
+    });
+
+    it("resolve_player falls back to the name when the id finds nothing", async () => {
+      mockSql.mockResolvedValueOnce([]).mockResolvedValueOnce([resolvedRow]);
+      const tool = getTool(createTestServer(), "web_resolve_player");
+
+      const result = (await tool.handler(
+        { name: "Test Player", sport: "NBA", espn_athlete_id: "does-not-exist" },
+        {},
+      )) as { content: Array<{ text: string }> };
+
+      const sql = capturedSql();
+      expect(sql).toContain("p.espn_athlete_id = ");
+      expect(sql).toContain("p.normalized_name = ");
+      const data = JSON.parse(result.content[0].text);
+      expect(data.resolved).toBe(true);
+      expect(data.player.confidence).toBe("normalized");
+    });
+
+    it("resolve_player is unchanged when no id is supplied", async () => {
+      mockSql.mockResolvedValueOnce([resolvedRow]);
+      const tool = getTool(createTestServer(), "web_resolve_player");
+
+      await tool.handler({ name: "Test Player", sport: "NBA" }, {});
+
+      expect(capturedSql()).not.toContain("p.espn_athlete_id = ");
+    });
+
     it("resolve_player returns the team's sync timestamp", async () => {
       mockSql.mockResolvedValueOnce([resolvedRow]);
       const tool = getTool(createTestServer(), "web_resolve_player");
