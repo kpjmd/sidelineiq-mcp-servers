@@ -5,6 +5,12 @@ export class McpToolError extends Error {
     public userMessage: string,
     public actionableSteps: string,
     public override cause?: unknown,
+    /**
+     * Upstream HTTP status, when the error came from an API call. Callers that
+     * want to handle one status specially should test this rather than pattern
+     * -match the message — userMessage is prose and does not contain the code.
+     */
+    public status?: number,
   ) {
     super(userMessage);
     this.name = "McpToolError";

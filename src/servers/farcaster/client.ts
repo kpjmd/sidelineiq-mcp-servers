@@ -44,6 +44,13 @@ export interface FarcasterNotification {
   type: "mention" | "reply";
 }
 
+const NOTIFICATION_TYPE_ALIASES: Record<string, "mention" | "reply" | undefined> = {
+  mention: "mention",
+  mentions: "mention",
+  reply: "reply",
+  replies: "reply",
+};
+
 export interface GetNotificationsResult {
   notifications: FarcasterNotification[];
   nextCursor?: string;
@@ -63,12 +70,19 @@ export class NeynarClient {
     method: string,
     path: string,
     body?: Record<string, unknown>,
-    params?: Record<string, string>,
+    params?: Record<string, string | string[]>,
   ): Promise<T> {
     const url = new URL(`${this.baseUrl}${path}`);
     if (params) {
       for (const [key, value] of Object.entries(params)) {
-        url.searchParams.set(key, value);
+        // Neynar's array-valued filters must be genuinely repeated params
+        // (?type=mentions&type=replies). `set` cannot express that, and a
+        // comma-joined scalar is rejected with 400 InvalidField.
+        if (Array.isArray(value)) {
+          for (const entry of value) url.searchParams.append(key, entry);
+        } else {
+          url.searchParams.set(key, value);
+        }
       }
     }
 
@@ -93,6 +107,8 @@ export class NeynarClient {
         throw new McpToolError(
           "Farcaster signer not approved or API key invalid",
           "Verify NEYNAR_API_KEY and NEYNAR_SIGNER_UUID are correct and the signer is approved.",
+          undefined,
+          403,
         );
       }
 
@@ -100,12 +116,16 @@ export class NeynarClient {
         throw new McpToolError(
           "Neynar API rate limit exceeded",
           "Wait 60 seconds and retry the request.",
+          undefined,
+          429,
         );
       }
 
       throw new McpToolError(
         `Neynar API returned status ${response.status}`,
         "Check server logs for details. Verify API key and signer UUID are valid.",
+        undefined,
+        response.status,
       );
     }
 
@@ -132,9 +152,12 @@ export class NeynarClient {
   }
 
   async getNotifications(fid: number, cursor?: string, limit?: number): Promise<GetNotificationsResult> {
-    const params: Record<string, string> = {
+    const params: Record<string, string | string[]> = {
       fid: String(fid),
-      type: "mention,reply",
+      // Plural values, one repeated param each. Neynar rejects the old
+      // "mention,reply" scalar with 400 InvalidField: "type must be an array of
+      // one or more of: likes, replies, recasts, mentions, follows, quotes".
+      type: ["mentions", "replies"],
       limit: String(limit ?? 25),
     };
     if (cursor) {
@@ -163,8 +186,11 @@ export class NeynarClient {
       const notifications: FarcasterNotification[] = [];
 
       for (const raw of data.notifications ?? []) {
-        const type = raw.type;
-        if (type !== "mention" && type !== "reply") continue;
+        // The request filter takes plurals; responses have been observed with
+        // the singular form. Accept either and normalise to the singular, which
+        // is the shape every consumer downstream already expects.
+        const type = raw.type ? NOTIFICATION_TYPE_ALIASES[raw.type] : undefined;
+        if (!type) continue;
         const cast = raw.cast;
         if (!cast?.hash || !cast.text) continue;
 
@@ -176,7 +202,7 @@ export class NeynarClient {
           authorFollowerCount: cast.author?.follower_count,
           parentHash: cast.parent_hash,
           timestamp: cast.timestamp ?? new Date().toISOString(),
-          type: type as "mention" | "reply",
+          type,
         });
       }
 
@@ -185,8 +211,11 @@ export class NeynarClient {
         nextCursor: data.next?.cursor,
       };
     } catch (err: unknown) {
-      // Handle 429 rate limit gracefully — return empty result instead of throwing
-      if (err instanceof Error && err.message.includes("429")) {
+      // Handle 429 rate limit gracefully — return empty result instead of
+      // throwing. Tests the status, not the message: the 429 path throws
+      // "Neynar API rate limit exceeded", which never contained "429", so the
+      // old string match made this branch unreachable.
+      if (err instanceof McpToolError && err.status === 429) {
         logger.warn("Neynar notifications rate limit hit — returning empty result");
         return { notifications: [] };
       }
