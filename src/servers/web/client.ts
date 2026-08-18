@@ -223,7 +223,11 @@ export interface ResolvedPlayer {
 
 // ── Injury entities & updates ────────────────────────────────────────
 export type Laterality = "LEFT" | "RIGHT" | "BILATERAL" | "UNSPECIFIED";
-export type EntityStatus = "ACTIVE" | "RESOLVED" | "RETIRED";
+// VOID (migration 020) is not a lifecycle outcome like the other three — it
+// means the thread should never have existed (wrong body part, wrong athlete,
+// rejected post). It carries no accuracy_record: scoring a projection that was
+// never valid would pollute the platform's accuracy record.
+export type EntityStatus = "ACTIVE" | "RESOLVED" | "RETIRED" | "VOID";
 export type UpdateKind =
   | "INITIAL"
   | "TRACKING"
@@ -282,6 +286,8 @@ export interface InjuryEntity {
   returned_at: string | null;
   closed_at: string | null;
   needs_date_review: boolean;
+  // Migration 020. Non-null only on status VOID.
+  void_reason: string | null;
 }
 
 // A thread row joined with player/team display fields for the MD dashboard list.
@@ -305,6 +311,7 @@ export interface ThreadListItem {
   actual_return_date: string | null;
   returned_at: string | null;
   closed_at: string | null;
+  void_reason: string | null;
   first_reported_at: string;
   last_updated_at: string;
 }
@@ -1747,14 +1754,17 @@ export class WebDatabaseClient {
     return normalizeEntityDates(rows[0] as InjuryEntity);
   }
 
-  // Close a thread when the athlete returns (RESOLVED) or retires (RETIRED).
-  // Computes accuracy_record from the frozen otm_projection vs the actual
-  // return. Idempotent: re-closing a RESOLVED thread recomputes in place.
+  // Close a thread when the athlete returns (RESOLVED) or retires (RETIRED),
+  // or retract one that should never have existed (VOID, migration 020).
+  // RESOLVED/RETIRED compute accuracy_record from the frozen otm_projection vs
+  // the actual return; VOID deliberately computes nothing. Idempotent:
+  // re-closing a RESOLVED thread recomputes in place.
   async closeThread(input: {
     entity_id: string;
     actual_return_date?: string;
-    outcome?: "RESOLVED" | "RETIRED";
+    outcome?: "RESOLVED" | "RETIRED" | "VOID";
     closed_by?: string;
+    void_reason?: string;
   }): Promise<InjuryEntity> {
     const entity = await this.getEntity(input.entity_id);
     if (!entity) {
@@ -1764,16 +1774,35 @@ export class WebDatabaseClient {
       );
     }
     const outcome = input.outcome ?? "RESOLVED";
+    // VOID says the thread was never a real injury record, so there is nothing
+    // to score and no return to stamp. Writing an accuracy_record here would
+    // grade a projection built on a wrong body part / wrong athlete and drag
+    // the platform's published accuracy down with it — see migration 020.
+    const isVoid = outcome === "VOID";
+    if (isVoid && input.actual_return_date) {
+      throw new McpToolError(
+        "actual_return_date is meaningless for outcome VOID",
+        "A voided thread never described a real injury, so there is no return to record. Omit actual_return_date, or use outcome RESOLVED if the athlete did return.",
+      );
+    }
+    if (!isVoid && input.void_reason) {
+      throw new McpToolError(
+        "void_reason is only valid for outcome VOID",
+        "Use outcome VOID to retract a thread that should not exist, or drop void_reason.",
+      );
+    }
     // entity dates are already normalized to 'YYYY-MM-DD' by getEntity; the pure
     // service functions accept strings or Dates either way.
-    const actualIso = resolveActualIso(entity, input.actual_return_date);
-    const accuracy = computeAccuracyRecord(entity, actualIso);
+    const actualIso = isVoid ? null : resolveActualIso(entity, input.actual_return_date);
+    const accuracy = isVoid ? null : computeAccuracyRecord(entity, actualIso);
+    const voidReason = isVoid ? (input.void_reason ?? null) : null;
 
     const rows = await this.sql`
       UPDATE injury_entities SET
         status = ${outcome},
         actual_return_date = COALESCE(${actualIso}::date, actual_return_date),
         accuracy_record = ${accuracy ? JSON.stringify(accuracy) : null}::jsonb,
+        void_reason = ${voidReason},
         returned_at = CASE WHEN ${outcome} = 'RESOLVED' THEN NOW() ELSE returned_at END,
         closed_at = NOW(),
         last_updated_at = NOW(),
@@ -1788,10 +1817,14 @@ export class WebDatabaseClient {
       actor_id: input.closed_by ?? undefined,
       entity_type: "injury_thread",
       entity_id: input.entity_id,
-      action: "thread_closed",
+      // A retraction is a different editorial act from a close and readers of
+      // the audit trail should not have to parse the payload to tell them apart.
+      action: isVoid ? "thread_voided" : "thread_closed",
       before: entity,
       after: closed,
-      payload: { outcome, actual_return_date: actualIso, accuracy_record: accuracy },
+      payload: isVoid
+        ? { outcome, void_reason: voidReason }
+        : { outcome, actual_return_date: actualIso, accuracy_record: accuracy },
     });
 
     return closed;
@@ -1818,7 +1851,7 @@ export class WebDatabaseClient {
       SELECT e.id, e.player_id, e.body_part, e.laterality, e.injury_type, e.status,
              e.injury_date, e.injury_date_confidence, e.surgery_date, e.surgery_confirmed,
              e.needs_date_review, e.otm_projection, e.accuracy_record,
-             e.actual_return_date, e.returned_at, e.closed_at,
+             e.actual_return_date, e.returned_at, e.closed_at, e.void_reason,
              e.first_reported_at, e.last_updated_at,
              p.full_name AS athlete_name, p.sport AS sport,
              t.display_name AS team_name
