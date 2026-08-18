@@ -497,6 +497,147 @@ describe("Web MCP Server", () => {
     });
   });
 
+  // web_thread_close — the VOID outcome (migration 020).
+  //
+  // VOID exists because entities are minted before any post exists and survive
+  // their post's deletion (canonical_post_id is ON DELETE SET NULL), so an MD
+  // rejecting a post used to leave an ACTIVE, post-less thread that kept
+  // matching new events for that athlete. The invariant under test: a VOID
+  // close must NOT write an accuracy_record, because grading a projection built
+  // on a wrong body part drags the platform's published accuracy down with it.
+  describe("web_thread_close", () => {
+    // closeThread issues three statements: getEntity, the UPDATE, auditAppend.
+    function queueCloseCalls(returned: Record<string, unknown>): void {
+      mockSql
+        .mockResolvedValueOnce([sampleEntity]) // getEntity
+        .mockResolvedValueOnce([returned]) // UPDATE ... RETURNING *
+        .mockResolvedValueOnce([{ id: "audit-1" }]); // auditAppend
+    }
+
+    function callAt(index: number): { text: string; values: unknown[] } {
+      const call = mockSql.mock.calls[index] as [string[], ...unknown[]];
+      const [strings, ...values] = call;
+      return { text: strings.join("?"), values };
+    }
+
+    it("writes no accuracy_record and no returned_at for outcome VOID", async () => {
+      const projected = {
+        ...sampleEntity,
+        // A projection IS present — the point is that VOID declines to score it.
+        otm_projection: { min_weeks: 14, max_weeks: 24, projected_return_date: "2026-12-22" },
+        injury_date: "2026-08-11",
+      };
+      mockSql
+        .mockResolvedValueOnce([projected])
+        .mockResolvedValueOnce([
+          { ...projected, status: "VOID", accuracy_record: null, void_reason: "wrong body part" },
+        ])
+        .mockResolvedValueOnce([{ id: "audit-1" }]);
+
+      const server = createTestServer();
+      const tool = getTool(server, "web_thread_close");
+
+      const result = (await tool.handler(
+        {
+          entity_id: sampleEntity.id,
+          outcome: "VOID",
+          void_reason: "wrong body part",
+          closed_by: "md-user-1",
+        },
+        {},
+      )) as { content: Array<{ text: string }>; isError?: boolean };
+
+      expect(result.isError).toBeFalsy();
+      const { text, values } = callAt(1); // the UPDATE
+      // No serialized accuracy_record was bound. Checking the bound values
+      // rather than the row we mocked back is what makes this test able to fail.
+      expect(values.some((v) => typeof v === "string" && v.includes("projected_return_date"))).toBe(
+        false,
+      );
+      expect(values).toContain("wrong body part");
+      // returned_at is only stamped for RESOLVED; VOID must leave it alone.
+      expect(text).toMatch(/returned_at = CASE WHEN \? = 'RESOLVED'/);
+
+      const data = JSON.parse(result.content[0].text);
+      expect(data.entity.status).toBe("VOID");
+      expect(data.entity.accuracy_record).toBeNull();
+    });
+
+    it("audits a VOID as thread_voided, not thread_closed", async () => {
+      queueCloseCalls({ ...sampleEntity, status: "VOID", void_reason: "rejected post" });
+
+      const server = createTestServer();
+      const tool = getTool(server, "web_thread_close");
+      await tool.handler(
+        { entity_id: sampleEntity.id, outcome: "VOID", void_reason: "rejected post" },
+        {},
+      );
+
+      const audit = callAt(2);
+      expect(audit.values).toContain("thread_voided");
+      expect(audit.values).not.toContain("thread_closed");
+    });
+
+    it("still scores RESOLVED against the projection", async () => {
+      const projected = {
+        ...sampleEntity,
+        otm_projection: { min_weeks: 2, max_weeks: 4, projected_return_date: "2026-04-07" },
+        injury_date: "2026-03-24",
+      };
+      mockSql
+        .mockResolvedValueOnce([projected])
+        .mockResolvedValueOnce([{ ...projected, status: "RESOLVED" }])
+        .mockResolvedValueOnce([{ id: "audit-1" }]);
+
+      const server = createTestServer();
+      const tool = getTool(server, "web_thread_close");
+      await tool.handler(
+        { entity_id: sampleEntity.id, outcome: "RESOLVED", actual_return_date: "2026-04-05" },
+        {},
+      );
+
+      const { values } = callAt(1);
+      const accuracy = values.find(
+        (v) => typeof v === "string" && v.includes("projected_return_date"),
+      ) as string | undefined;
+      expect(accuracy).toBeDefined();
+      expect(JSON.parse(accuracy!).actual_return_date).toBe("2026-04-05");
+
+      const audit = callAt(2);
+      expect(audit.values).toContain("thread_closed");
+    });
+
+    it("rejects actual_return_date on a VOID", async () => {
+      mockSql.mockResolvedValueOnce([sampleEntity]);
+
+      const server = createTestServer();
+      const tool = getTool(server, "web_thread_close");
+      const result = (await tool.handler(
+        { entity_id: sampleEntity.id, outcome: "VOID", actual_return_date: "2026-04-05" },
+        {},
+      )) as { content: Array<{ text: string }>; isError?: boolean };
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("meaningless for outcome VOID");
+      // Fail closed: only the read happened, nothing was written.
+      expect(mockSql).toHaveBeenCalledTimes(1);
+    });
+
+    it("rejects void_reason on a non-VOID outcome", async () => {
+      mockSql.mockResolvedValueOnce([sampleEntity]);
+
+      const server = createTestServer();
+      const tool = getTool(server, "web_thread_close");
+      const result = (await tool.handler(
+        { entity_id: sampleEntity.id, outcome: "RETIRED", void_reason: "oops" },
+        {},
+      )) as { content: Array<{ text: string }>; isError?: boolean };
+
+      expect(result.isError).toBe(true);
+      expect(mockSql).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe("web_list_injury_updates", () => {
     it("should list updates newest-first", async () => {
       mockSql.mockResolvedValue(sampleUpdates);

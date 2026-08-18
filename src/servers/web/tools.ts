@@ -1307,12 +1307,17 @@ export function registerWebTools(server: McpServer): void {
   // ── web_thread_close ────────────────────────────────────────────────
   server.tool(
     "web_thread_close",
-    "Close an injury thread when the athlete returns (RESOLVED) or retires (RETIRED). Records actual_return_date, computes accuracy_record against the stored otm_projection, stamps returned_at/closed_at, writes an audit entry, and sets status. Idempotent: re-closing a RESOLVED thread recomputes the record in place.",
+    "Close an injury thread when the athlete returns (RESOLVED) or retires (RETIRED), or retract one that should never have existed (VOID). RESOLVED/RETIRED record actual_return_date and compute accuracy_record against the stored otm_projection. VOID does neither — it means the thread describes an injury we got wrong (wrong body part, wrong athlete, rejected post), so there is nothing to score; pass void_reason instead. All outcomes stamp closed_at, write an audit entry (thread_closed / thread_voided) and take the thread out of web_find_matching_entity, which only matches ACTIVE. Idempotent: re-closing recomputes in place.",
     {
       entity_id: z.string().uuid(),
       actual_return_date: z.string().date().optional(),
-      outcome: z.enum(["RESOLVED", "RETIRED"]).default("RESOLVED"),
+      outcome: z.enum(["RESOLVED", "RETIRED", "VOID"]).default("RESOLVED"),
       closed_by: z.string().optional(),
+      void_reason: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Why the thread is being retracted. VOID only; rejected for other outcomes."),
     },
     {
       readOnlyHint: false,
@@ -1365,9 +1370,9 @@ export function registerWebTools(server: McpServer): void {
   // ── web_list_threads ────────────────────────────────────────────────
   server.tool(
     "web_list_threads",
-    "List injury threads for the MD dashboard, joined with athlete name / sport / team. Filter by status (ACTIVE/RESOLVED/RETIRED) and/or needs_date_review to drive the active, date-review, and accuracy views. Ordered by last_updated_at.",
+    "List injury threads for the MD dashboard, joined with athlete name / sport / team. Filter by status (ACTIVE/RESOLVED/RETIRED/VOID) and/or needs_date_review to drive the active, date-review, and accuracy views. Ordered by last_updated_at. VOID rows are retracted threads kept for the audit trail — omit them from accuracy views and default listings.",
     {
-      status: z.enum(["ACTIVE", "RESOLVED", "RETIRED"]).optional(),
+      status: z.enum(["ACTIVE", "RESOLVED", "RETIRED", "VOID"]).optional(),
       needs_date_review: z.boolean().optional(),
       limit: z.number().int().min(1).max(500).default(100),
     },
