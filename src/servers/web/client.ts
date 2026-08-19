@@ -16,6 +16,8 @@ import {
   normalizeEntityDates,
   normalizeThreadListItem,
   normalizePostDates,
+  addWeeks,
+  toIsoDate,
 } from "./date-utils.js";
 import {
   evaluatePublishGate,
@@ -1715,7 +1717,22 @@ export class WebDatabaseClient {
     otm_projection?: OtmProjection;
     canonical_post_id?: string;
     needs_date_review?: boolean;
+    /**
+     * Who is writing. Mirrors closeThread's `closed_by`: any value other than
+     * "system" is recorded as an `md` actor on the re-anchor audit row.
+     */
+    updated_by?: string;
   }): Promise<InjuryEntity> {
+    // Read first — needed for the re-anchor arithmetic and for the audit
+    // before-state. Cheap: one indexed lookup by primary key.
+    const before = await this.getEntity(input.entity_id);
+    if (!before) {
+      throw new McpToolError(
+        `Injury thread ${input.entity_id} not found`,
+        "Verify the entity_id.",
+      );
+    }
+
     const needsReview =
       input.needs_date_review !== undefined
         ? input.needs_date_review
@@ -1726,7 +1743,49 @@ export class WebDatabaseClient {
     const sources = input.date_resolution_sources
       ? JSON.stringify(input.date_resolution_sources)
       : null;
-    const projection = input.otm_projection ? JSON.stringify(input.otm_projection) : null;
+    // ── Arithmetic re-anchor ────────────────────────────────────────────
+    // projected_return_date is frozen at thread open as injury_date plus the
+    // midpoint of the OTM week window. When an MD (or a later resolution)
+    // corrects injury_date, that projection silently keeps pointing at the old
+    // anchor: Mykel Williams' 34-43w window against a wrong 2026-08-19 anchor
+    // projected a 2027-05-15 return for an athlete already nine months post-op.
+    // Recompute here — one place covering both the frontend MD edit and the
+    // agents poller.
+    //
+    // OTM is deliberately NOT re-run. The WEEKS are a clinical judgement about
+    // the injury and do not change when the calendar anchor is corrected; only
+    // the arithmetic does. Re-running would also rewrite published content
+    // behind the MD's back.
+    const prior = before.otm_projection;
+    const injuryDateChanged =
+      input.injury_date != null &&
+      (before.injury_date == null ||
+        toIsoDate(before.injury_date) !== toIsoDate(input.injury_date));
+    // Number(null) is 0, and 0 is finite — coercing first would treat a
+    // null week bound as a real zero and write a projection anchored to half
+    // the window. Require actual numbers.
+    const isWeek = (v: unknown): v is number =>
+      typeof v === "number" && Number.isFinite(v);
+    const weeksUsable =
+      prior != null && isWeek(prior.min_weeks) && isWeek(prior.max_weeks);
+    // A caller-supplied projection wins: it was computed against the very date
+    // the caller is writing, so re-deriving it would be a no-op at best.
+    const reanchored =
+      !input.otm_projection && injuryDateChanged && weeksUsable
+        ? {
+            ...prior!,
+            projected_return_date: addWeeks(
+              input.injury_date!,
+              (prior!.min_weeks + prior!.max_weeks) / 2,
+            ),
+          }
+        : null;
+
+    const projection = input.otm_projection
+      ? JSON.stringify(input.otm_projection)
+      : reanchored
+        ? JSON.stringify(reanchored)
+        : null;
 
     const rows = await this.sql`
       UPDATE injury_entities SET
@@ -1751,7 +1810,33 @@ export class WebDatabaseClient {
         "Verify the entity_id.",
       );
     }
-    return normalizeEntityDates(rows[0] as InjuryEntity);
+    const updated = normalizeEntityDates(rows[0] as InjuryEntity);
+
+    if (reanchored) {
+      // auditAppend stores before/after only as hashes, so the readable diff
+      // has to live in the payload — same as closeThread.
+      await this.auditAppend({
+        actor:
+          input.updated_by && input.updated_by !== "system" ? "md" : "system",
+        actor_id: input.updated_by ?? undefined,
+        entity_type: "injury_thread",
+        entity_id: input.entity_id,
+        action: "otm_projection_reanchored",
+        before: prior,
+        after: reanchored,
+        payload: {
+          previous_injury_date: before.injury_date ?? null,
+          new_injury_date: toIsoDate(input.injury_date!),
+          previous_projected_return_date: prior!.projected_return_date ?? null,
+          new_projected_return_date: reanchored.projected_return_date,
+          otm_min_weeks: prior!.min_weeks,
+          otm_max_weeks: prior!.max_weeks,
+          recomputed_from: "stored_otm_projection_weeks",
+        },
+      });
+    }
+
+    return updated;
   }
 
   // Close a thread when the athlete returns (RESOLVED) or retires (RETIRED),
