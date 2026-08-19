@@ -76,6 +76,27 @@ Always snake_case. Always service-prefixed.
 - Twitter MCP Server: 3102
 - SidelineIQ Web MCP Server: 3103
 
+### web_thread_update_dates re-anchors the OTM projection
+
+`projected_return_date` is frozen at thread open as `injury_date` plus the midpoint
+of the OTM week window. When `injury_date` CHANGES and the thread already carries an
+`otm_projection`, `updateThreadDates` recomputes it from the STORED weeks and writes
+an `otm_projection_reanchored` row to `audit_log`. This is the single place that
+covers both the frontend MD date edit and the agents poller.
+
+OTM is deliberately NOT re-run. The WEEKS are a clinical judgement about the injury
+and do not change when the calendar anchor is corrected — only the arithmetic does,
+and re-running would rewrite already-published content behind the MD's back. Pass an
+explicit `otm_projection` to override the recomputation.
+
+It fails closed on a missing projection or a non-numeric week bound. Check the TYPE,
+not the coercion: `Number(null)` is `0` and `0` is finite, so a null `min_weeks` would
+otherwise anchor the projection to half the window.
+
+Side effect worth knowing: `computeAccuracyRecord` scores `error_days` off the frozen
+`projected_return_date` while `within_range` uses the live `injury_date`. The
+re-anchor keeps those two consistent for every row written after this shipped.
+
 ## Environment Variables
 
 See .env.example for all required variables.

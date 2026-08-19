@@ -2246,3 +2246,132 @@ describe("linter regex rules", () => {
     expect(checkNonPublicDetailRegex("Recovery is progressing well.")).toHaveLength(0);
   });
 });
+
+// ── OTM projection re-anchor ───────────────────────────────────────────
+// An MD correcting injury_date used to leave projected_return_date pointing at
+// the old anchor. Mykel Williams' 34-43w window against a wrong 2026-08-19
+// anchor projected a 2027-05-15 return for an athlete already nine months
+// post-op; correcting the date alone left the contradiction in place, which is
+// worse than either error on its own.
+describe("web_thread_update_dates — OTM projection re-anchor", () => {
+  const ENTITY_ID = "770e8400-e29b-41d4-a716-446655440002";
+  const WRONG_ANCHOR = {
+    ...sampleEntity,
+    injury_date: "2026-08-19",
+    otm_projection: {
+      min_weeks: 34,
+      max_weeks: 43,
+      projected_return_date: "2027-05-15",
+      created_at: "2026-08-19T00:20:00Z",
+    },
+  };
+
+  function projectionWritten(): Record<string, unknown> | null {
+    // The UPDATE is the first sql call after the getEntity SELECT.
+    for (const call of mockSql.mock.calls) {
+      const [, ...values] = call as [string[], ...unknown[]];
+      for (const v of values) {
+        if (typeof v === "string" && v.includes("projected_return_date")) {
+          return JSON.parse(v) as Record<string, unknown>;
+        }
+      }
+    }
+    return null;
+  }
+  const auditCalls = () =>
+    mockSql.mock.calls.filter(([strings]) =>
+      (strings as string[]).join("").includes("audit_log"),
+    );
+
+  beforeEach(() => mockSql.mockReset());
+
+  it("recomputes projected_return_date from the stored weeks when injury_date changes", async () => {
+    mockSql.mockResolvedValue([WRONG_ANCHOR]);
+    const tool = getTool(createTestServer(), "web_thread_update_dates");
+
+    await tool.handler({
+      entity_id: ENTITY_ID,
+      injury_date: "2025-11-02",
+      injury_date_confidence: "confirmed",
+    }, {});
+
+    const proj = projectionWritten();
+    // 2025-11-02 + midpoint(34,43)=38.5 weeks -> 2026-07-29. This is exactly
+    // the value the MD arrived at re-anchoring this entity by hand, so the
+    // automated path reproduces the manual one rather than inventing a rule.
+    expect(proj?.projected_return_date).toBe("2026-07-29");
+    // The WEEKS are a clinical judgement about the injury and must not move.
+    expect(proj?.min_weeks).toBe(34);
+    expect(proj?.max_weeks).toBe(43);
+    expect(auditCalls().length).toBeGreaterThan(0);
+  });
+
+  it("does nothing when injury_date is unchanged (idempotent)", async () => {
+    mockSql.mockResolvedValue([WRONG_ANCHOR]);
+    const tool = getTool(createTestServer(), "web_thread_update_dates");
+    await tool.handler({ entity_id: ENTITY_ID, injury_date: "2026-08-19" }, {});
+    expect(projectionWritten()).toBeNull();
+    expect(auditCalls()).toHaveLength(0);
+  });
+
+  it("lets a caller-supplied projection win without re-deriving", async () => {
+    mockSql.mockResolvedValue([WRONG_ANCHOR]);
+    const tool = getTool(createTestServer(), "web_thread_update_dates");
+    await tool.handler({
+      entity_id: ENTITY_ID,
+      injury_date: "2025-11-02",
+      otm_projection: {
+        min_weeks: 39,
+        max_weeks: 52,
+        projected_return_date: "2026-09-14",
+        created_at: "2026-08-19T00:00:00Z",
+      },
+    }, {});
+    // The caller computed theirs against the very date they are writing.
+    expect(projectionWritten()?.projected_return_date).toBe("2026-09-14");
+    expect(auditCalls()).toHaveLength(0);
+  });
+
+  it("fails closed on a thread with no projection to re-anchor", async () => {
+    mockSql.mockResolvedValue([{ ...sampleEntity, injury_date: "2026-08-19", otm_projection: null }]);
+    const tool = getTool(createTestServer(), "web_thread_update_dates");
+    await expect(
+      tool.handler({ entity_id: ENTITY_ID, injury_date: "2025-11-02" }, {}),
+    ).resolves.toBeDefined();
+    expect(projectionWritten()).toBeNull();
+    expect(auditCalls()).toHaveLength(0);
+  });
+
+  it("fails closed on a projection whose weeks are unusable", async () => {
+    mockSql.mockResolvedValue([
+      {
+        ...sampleEntity,
+        injury_date: "2026-08-19",
+        otm_projection: { min_weeks: null, max_weeks: 43, projected_return_date: "2027-05-15" },
+      },
+    ]);
+    const tool = getTool(createTestServer(), "web_thread_update_dates");
+    await expect(
+      tool.handler({ entity_id: ENTITY_ID, injury_date: "2025-11-02" }, {}),
+    ).resolves.toBeDefined();
+    // No NaN date, no crash — the stale projection is left exactly as it was.
+    expect(projectionWritten()).toBeNull();
+  });
+
+  it("attributes the audit row to the MD who made the correction", async () => {
+    mockSql.mockResolvedValue([WRONG_ANCHOR]);
+    const tool = getTool(createTestServer(), "web_thread_update_dates");
+    await tool.handler({
+      entity_id: ENTITY_ID,
+      injury_date: "2025-11-02",
+      updated_by: "md-user-42",
+    }, {});
+    const audit = auditCalls();
+    expect(audit.length).toBeGreaterThan(0);
+    const values = (audit[0] as [string[], ...unknown[]]).slice(1);
+    expect(values).toContain("md");
+    expect(values).toContain("md-user-42");
+    expect(values.some((v) => typeof v === "string" && v.includes("otm_projection_reanchored")))
+      .toBe(true);
+  });
+});
