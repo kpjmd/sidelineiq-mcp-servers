@@ -10,8 +10,17 @@ const logger = createLogger("web-tools");
 const sportEnum = z.enum(["NFL", "NBA", "PREMIER_LEAGUE", "UFC", "OTHER"]);
 const severityEnum = z.enum(["MINOR", "MODERATE", "SEVERE", "UNKNOWN"]);
 const contentTypeEnum = z.enum(["BREAKING", "TRACKING", "DEEP_DIVE", "CONFLICT_FLAG"]);
-const statusEnum = z.enum(["PUBLISHED", "PENDING_REVIEW", "DRAFT"]);
-const mdReviewStatusEnum = z.enum(["PENDING", "APPROVED", "REJECTED"]);
+// REJECTED and SUPERSEDED were added by migration 021. Widening this enum is
+// what makes them QUERYABLE — the agent's reader audit and the rejection-memory
+// check both need `web_list_posts {status:"REJECTED"}` to work.
+const statusEnum = z.enum([
+  "PUBLISHED",
+  "PENDING_REVIEW",
+  "DRAFT",
+  "REJECTED",
+  "SUPERSEDED",
+]);
+const mdReviewStatusEnum = z.enum(["PENDING", "APPROVED", "REJECTED", "SUPERSEDED"]);
 
 const returnToPlaySchema = z.object({
   min_weeks: z.number().int().min(0),
@@ -171,7 +180,7 @@ export function registerWebTools(server: McpServer): void {
   // ── web_delete_injury_post ──────────────────────────────────────────
   server.tool(
     "web_delete_injury_post",
-    "Hard delete an injury post from the SidelineIQ database. Protected against accidentally deleting posts with TRACKING children — pass force:true to cascade-delete children and md_reviews.",
+    "Hard delete an injury post from the SidelineIQ database. NOT the MD reject path — use web_reject_injury_post, which keeps the row so the review queue remembers the decision. This is for genuine deletions only. Protected against accidentally deleting posts with TRACKING children — pass force:true to cascade-delete children and md_reviews.",
     {
       post_id: z.string().describe("The post ID to delete"),
       reason: z
@@ -215,6 +224,69 @@ export function registerWebTools(server: McpServer): void {
           ...result,
           ...(input.force ? { cascaded_count: childCount } : {}),
         });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_reject_injury_post ──────────────────────────────────────────
+  server.tool(
+    "web_reject_injury_post",
+    "Reject a post awaiting MD review: sets status REJECTED, keeps the row, and closes its md_reviews entry. Replaces web_delete_injury_post on the reject path — the row is what lets the agent remember the decision and stop re-filing the same review item every poll cycle. Void the post's thread BEFORE calling this: it clears the entity links, after which the entity cannot be found from the post id.",
+    {
+      post_id: z.string().uuid().optional().describe("The post to reject. Pass this OR review_id, not both."),
+      review_id: z.string().uuid().optional().describe("The md_reviews row to reject, when the caller has the review rather than the post."),
+      reason: z.string().optional().describe("Why the MD rejected it. Stored on the post and as the reviewer note."),
+      rejected_by: z.string().describe("The reviewing MD's user id, for the audit log"),
+    },
+    {
+      readOnlyHint: false,
+      // Nothing is destroyed — that is the entire point of this tool.
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    async (input) => {
+      try {
+        const result = await client.rejectPost(input);
+        logger.info("injury post rejected", {
+          post_id: result.post_id,
+          post_updated: result.post_updated,
+          post_status: result.post_status,
+          entity_links_cleared: result.entity_links_cleared,
+        });
+        return toolSuccess(result);
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_supersede_injury_post ───────────────────────────────────────
+  server.tool(
+    "web_supersede_injury_post",
+    "Retire pending review items that a later post has already published for, so the MD cannot approve a duplicate. Only rows currently in PENDING_REVIEW are touched; anything else is returned in `skipped`. The caller decides equivalence — this tool takes explicit ids.",
+    {
+      post_ids: z.array(z.string().uuid()).min(1).max(20).describe("Pending posts to retire"),
+      superseded_by: z.string().uuid().describe("The post that published instead"),
+      reason: z.string().describe("Why these were retired (for the audit log and the MD queue)"),
+    },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    async (input) => {
+      try {
+        const result = await client.supersedePosts(input);
+        logger.info("pending posts superseded", {
+          superseded: result.superseded,
+          skipped: result.skipped,
+          superseded_by: input.superseded_by,
+        });
+        return toolSuccess(result);
       } catch (err) {
         return handleToolError(err, logger);
       }

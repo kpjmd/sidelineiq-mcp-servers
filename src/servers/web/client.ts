@@ -26,7 +26,18 @@ import {
   assertCanAttest,
   slugify,
 } from "./service.js";
-import type { InjuryPost, MdReview, MdReviewStatus, PostStatus, Sport, ContentType } from "../../shared/types.js";
+import type {
+  InjuryPost,
+  MdReview,
+  MdReviewStatus,
+  PostStatus,
+  RejectPostInput,
+  RejectPostResult,
+  SupersedePostsInput,
+  SupersedePostsResult,
+  Sport,
+  ContentType,
+} from "../../shared/types.js";
 
 // ── Audit log types ──────────────────────────────────────────────────
 export type AuditActor = "system" | "md" | "automation" | "agent";
@@ -815,6 +826,201 @@ export class WebDatabaseClient {
     return post;
   }
 
+  /**
+   * Reject a post: keep the row, mark it REJECTED, close its review.
+   *
+   * Replaces the hard DELETE the MD's Reject button used to perform. See
+   * migration 021 for why. Three things happen and the ORDER matters:
+   *
+   * 1. The post flips PENDING_REVIEW → REJECTED. Guarded on the source status,
+   *    so an already-PUBLISHED post — flagForMdReview(preserve_status) can
+   *    attach a PENDING review to live content — is left completely alone and
+   *    comes back as post_updated:false rather than throwing. That guard is
+   *    what preserves the invariant every reader leans on: a REJECTED row never
+   *    published, so it never carries a farcaster_hash or twitter_id.
+   * 2. The review row is closed. Post first, review second: if step 2 fails the
+   *    item is already unapprovable and still visible in the queue, and
+   *    re-clicking Reject is idempotent. The reverse order would leave an
+   *    approvable post with a closed review — invisible and still live.
+   * 3. The two FKs that ON DELETE SET NULL used to null are nulled by hand.
+   *    This is the part that is easy to miss and expensive to get wrong: leave
+   *    injury_entities.canonical_post_id pointing at a rejected post and
+   *    updateThreadDates can never re-anchor the thread (it backfills only when
+   *    NULL); leave injury_updates.post_id and shouldVoidThreadOnReject reads a
+   *    previously-rejected post as "other coverage exists" and stops voiding —
+   *    the Greenard failure mode migration 020 closed. Doing it here makes the
+   *    whole entity/void subsystem see byte-identical inputs to before.
+   *
+   * The caller must therefore still void the thread BEFORE calling this: after
+   * the nulling there is no way to find the entity from the post id.
+   */
+  async rejectPost(input: RejectPostInput): Promise<RejectPostResult> {
+    if ((input.post_id ? 1 : 0) + (input.review_id ? 1 : 0) !== 1) {
+      throw new McpToolError(
+        "Pass exactly one of post_id or review_id",
+        "Use post_id from the Reject button, or review_id from the MD review form.",
+      );
+    }
+
+    let postId = input.post_id ?? null;
+    let reviewId = input.review_id ?? null;
+
+    if (reviewId) {
+      const found = await this.sql`
+        SELECT post_id FROM md_reviews WHERE id = ${reviewId}
+      `;
+      if (found.length === 0) {
+        throw new McpToolError(
+          `MD review ${reviewId} not found`,
+          "Verify the review id. Use web_list_md_reviews to find valid review IDs.",
+        );
+      }
+      postId = (found[0] as { post_id: string }).post_id;
+    }
+
+    const existing = await this.sql`
+      SELECT id, status FROM injury_posts WHERE id = ${postId}
+    `;
+    if (existing.length === 0) {
+      throw new McpToolError(
+        `Post ${postId} not found`,
+        "Verify the post_id is correct. Use web_list_posts to find valid post IDs.",
+      );
+    }
+    const before = existing[0] as { id: string; status: PostStatus };
+
+    const updated = await this.sql`
+      UPDATE injury_posts
+      SET status = 'REJECTED',
+          retired_at = NOW(),
+          retirement_reason = ${input.reason ?? null},
+          updated_at = NOW()
+      WHERE id = ${postId} AND status = 'PENDING_REVIEW'
+      RETURNING id, status
+    `;
+    const postUpdated = updated.length > 0;
+
+    const reviewRows = await this.sql`
+      UPDATE md_reviews
+      SET status = 'REJECTED',
+          reviewer_notes = COALESCE(${input.reason ?? null}, reviewer_notes),
+          reviewed_at = NOW()
+      WHERE post_id = ${postId} AND status = 'PENDING'
+      RETURNING id
+    `;
+    if (!reviewId && reviewRows.length > 0) {
+      reviewId = (reviewRows[0] as { id: string }).id;
+    }
+
+    // Only when the post actually became REJECTED. An untouched PUBLISHED post
+    // must keep its entity links — nothing about it was retracted.
+    let canonical = 0;
+    let updates = 0;
+    if (postUpdated) {
+      const c = await this.sql`
+        UPDATE injury_entities SET canonical_post_id = NULL
+        WHERE canonical_post_id = ${postId}
+        RETURNING id
+      `;
+      const u = await this.sql`
+        UPDATE injury_updates SET post_id = NULL
+        WHERE post_id = ${postId}
+        RETURNING id
+      `;
+      canonical = c.length;
+      updates = u.length;
+    }
+
+    await this.auditAppend({
+      actor: "md",
+      actor_id: input.rejected_by,
+      entity_type: "injury_post",
+      entity_id: postId!,
+      action: "reject_post",
+      payload: {
+        reason: input.reason ?? null,
+        post_updated: postUpdated,
+        previous_status: before.status,
+        entity_links_cleared: { canonical, updates },
+      },
+    });
+
+    return {
+      post_id: postId!,
+      review_id: reviewId,
+      post_updated: postUpdated,
+      post_status: postUpdated ? "REJECTED" : before.status,
+      review_status: reviewRows.length > 0 || reviewId ? "REJECTED" : null,
+      entity_links_cleared: { canonical, updates },
+    };
+  }
+
+  /**
+   * Retire pending review items that a later post has already published for.
+   *
+   * The `AND status = 'PENDING_REVIEW'` guard is the structural fail-safe, not
+   * a convenience: the agent decides equivalence (content_type, thread,
+   * disclosed weeks, severity — see findSupersededPending) and a bug there must
+   * never be able to retire something an audience has seen. Anything not
+   * pending comes back in `skipped` with the status that blocked it.
+   *
+   * Unlike a rejection this re-POINTS canonical_post_id rather than nulling it:
+   * the superseding post is on the same thread by construction, so it is the
+   * correct new anchor. injury_updates.post_id is still nulled — that update
+   * row records a report that happened, and the post carrying it is gone.
+   */
+  async supersedePosts(input: SupersedePostsInput): Promise<SupersedePostsResult> {
+    if (input.post_ids.length === 0) return { superseded: [], skipped: [] };
+
+    const rows = await this.sql`
+      UPDATE injury_posts
+      SET status = 'SUPERSEDED',
+          superseded_by = ${input.superseded_by},
+          retired_at = NOW(),
+          retirement_reason = ${input.reason},
+          updated_at = NOW()
+      WHERE id = ANY(${input.post_ids}) AND status = 'PENDING_REVIEW'
+      RETURNING id
+    `;
+    const superseded = (rows as Array<{ id: string }>).map((r) => r.id);
+
+    const blocked = await this.sql`
+      SELECT id, status FROM injury_posts
+      WHERE id = ANY(${input.post_ids}) AND status <> 'SUPERSEDED'
+    `;
+    const skipped = (blocked as Array<{ id: string; status: PostStatus }>).map((r) => ({
+      post_id: r.id,
+      status: r.status,
+    }));
+
+    if (superseded.length > 0) {
+      await this.sql`
+        UPDATE md_reviews
+        SET status = 'SUPERSEDED', reviewed_at = NOW()
+        WHERE post_id = ANY(${superseded}) AND status = 'PENDING'
+      `;
+      await this.sql`
+        UPDATE injury_entities SET canonical_post_id = ${input.superseded_by}
+        WHERE canonical_post_id = ANY(${superseded})
+      `;
+      await this.sql`
+        UPDATE injury_updates SET post_id = NULL
+        WHERE post_id = ANY(${superseded})
+      `;
+      for (const id of superseded) {
+        await this.auditAppend({
+          actor: "system",
+          entity_type: "injury_post",
+          entity_id: id,
+          action: "supersede_post",
+          payload: { superseded_by: input.superseded_by, reason: input.reason },
+        });
+      }
+    }
+
+    return { superseded, skipped };
+  }
+
   async getPost(id: string): Promise<InjuryPost | null> {
     const rows = await this.sql`
       SELECT * FROM injury_posts WHERE id = ${id}
@@ -958,9 +1164,15 @@ export class WebDatabaseClient {
       SELECT
         r.id, r.post_id, r.reason, r.status, r.reviewer_notes,
         r.created_at, r.reviewed_at,
-        p.athlete_name, p.sport, p.headline, p.slug
+        p.athlete_name, p.sport, p.headline, p.slug,
+        p.superseded_by, sp.slug AS superseding_slug
       FROM md_reviews r
       JOIN injury_posts p ON p.id = r.post_id
+      -- LEFT, and a second row of injury_posts: a SUPERSEDED review should link
+      -- to the post that published instead, not to its own slug, which the
+      -- public site now 404s. Every other review has superseded_by NULL and is
+      -- unaffected.
+      LEFT JOIN injury_posts sp ON sp.id = p.superseded_by
       ${status ? `WHERE r.status = $1` : ""}
       ORDER BY r.created_at DESC
     `;
