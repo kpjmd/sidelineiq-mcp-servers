@@ -98,6 +98,12 @@ const WEB: Record<string, Hints> = {
   // Overwrites in place with no version-history table; version increments.
   web_update_injury_post: [false, true, false, false],
   web_delete_injury_post: [false, true, true, false],
+  // Neither destroys anything: the row survives with a retired status. That is
+  // the whole reason they exist in place of a DELETE — see migration 021.
+  // Idempotent because both guard on the source status, so a second call is a
+  // no-op rather than a second retirement.
+  web_reject_injury_post: [false, false, true, false],
+  web_supersede_injury_post: [false, false, true, false],
   web_get_post: READ,
   web_get_post_by_slug: READ,
   web_get_post_by_social_id: READ,
@@ -192,7 +198,7 @@ const TWITTER: Record<string, Hints> = {
 };
 
 const SERVERS = [
-  { label: "web", register: registerWebTools, expected: WEB, count: 59 },
+  { label: "web", register: registerWebTools, expected: WEB, count: 61 },
   { label: "farcaster", register: registerFarcasterTools, expected: FARCASTER, count: 5 },
   { label: "twitter", register: registerTwitterTools, expected: TWITTER, count: 5 },
 ] as const;
@@ -243,12 +249,12 @@ describe.each(SERVERS)("$label tool annotations", ({ register, expected, count }
 });
 
 describe("annotation coverage across all servers", () => {
-  it("covers all 66 tools", () => {
+  it("covers all 71 tools", () => {
     const total = SERVERS.reduce(
       (sum, { register }) => sum + Object.keys(annotationsByTool(register)).length,
       0,
     );
 
-    expect(total).toBe(69);
+    expect(total).toBe(71);
   });
 });
