@@ -66,7 +66,9 @@ export function registerWebTools(server: McpServer): void {
         .int()
         .min(0)
         .optional()
-        .describe("Team's official return timeline in weeks"),
+        .describe(
+          "Weeks REMAINING before return as of this post's report date, as the team stated it — NOT total time since the injury. This is a different clock from return_to_play_min_weeks/max_weeks, which are total from injury_date: compare the two only after adding elapsed time. Omit for game-status designations (Questionable/Out/day-to-day) and season-ending or PUP/IR statements, which are availability labels and administrative floors rather than timelines.",
+        ),
       injury_date: z
         .string()
         .date()
