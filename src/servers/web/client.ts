@@ -1945,16 +1945,58 @@ export class WebDatabaseClient {
       );
     }
 
+    // ── A human's date outranks a machine's re-derivation ───────────────
+    // The UPDATE below is COALESCE(param, column) — param FIRST, so anything a
+    // caller supplies overwrites what is stored. (canonical_post_id two lines
+    // further down is inverted on purpose; injury_date never was.) The agents
+    // poller calls this on every cycle that reaches resolveThreadAndDates,
+    // carrying a freshly resolved date, so an MD who corrected a date by hand
+    // watched it revert on the next pass-through cycle.
+    //
+    // Thread 83951acd took four corrections and four reverts in three days,
+    // one of them seven minutes after the edit, flipping 2025-12-14 back to
+    // 2024-12-14 and re-anchoring the projected return into the past. Both
+    // symptoms the MD reported — "the date won't stick" and "the post is off by
+    // a year" — were this one line of SQL.
+    //
+    // The MD's value is the only one here backed by a person who read the case,
+    // so a system write never overrides it. An MD can always correct their own
+    // correction: the guard keys on WHO is writing, not on what.
+    const storedIsMdManual = (before.date_resolution_sources ?? []).some(
+      (s) => s?.stage === "md_manual",
+    );
+    // Mirrors the audit actor derivation below: anything but an explicit
+    // non-"system" caller is a machine.
+    const callerIsSystem = !input.updated_by || input.updated_by === "system";
+    const deferToMd = storedIsMdManual && callerIsSystem;
+
+    // Exactly the fields the MD's date form writes. otm_projection and
+    // canonical_post_id are deliberately NOT guarded — they are bookkeeping
+    // rather than the date decision, and the poller derives its projection from
+    // a thread read-back that now returns the MD's date.
+    const dateIn = deferToMd ? undefined : input.injury_date;
+    const confidenceIn = deferToMd ? undefined : input.injury_date_confidence;
+    const surgeryDateIn = deferToMd ? undefined : input.surgery_date;
+    const surgeryConfirmedIn = deferToMd ? undefined : input.surgery_confirmed;
+    const sourcesIn = deferToMd ? undefined : input.date_resolution_sources;
+    const needsReviewIn = deferToMd ? undefined : input.needs_date_review;
+
+    // Only interesting when the machine actually wanted a DIFFERENT date;
+    // re-deriving the same value is the normal, silent case.
+    const refusedDate =
+      deferToMd &&
+      input.injury_date != null &&
+      (before.injury_date == null ||
+        toIsoDate(input.injury_date) !== toIsoDate(before.injury_date));
+
     const needsReview =
-      input.needs_date_review !== undefined
-        ? input.needs_date_review
-        : input.injury_date_confidence !== undefined
-          ? input.injury_date_confidence === "unknown"
+      needsReviewIn !== undefined
+        ? needsReviewIn
+        : confidenceIn !== undefined
+          ? confidenceIn === "unknown"
           : null; // keep existing
 
-    const sources = input.date_resolution_sources
-      ? JSON.stringify(input.date_resolution_sources)
-      : null;
+    const sources = sourcesIn ? JSON.stringify(sourcesIn) : null;
     // ── Arithmetic re-anchor ────────────────────────────────────────────
     // projected_return_date is frozen at thread open as injury_date plus the
     // midpoint of the OTM week window. When an MD (or a later resolution)
@@ -1970,9 +2012,9 @@ export class WebDatabaseClient {
     // behind the MD's back.
     const prior = before.otm_projection;
     const injuryDateChanged =
-      input.injury_date != null &&
+      dateIn != null &&
       (before.injury_date == null ||
-        toIsoDate(before.injury_date) !== toIsoDate(input.injury_date));
+        toIsoDate(before.injury_date) !== toIsoDate(dateIn));
     // Number(null) is 0, and 0 is finite — coercing first would treat a
     // null week bound as a real zero and write a projection anchored to half
     // the window. Require actual numbers.
@@ -1987,7 +2029,7 @@ export class WebDatabaseClient {
         ? {
             ...prior!,
             projected_return_date: addWeeks(
-              input.injury_date!,
+              dateIn!,
               (prior!.min_weeks + prior!.max_weeks) / 2,
             ),
           }
@@ -2001,10 +2043,10 @@ export class WebDatabaseClient {
 
     const rows = await this.sql`
       UPDATE injury_entities SET
-        injury_date = COALESCE(${input.injury_date ?? null}::date, injury_date),
-        injury_date_confidence = COALESCE(${input.injury_date_confidence ?? null}, injury_date_confidence),
-        surgery_date = COALESCE(${input.surgery_date ?? null}::date, surgery_date),
-        surgery_confirmed = COALESCE(${input.surgery_confirmed ?? null}::boolean, surgery_confirmed),
+        injury_date = COALESCE(${dateIn ?? null}::date, injury_date),
+        injury_date_confidence = COALESCE(${confidenceIn ?? null}, injury_date_confidence),
+        surgery_date = COALESCE(${surgeryDateIn ?? null}::date, surgery_date),
+        surgery_confirmed = COALESCE(${surgeryConfirmedIn ?? null}::boolean, surgery_confirmed),
         date_resolution_sources = COALESCE(${sources}::jsonb, date_resolution_sources),
         otm_projection = COALESCE(${projection}::jsonb, otm_projection),
         -- Inverted on purpose: column first, param second. Fills only when the
@@ -2024,6 +2066,40 @@ export class WebDatabaseClient {
     }
     const updated = normalizeEntityDates(rows[0] as InjuryEntity);
 
+    if (refusedDate) {
+      // Durable, because the silence is what made this expensive to find: the
+      // poller reverted the date with no log line, no audit row and no counter,
+      // so from the MD's side the edit simply had not saved.
+      console.warn(
+        `[Thread] ${input.entity_id} — kept the MD's injury_date ` +
+          `${toIsoDate(before.injury_date!)} over a system write of ` +
+          `${toIsoDate(input.injury_date!)}. A hand-set date is not re-derived.`,
+      );
+      // Best-effort, like the supersede sweep: the GUARD is the guarantee, the
+      // record of it is not. A failing audit insert must not turn a write that
+      // used to succeed into a thrown error on the poller's hot path.
+      try {
+        await this.auditAppend({
+          actor: "system",
+          entity_type: "injury_thread",
+          entity_id: input.entity_id,
+          action: "md_date_write_refused",
+          before: { injury_date: before.injury_date ?? null },
+          after: { injury_date: before.injury_date ?? null },
+          payload: {
+            kept_injury_date: toIsoDate(before.injury_date!),
+            refused_injury_date: toIsoDate(input.injury_date!),
+            refused_confidence: input.injury_date_confidence ?? null,
+            reason: "stored date is md_manual; caller is system",
+          },
+        });
+      } catch (err) {
+        console.warn(
+          `[Thread] ${input.entity_id} — could not record md_date_write_refused: ${String(err)}`,
+        );
+      }
+    }
+
     if (reanchored) {
       // auditAppend stores before/after only as hashes, so the readable diff
       // has to live in the payload — same as closeThread.
@@ -2038,7 +2114,7 @@ export class WebDatabaseClient {
         after: reanchored,
         payload: {
           previous_injury_date: before.injury_date ?? null,
-          new_injury_date: toIsoDate(input.injury_date!),
+          new_injury_date: toIsoDate(dateIn!),
           previous_projected_return_date: prior!.projected_return_date ?? null,
           new_projected_return_date: reanchored.projected_return_date,
           otm_min_weeks: prior!.min_weeks,
