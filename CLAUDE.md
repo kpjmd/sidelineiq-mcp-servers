@@ -93,6 +93,43 @@ It fails closed on a missing projection or a non-numeric week bound. Check the T
 not the coercion: `Number(null)` is `0` and `0` is finite, so a null `min_weeks` would
 otherwise anchor the projection to half the window.
 
+### A hand-set date outranks a re-derived one
+
+`updateThreadDates`' UPDATE is `COALESCE(param, column)` — **param first, so any
+supplied value OVERWRITES**. `canonical_post_id` in the same statement is inverted on
+purpose so it only fills when null; `injury_date` never was. The agents poller calls
+this tool on every cycle that reaches `resolveThreadAndDates`, carrying a freshly
+resolved date, so an MD's hand correction was reverted on the next pass-through cycle.
+
+Thread `83951acd` took four corrections and four reverts in three days — one of them
+seven minutes after the edit — flipping `2025-12-14` back to `2024-12-14` and dragging
+`projected_return_date` to a return date in the past. Both symptoms the MD reported,
+"the date won't stick" and "the post is off by a year", were that one COALESCE.
+
+So a **system** caller can no longer overwrite `injury_date`,
+`injury_date_confidence`, `surgery_date`, `surgery_confirmed`,
+`date_resolution_sources` or `needs_date_review` on a thread whose stored
+`date_resolution_sources` carries `stage: 'md_manual'`. The discriminator is
+`updated_by`, the same one the audit `actor` already derives from: the frontend MD
+route passes the reviewer's id, the poller passes nothing. An MD can always correct
+their own correction — the guard keys on WHO is writing, not on what.
+
+`otm_projection` and `canonical_post_id` are deliberately NOT guarded. They are
+bookkeeping rather than the date decision, and the poller builds its projection from a
+thread read-back that now returns the MD's date, so protecting the entity protects the
+post too.
+
+A refusal that would have CHANGED the date logs `[Thread] … kept the MD's injury_date`
+and appends an `md_date_write_refused` audit row; re-deriving the same value is silent.
+That audit write is best-effort in a try/catch — the guard is the guarantee, the record
+of it is not, and a failing insert must not throw on the poller's hot path.
+
+This does NOT fix the resolver. It still returns different dates for one event across
+cycles (`26f531ec` oscillated 08-19/08-20 four times with no MD involved) and is
+systematically a year early on December injuries. That is a separate, open defect in
+the agents repo's `resolveInjuryDate`; this guard only stops a human's answer being
+thrown away by a machine's.
+
 Side effect worth knowing: `computeAccuracyRecord` scores `error_days` off the frozen
 `projected_return_date` while `within_range` uses the live `injury_date`. The
 re-anchor keeps those two consistent for every row written after this shipped.
