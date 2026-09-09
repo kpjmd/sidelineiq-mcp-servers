@@ -1,0 +1,79 @@
+{
+  "_recorded_from": "live production DB, 2026-09-09: web_thread_get (SELECT * on injury_entities) and web_list_threads for the same entity b50addcd (Alvin Kamara, md_manual).",
+  "_note": "Never hand-author. `entity` is the raw SELECT * row and therefore carries every column listThreads' widened SELECT projects. `list_row` is the same entity as it arrived over the wire from the PRE-widening server, so the two together show exactly which keys the widening adds. The test re-hydrates injury_date to a JS Date because the neon driver returns DATE columns as Date objects and the wire payload is already normalized; that re-hydration is the only constructed value here.",
+  "entity": {
+    "id": "b50addcd-7379-4e71-a7bc-d64ed4354bb9",
+    "player_id": "5b76031d-0c41-4dbb-98e5-c906f625698e",
+    "body_part": "knee",
+    "laterality": "UNSPECIFIED",
+    "injury_type": "sprain",
+    "status": "ACTIVE",
+    "canonical_post_id": "b8d94a3f-1050-4415-b7e0-25ec60772d6e",
+    "first_reported_at": "2026-08-20T03:19:37.095Z",
+    "last_updated_at": "2026-09-09T19:33:00.976Z",
+    "actual_return_date": null,
+    "created_at": "2026-08-20T03:19:37.095Z",
+    "updated_at": "2026-09-09T19:33:00.976Z",
+    "injury_date": "2026-08-18",
+    "injury_date_confidence": "confirmed",
+    "surgery_date": null,
+    "surgery_confirmed": false,
+    "date_resolution_sources": [
+      {
+        "stage": "md_manual"
+      }
+    ],
+    "otm_projection": {
+      "max_weeks": 6,
+      "min_weeks": 3,
+      "created_at": "2026-08-21T12:41:40.475Z",
+      "probability_week_2": 0.05,
+      "probability_week_4": 0.55,
+      "probability_week_8": 0.92,
+      "projected_return_date": "2026-09-18"
+    },
+    "accuracy_record": null,
+    "returned_at": null,
+    "closed_at": null,
+    "needs_date_review": false,
+    "void_reason": null
+  },
+  "list_row": {
+    "id": "b50addcd-7379-4e71-a7bc-d64ed4354bb9",
+    "player_id": "5b76031d-0c41-4dbb-98e5-c906f625698e",
+    "body_part": "knee",
+    "laterality": "UNSPECIFIED",
+    "injury_type": "sprain",
+    "status": "ACTIVE",
+    "injury_date": "2026-08-18",
+    "injury_date_confidence": "confirmed",
+    "surgery_date": null,
+    "surgery_confirmed": false,
+    "needs_date_review": false,
+    "otm_projection": {
+      "max_weeks": 6,
+      "min_weeks": 3,
+      "created_at": "2026-08-21T12:41:40.475Z",
+      "probability_week_2": 0.05,
+      "probability_week_4": 0.55,
+      "probability_week_8": 0.92,
+      "projected_return_date": "2026-09-18"
+    },
+    "accuracy_record": null,
+    "actual_return_date": null,
+    "returned_at": null,
+    "closed_at": null,
+    "void_reason": null,
+    "first_reported_at": "2026-08-20T03:19:37.095Z",
+    "last_updated_at": "2026-09-09T19:33:00.976Z",
+    "athlete_name": "Alvin Kamara",
+    "sport": "NFL",
+    "team_name": "New Orleans Saints"
+  },
+  "adds_over_pre_widening_list_row": [
+    "canonical_post_id",
+    "created_at",
+    "date_resolution_sources",
+    "updated_at"
+  ]
+}

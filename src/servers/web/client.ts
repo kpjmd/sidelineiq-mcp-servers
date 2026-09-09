@@ -321,6 +321,14 @@ export interface ThreadListItem {
   needs_date_review: boolean;
   otm_projection: OtmProjection | null;
   accuracy_record: AccuracyRecord | null;
+  // Provenance of the stored dates (migration 014). Legitimately NULL on any
+  // thread the resolver has never run on, so a caller distinguishing "never
+  // resolved" from "this server predates the column" must test for KEY
+  // PRESENCE, not for a non-null value.
+  date_resolution_sources: DateResolutionSource[] | null;
+  // The post the thread was created from (migration 009). NULL when the entity
+  // was minted before any post existed.
+  canonical_post_id: string | null;
   actual_return_date: string | null;
   returned_at: string | null;
   closed_at: string | null;
@@ -2224,6 +2232,7 @@ export class WebDatabaseClient {
       SELECT e.id, e.player_id, e.body_part, e.laterality, e.injury_type, e.status,
              e.injury_date, e.injury_date_confidence, e.surgery_date, e.surgery_confirmed,
              e.needs_date_review, e.otm_projection, e.accuracy_record,
+             e.date_resolution_sources, e.canonical_post_id,
              e.actual_return_date, e.returned_at, e.closed_at, e.void_reason,
              e.first_reported_at, e.last_updated_at,
              p.full_name AS athlete_name, p.sport AS sport,
