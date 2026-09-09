@@ -1445,7 +1445,7 @@ export function registerWebTools(server: McpServer): void {
   // ── web_list_threads ────────────────────────────────────────────────
   server.tool(
     "web_list_threads",
-    "List injury threads for the MD dashboard, joined with athlete name / sport / team. Filter by status (ACTIVE/RESOLVED/RETIRED/VOID) and/or needs_date_review to drive the active, date-review, and accuracy views. Ordered by last_updated_at. VOID rows are retracted threads kept for the audit trail — omit them from accuracy views and default listings.",
+    "List injury threads for the MD dashboard, joined with athlete name / sport / team. Filter by status (ACTIVE/RESOLVED/RETIRED/VOID) and/or needs_date_review to drive the active, date-review, and accuracy views. Ordered by last_updated_at. VOID rows are retracted threads kept for the audit trail — omit them from accuracy views and default listings. Rows also carry date_resolution_sources (JSONB provenance for the stored dates; NULL on any thread the resolver has never run on) and canonical_post_id (the post the thread was created from; NULL when the entity was minted before any post existed), so a caller can classify a thread's date provenance from the list alone instead of a per-entity web_thread_get.",
     {
       status: z.enum(["ACTIVE", "RESOLVED", "RETIRED", "VOID"]).optional(),
       needs_date_review: z.boolean().optional(),
