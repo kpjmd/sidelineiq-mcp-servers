@@ -22,13 +22,58 @@ const statusEnum = z.enum([
 ]);
 const mdReviewStatusEnum = z.enum(["PENDING", "APPROVED", "REJECTED", "SUPERSEDED"]);
 
+// Every field here was a bare number with no description for the life of this
+// tool. That is the PR #30 failure: an undescribed numeric field collapsed onto
+// a single modal value across 439 posts, and the two confidences came back
+// byte-identical because nothing told the model they were different questions.
+// The two axes these descriptions have to keep apart:
+//   TOTAL vs REMAINING  — the week bounds are total from injury_date; a team's
+//                         disclosed timeline (team_timeline_weeks) is what is left.
+//   FACTS vs LITERATURE — confidence here scores the evidence behind the
+//                         timeline; md_review_confidence scores the reported event.
 const returnToPlaySchema = z.object({
-  min_weeks: z.number().int().min(0),
-  max_weeks: z.number().int().min(0),
-  probability_week_2: z.number().min(0).max(1),
-  probability_week_4: z.number().min(0).max(1),
-  probability_week_8: z.number().min(0).max(1),
-  confidence: z.number().min(0).max(1),
+  min_weeks: z
+    .number()
+    .int()
+    .min(0)
+    .describe(
+      "Lower bound of the return-to-play window, in weeks counted as a TOTAL from injury_date — or from the surgery date when there was one — NOT the time remaining from today. These bounds do not shrink as the athlete rehabs: an ACL reconstruction is ~39 weeks whether surgery was last week or nine months ago. Remaining time is derived for display and never stored.",
+    ),
+  max_weeks: z
+    .number()
+    .int()
+    .min(0)
+    .describe(
+      "Upper bound of the same TOTAL window from injury_date. Same clock as min_weeks, and a DIFFERENT clock from team_timeline_weeks, which is weeks remaining as of the report date — the two are only comparable after adding elapsed time to the team's figure.",
+    ),
+  probability_week_2: z
+    .number()
+    .min(0)
+    .max(1)
+    .describe(
+      "Probability from 0 to 1 that the athlete has returned to play by week 2 counted from injury_date, on the same TOTAL clock as min_weeks/max_weeks. A genuine 0 is meaningful and must be sent rather than omitted — a complete tendon rupture really does have no chance of return at week 2.",
+    ),
+  probability_week_4: z
+    .number()
+    .min(0)
+    .max(1)
+    .describe(
+      "Probability from 0 to 1 of having returned by week 4 from injury_date. Same TOTAL clock; a genuine 0 is meaningful.",
+    ),
+  probability_week_8: z
+    .number()
+    .min(0)
+    .max(1)
+    .describe(
+      "Probability from 0 to 1 of having returned by week 8 from injury_date. Same TOTAL clock; a genuine 0 is meaningful.",
+    ),
+  confidence: z
+    .number()
+    .min(0)
+    .max(1)
+    .describe(
+      "How good the EVIDENCE behind this timeline is, 0 to 1: the strength and directness of the literature for this injury type and grade, per the SKILL.md evidence tiers. This is a DIFFERENT judgement from the post-level md_review_confidence, which scores how sure we are of the reported facts. They will usually be different numbers, and neither may be copied into the other.",
+    ),
 });
 
 export function registerWebTools(server: McpServer): void {
@@ -52,6 +97,14 @@ export function registerWebTools(server: McpServer): void {
       twitter_id: z.string().optional().describe("Populated after Twitter publish"),
       source_url: z.string().url().optional().describe("Original news source URL"),
       md_review_required: z.boolean().default(false).describe("Whether MD review is needed"),
+      md_review_confidence: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional()
+        .describe(
+          "How sure the agent is of the POST'S FACTS, 0 to 1: whether the diagnosis is confirmed rather than inferred from mechanism, whether the athlete, team and side are unambiguous, and whether the sources agree. This is a DIFFERENT judgement from return_to_play_estimate.confidence, which scores the literature behind the timeline; the two will usually be different numbers and neither may be copied into the other. A low value routes the post to physician review before it publishes. Send it on EVERY create, including posts that publish with no review — a NULL here cannot be told apart from never having been scored.",
+        ),
       parent_post_id: z
         .string()
         .uuid()
@@ -102,6 +155,7 @@ export function registerWebTools(server: McpServer): void {
           twitter_id: input.twitter_id,
           source_url: input.source_url,
           md_review_required: input.md_review_required,
+          md_review_confidence: input.md_review_confidence,
           parent_post_id: input.parent_post_id,
           conflict_reason: input.conflict_reason,
           team_timeline_weeks: input.team_timeline_weeks,

@@ -125,6 +125,7 @@ export interface CreatePostInput {
   twitter_id?: string;
   source_url?: string;
   md_review_required?: boolean;
+  md_review_confidence?: number;
   parent_post_id?: string;
   conflict_reason?: string;
   team_timeline_weeks?: number;
@@ -712,7 +713,8 @@ export class WebDatabaseClient {
         return_to_play_min_weeks, return_to_play_max_weeks,
         rtp_probability_week_2, rtp_probability_week_4, rtp_probability_week_8,
         rtp_confidence, farcaster_hash, twitter_id, source_url, md_review_required,
-        parent_post_id, slug, conflict_reason, team_timeline_weeks, injury_date
+        md_review_confidence, parent_post_id, slug, conflict_reason, team_timeline_weeks,
+        injury_date
       ) VALUES (
         ${data.athlete_name}, ${data.sport}, ${data.team},
         ${data.injury_type}, ${data.injury_severity},
@@ -722,6 +724,7 @@ export class WebDatabaseClient {
         ${data.rtp_probability_week_8 ?? null}, ${data.rtp_confidence ?? null},
         ${data.farcaster_hash ?? null}, ${data.twitter_id ?? null},
         ${data.source_url ?? null}, ${data.md_review_required ?? false},
+        ${data.md_review_confidence ?? null},
         ${data.parent_post_id ?? null}, ${slug},
         ${data.conflict_reason ?? null}, ${data.team_timeline_weeks ?? null},
         ${data.injury_date ?? null}
