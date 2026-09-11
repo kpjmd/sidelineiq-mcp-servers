@@ -56,6 +56,9 @@ store and exposes it as clean MCP tools.
 - Never hardcode API keys or secrets
 - Never expose internal error details to MCP clients
 - Never skip Zod validation on any tool input
+- Never pass a prebuilt `z.object(...)` to `server.tool()` — the SDK treats any
+  non-raw-shape object in that slot as ANNOTATIONS and the tool registers with no
+  input schema. Pass the raw shape; `withInputKeyPolicy` makes it strict.
 
 ### Always Do These
 - All tools must have complete Zod input schemas
@@ -155,6 +158,36 @@ thrown away by a machine's.
 Side effect worth knowing: `computeAccuracyRecord` scores `error_days` off the frozen
 `projected_return_date` while `within_range` uses the live `injury_date`. The
 re-anchor keeps those two consistent for every row written after this shipped.
+
+### An unknown input key is an error, not a dropped field
+
+Every tool registers a raw zod shape, which the SDK wraps in a plain `z.object`
+— and `z.object` STRIPS undeclared keys and returns success, while tools/list
+advertised `additionalProperties: false` on every object the whole time. That
+mismatch cost the agent the model's post-level confidence on 183 rows (it sent a
+flat `confidence`) and made `status` on web_create_injury_post a no-op for
+months.
+
+`withInputKeyPolicy` (`src/shared/input-key-policy.ts`) is applied in every
+`server.ts` and rebuilds each registered tool's `inputSchema` with `.strict()` at
+every depth, cloning wrapper defs so `.describe()` text survives. `z.record` /
+`z.unknown` stay open (`payload`, `raw_payload`, `before`, `after`). Lever:
+`MCP_UNKNOWN_KEYS=strict|strip`, default strict; only an explicit `strip`
+reopens it. tools/list is byte-identical under both modes — strict changes what
+is ENFORCED, not what is ADVERTISED; `tests/input-key-policy.test.ts` pins that
+for all 71 tools.
+
+Before it shipped (2026-09-11) every caller was audited: all 123 agents call
+sites, all 33 frontend ones, and a replay of every payload the agents test suite
+builds against the strict schemas (0 undeclared keys; the same replay against
+the pre-change schema flagged exactly `status`). A rejection reaches the caller
+as a VALUE with `isError`, so the agents' `callTool` logs `[MCP] INPUT REJECTED`
+for every caller at once.
+
+**Test through validation.** `getTool(server, name).handler(args, {})` calls the
+RAW callback — zod never runs, so neither stripping nor rejection is visible to
+it. Use `tool.inputSchema.parse()` first, or a real `Client` over
+`InMemoryTransport` (see `tests/input-key-policy.test.ts`).
 
 ## Environment Variables
 

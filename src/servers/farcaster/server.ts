@@ -5,6 +5,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { createLogger } from "../../shared/logger.js";
 import { requireMcpAuth } from "../../shared/auth.js";
 import { registerFarcasterTools } from "./tools.js";
+import { withInputKeyPolicy } from "../../shared/input-key-policy.js";
 import { fileURLToPath } from "node:url";
 
 const logger = createLogger("farcaster");
@@ -22,7 +23,7 @@ export function createFarcasterServer(): { app: express.Express; port: number } 
         { name: "sidelineiq-farcaster", version: "1.0.0" },
         { capabilities: { tools: {} } },
       );
-      registerFarcasterTools(mcpServer);
+      registerFarcasterTools(withInputKeyPolicy(mcpServer));
 
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
