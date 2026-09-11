@@ -76,6 +76,28 @@ Always snake_case. Always service-prefixed.
 - Twitter MCP Server: 3102
 - SidelineIQ Web MCP Server: 3103
 
+### A review-routed post is born PENDING_REVIEW, with its queue item
+
+`web_create_injury_post` declares `status` (PUBLISHED | PENDING_REVIEW only —
+retired statuses cannot be created) and `md_review_reason`. `createPost` is ONE
+data-modifying CTE: the post and, when it is PENDING_REVIEW with a reason, its
+md_reviews row commit together (the FK is checked at end of statement). The
+result echoes `md_review_filed`. Before this `status` was stripped, every row
+landed PUBLISHED, and the agent flipped it with a second call — so a failed
+flag left a post routed to physician review live on the site and eligible for
+the agent's ApprovalSync re-cast to social.
+
+A PENDING_REVIEW create WITHOUT a reason is accepted on purpose: it is what a
+pre-change agent sends mid-deploy. It lands non-public with no queue item and
+`md_review_filed: false`, and that agent's own flag call files the row. Do not
+"tighten" this into a rejection — it would fail every review-routed create in
+the window between an mcp deploy and an agents deploy.
+
+`web_flag_for_md_review`'s `confidence_score` is optional and COALESCEs onto
+the stored value. A caller with no number of its own must not overwrite the
+model's — never pass a placeholder. Migration 022 CHECKs both confidence
+columns into [0,1] (NULL stays legal: the historical NULLs have no source).
+
 ### web_thread_update_dates re-anchors the OTM projection
 
 `projected_return_date` is frozen at thread open as `injury_date` plus the midpoint

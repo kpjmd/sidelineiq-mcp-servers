@@ -104,8 +104,10 @@ function insertCall(): { cols: string[]; values: unknown[] } {
   ) as [string[], ...unknown[]] | undefined;
   if (!call) throw new Error("no INSERT INTO injury_posts call");
   const [strings, ...values] = call;
+  // Anchor on the INSERT itself, not the first "(" — createPost is a CTE now
+  // (`WITH p AS (INSERT INTO injury_posts (...`).
   const cols = strings[0]
-    .split("(")[1]
+    .split("INSERT INTO injury_posts (")[1]
     .split(")")[0]
     .split(",")
     .map((c) => c.trim())
