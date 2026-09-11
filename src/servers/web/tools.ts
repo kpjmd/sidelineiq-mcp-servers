@@ -127,6 +127,19 @@ export function registerWebTools(server: McpServer): void {
         .date()
         .optional()
         .describe("ISO 8601 date (YYYY-MM-DD) when the injury or surgery originally occurred"),
+      status: z
+        .enum(["PUBLISHED", "PENDING_REVIEW"])
+        .optional()
+        .describe(
+          "PENDING_REVIEW for a post routed to physician review — it is created non-public and never appears in PUBLISHED listings until approved. Omit (or PUBLISHED) for a post that publishes now. Retired statuses cannot be created.",
+        ),
+      md_review_reason: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "Why the post needs physician review. With status PENDING_REVIEW, the review-queue item is filed in the SAME write as the post, and the result's md_review_filed is true; no separate web_flag_for_md_review call is needed. Without it, a PENDING_REVIEW post is created with no queue item and md_review_filed is false.",
+        ),
     },
     {
       readOnlyHint: false,
@@ -160,6 +173,8 @@ export function registerWebTools(server: McpServer): void {
           conflict_reason: input.conflict_reason,
           team_timeline_weeks: input.team_timeline_weeks,
           injury_date: input.injury_date,
+          status: input.status,
+          md_review_reason: input.md_review_reason,
         });
 
         return toolSuccess({
@@ -167,6 +182,7 @@ export function registerWebTools(server: McpServer): void {
           slug: result.slug,
           created_at: result.created_at,
           status: result.status,
+          md_review_filed: result.md_review_filed,
         });
       } catch (err) {
         return handleToolError(err, logger);
@@ -467,7 +483,10 @@ export function registerWebTools(server: McpServer): void {
         .number()
         .min(0)
         .max(1)
-        .describe("Confidence score that triggered the review (0-1)"),
+        .optional()
+        .describe(
+          "The post-level confidence (0-1), stored as md_review_confidence. Omit when you have no number of your own — the stored value is then kept. Never pass a placeholder: it overwrites the model's real score.",
+        ),
       flagged_by: z.string().min(1).describe("Which agent flagged it"),
       preserve_status: z
         .boolean()

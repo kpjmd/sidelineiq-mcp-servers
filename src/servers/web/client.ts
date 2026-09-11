@@ -130,6 +130,10 @@ export interface CreatePostInput {
   conflict_reason?: string;
   team_timeline_weeks?: number;
   injury_date?: string;
+  /** Omitted ⇒ 'PUBLISHED', the 001 DDL default. */
+  status?: 'PUBLISHED' | 'PENDING_REVIEW';
+  /** With status PENDING_REVIEW, files the md_reviews row in the same statement. */
+  md_review_reason?: string;
 }
 
 export interface UpdatePostInput {
@@ -701,37 +705,67 @@ export class WebDatabaseClient {
   }
 
   // ── Posts ────────────────────────────────────────────────────────────
-  async createPost(data: CreatePostInput): Promise<InjuryPost> {
+  /**
+   * Insert a post — and, when it is born PENDING_REVIEW with a reason, its
+   * md_reviews row — in ONE statement.
+   *
+   * `status` used to be undeclared, so every row landed at the DDL default
+   * PUBLISHED and the agent flipped it with a SECOND call (flagForMdReview,
+   * itself an UPDATE then an INSERT). If that call failed, a post routed to
+   * physician review sat PUBLISHED: on the homepage, and in ApprovalSync's
+   * hashless-PUBLISHED sweep, which re-casts exactly that to Farcaster and X.
+   *
+   * A data-modifying CTE is atomic without a transaction API: both inserts
+   * commit or neither does, and the md_reviews FK is checked at end of
+   * statement, after `p` has inserted the parent. `md_review_filed` tells the
+   * caller whether the review row was written, so it knows whether the
+   * separate flag call is still needed. A PENDING_REVIEW create WITHOUT a
+   * reason is deliberately allowed — it is what an agent that predates this
+   * change sends, and it still lands non-public; that agent's flag call then
+   * files the row.
+   */
+  async createPost(data: CreatePostInput): Promise<InjuryPost & { md_review_filed: boolean }> {
     const slug = await this.resolveUniqueSlug(
       this.generateBaseSlug(data.athlete_name, data.injury_type, new Date()),
     );
 
     const rows = await this.sql`
-      INSERT INTO injury_posts (
-        athlete_name, sport, team, injury_type, injury_severity,
-        content_type, headline, clinical_summary,
-        return_to_play_min_weeks, return_to_play_max_weeks,
-        rtp_probability_week_2, rtp_probability_week_4, rtp_probability_week_8,
-        rtp_confidence, farcaster_hash, twitter_id, source_url, md_review_required,
-        md_review_confidence, parent_post_id, slug, conflict_reason, team_timeline_weeks,
-        injury_date
-      ) VALUES (
-        ${data.athlete_name}, ${data.sport}, ${data.team},
-        ${data.injury_type}, ${data.injury_severity},
-        ${data.content_type}, ${data.headline}, ${data.clinical_summary},
-        ${data.return_to_play_min_weeks ?? null}, ${data.return_to_play_max_weeks ?? null},
-        ${data.rtp_probability_week_2 ?? null}, ${data.rtp_probability_week_4 ?? null},
-        ${data.rtp_probability_week_8 ?? null}, ${data.rtp_confidence ?? null},
-        ${data.farcaster_hash ?? null}, ${data.twitter_id ?? null},
-        ${data.source_url ?? null}, ${data.md_review_required ?? false},
-        ${data.md_review_confidence ?? null},
-        ${data.parent_post_id ?? null}, ${slug},
-        ${data.conflict_reason ?? null}, ${data.team_timeline_weeks ?? null},
-        ${data.injury_date ?? null}
+      WITH p AS (
+        INSERT INTO injury_posts (
+          athlete_name, sport, team, injury_type, injury_severity,
+          content_type, headline, clinical_summary,
+          return_to_play_min_weeks, return_to_play_max_weeks,
+          rtp_probability_week_2, rtp_probability_week_4, rtp_probability_week_8,
+          rtp_confidence, farcaster_hash, twitter_id, source_url, md_review_required,
+          md_review_confidence, parent_post_id, slug, conflict_reason, team_timeline_weeks,
+          injury_date, status, md_review_reason
+        ) VALUES (
+          ${data.athlete_name}, ${data.sport}, ${data.team},
+          ${data.injury_type}, ${data.injury_severity},
+          ${data.content_type}, ${data.headline}, ${data.clinical_summary},
+          ${data.return_to_play_min_weeks ?? null}, ${data.return_to_play_max_weeks ?? null},
+          ${data.rtp_probability_week_2 ?? null}, ${data.rtp_probability_week_4 ?? null},
+          ${data.rtp_probability_week_8 ?? null}, ${data.rtp_confidence ?? null},
+          ${data.farcaster_hash ?? null}, ${data.twitter_id ?? null},
+          ${data.source_url ?? null}, ${data.md_review_required ?? false},
+          ${data.md_review_confidence ?? null},
+          ${data.parent_post_id ?? null}, ${slug},
+          ${data.conflict_reason ?? null}, ${data.team_timeline_weeks ?? null},
+          ${data.injury_date ?? null}, ${data.status ?? 'PUBLISHED'},
+          ${data.md_review_reason ?? null}
+        )
+        RETURNING *
+      ),
+      r AS (
+        INSERT INTO md_reviews (post_id, reason, status)
+        SELECT id, md_review_reason, 'PENDING' FROM p
+        WHERE p.status = 'PENDING_REVIEW' AND p.md_review_reason IS NOT NULL
+        RETURNING id
       )
-      RETURNING *
+      SELECT p.*, EXISTS (SELECT 1 FROM r) AS md_review_filed FROM p
     `;
-    return normalizePostDates(rows[0] as InjuryPost);
+    const row = rows[0] as InjuryPost & { md_review_filed: boolean };
+    return { ...normalizePostDates(row), md_review_filed: row.md_review_filed === true };
   }
 
   async updatePost(
@@ -1056,7 +1090,7 @@ export class WebDatabaseClient {
   async flagForMdReview(
     id: string,
     reason: string,
-    confidenceScore: number,
+    confidenceScore: number | undefined,
     flaggedBy: string,
     preserveStatus = false,
   ): Promise<InjuryPost> {
@@ -1065,12 +1099,19 @@ export class WebDatabaseClient {
     // PENDING_REVIEW — is correct for new agent-generated content that hasn't
     // published yet, but applying it to live posts pulls them out of any
     // "PUBLISHED only" filter and creates confusing review-queue states.
+    //
+    // COALESCE: a caller with no confidence of its own keeps the stored one.
+    // Since every create persists the model's number, the repair scripts'
+    // hard-coded sentinels (0.5, 1) would otherwise overwrite the only record
+    // of it — and write a fabricated value into historical NULLs that must
+    // stay NULL. A caller that does pass a number still wins.
+    const score = confidenceScore ?? null;
     const rows = preserveStatus
       ? await this.sql`
           UPDATE injury_posts
           SET md_review_required = true,
               md_review_reason = ${reason},
-              md_review_confidence = ${confidenceScore},
+              md_review_confidence = COALESCE(${score}, md_review_confidence),
               updated_at = NOW()
           WHERE id = ${id}
           RETURNING *
@@ -1080,7 +1121,7 @@ export class WebDatabaseClient {
           SET status = 'PENDING_REVIEW',
               md_review_required = true,
               md_review_reason = ${reason},
-              md_review_confidence = ${confidenceScore},
+              md_review_confidence = COALESCE(${score}, md_review_confidence),
               updated_at = NOW()
           WHERE id = ${id}
           RETURNING *
