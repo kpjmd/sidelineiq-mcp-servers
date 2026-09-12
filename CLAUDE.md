@@ -118,6 +118,36 @@ It fails closed on a missing projection or a non-numeric week bound. Check the T
 not the coercion: `Number(null)` is `0` and `0` is finite, so a null `min_weeks` would
 otherwise anchor the projection to half the window.
 
+### A clinical attribute was INSERT-only until it wasn't
+
+`laterality`, `body_part` and `injury_type` on `injury_entities` were written by
+`createInjuryEntity` and by nothing else, so a thread opened with the wrong side
+could not be corrected through any tool. `fix-injury-laterality.ts`'s `--fix-entity`
+path in the agents repo had been calling `web_apply_correction` with
+`{entity_id, field:'laterality'}` — undeclared on three counts at once (that tool
+targets `injury_posts`, `post_id` is required, and `laterality` is not in its field
+enum) — and never checked `isError`, so entity laterality had never once been
+corrected.
+
+`web_thread_correct_laterality` closes that, and ONLY for laterality. `body_part`
+and `injury_type` key entity matching in a way an in-place correction cannot
+repair: changing them retroactively re-points which past reports should have
+matched this thread, which is a larger decision than "the side is wrong".
+
+Two behaviours worth keeping:
+- **It does not touch `last_updated_at`.** That column drives
+  `web_find_matching_entity`'s 21-day recency window, and a correction is
+  bookkeeping, not new injury activity — bumping it silently extends the window in
+  which the thread absorbs new reports.
+- **Correcting to the stored value writes nothing at all** — no UPDATE and no audit
+  row — so a repair script re-run cannot manufacture a change that did not happen.
+  It also refuses a `VOID` thread: that thread was retracted as never having
+  described a real injury, so there is no side to correct.
+
+The readable diff lives in the audit `payload` (`previous_laterality` /
+`new_laterality`), because `before`/`after` reach `audit_log` only as hashes — the
+same rule `otm_projection_reanchored` follows.
+
 ### A hand-set date outranks a re-derived one
 
 `updateThreadDates`' UPDATE is `COALESCE(param, column)` — **param first, so any
