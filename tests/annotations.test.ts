@@ -146,6 +146,9 @@ const WEB: Record<string, Hints> = {
   web_thread_update_dates: [false, false, true, false],
   web_thread_append_timeline: [false, false, false, false],
   web_thread_close: [false, false, true, false],
+  // Writes one column plus an audit row; re-correcting to the stored value
+  // writes nothing at all, so a replay is genuinely a no-op.
+  web_thread_correct_laterality: [false, false, true, false],
   web_thread_get: READ,
   web_list_threads: READ,
   web_audit_append: [false, false, false, false],
@@ -198,7 +201,7 @@ const TWITTER: Record<string, Hints> = {
 };
 
 const SERVERS = [
-  { label: "web", register: registerWebTools, expected: WEB, count: 61 },
+  { label: "web", register: registerWebTools, expected: WEB, count: 62 },
   { label: "farcaster", register: registerFarcasterTools, expected: FARCASTER, count: 5 },
   { label: "twitter", register: registerTwitterTools, expected: TWITTER, count: 5 },
 ] as const;
@@ -249,12 +252,12 @@ describe.each(SERVERS)("$label tool annotations", ({ register, expected, count }
 });
 
 describe("annotation coverage across all servers", () => {
-  it("covers all 71 tools", () => {
+  it("covers all 72 tools", () => {
     const total = SERVERS.reduce(
       (sum, { register }) => sum + Object.keys(annotationsByTool(register)).length,
       0,
     );
 
-    expect(total).toBe(71);
+    expect(total).toBe(72);
   });
 });

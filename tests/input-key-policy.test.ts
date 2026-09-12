@@ -112,11 +112,11 @@ describe("tools/list is byte-identical under strict and strip", () => {
     });
   }
 
-  it("covers all 71 tools", async () => {
+  it("covers all 72 tools", async () => {
     const counts = await Promise.all(
       Object.values(REGISTRARS).map((r) => connect(r, "strict").then((c) => c.listTools())),
     );
-    expect(counts.reduce((n, l) => n + l.tools.length, 0)).toBe(71);
+    expect(counts.reduce((n, l) => n + l.tools.length, 0)).toBe(72);
   });
 });
 
@@ -147,6 +147,32 @@ describe("strict rejects an undeclared key at any depth", () => {
     });
     expect(isInputRejection(r)).toBe(true);
     expect(r.content[0].text).toMatch(/snippet/);
+  });
+
+  // The tool that exists because the old --fix-entity call was undeclared on
+  // three counts at once (wrong target table, missing post_id, laterality not
+  // in the field enum) and nobody checked isError. Its own payload has to be
+  // exactly right, so pin it the same way.
+  it("web_thread_correct_laterality rejects an undeclared key", async () => {
+    const r = await call("strict", "web_thread_correct_laterality", {
+      entity_id: "550e8400-e29b-41d4-a716-446655440000",
+      laterality: "LEFT",
+      corrected_by: "fix-injury-laterality",
+      reason: "x",
+      field: "laterality", // what the old web_apply_correction call sent
+    });
+    expect(isInputRejection(r)).toBe(true);
+    expect(r.content[0].text).toMatch(/field/);
+  });
+
+  it("web_thread_correct_laterality rejects a side outside the column's CHECK", async () => {
+    const r = await call("strict", "web_thread_correct_laterality", {
+      entity_id: "550e8400-e29b-41d4-a716-446655440000",
+      laterality: "left",
+      corrected_by: "fix-injury-laterality",
+      reason: "x",
+    });
+    expect(isInputRejection(r)).toBe(true);
   });
 
   it("inside web_update_injury_post's `updates` — a stripped update was a silent no-op", async () => {

@@ -1483,6 +1483,47 @@ export function registerWebTools(server: McpServer): void {
     },
   );
 
+  // ── web_thread_correct_laterality ───────────────────────────────────
+  // The only way to change a clinical attribute on an existing entity. Before
+  // this, laterality/body_part/injury_type were INSERT-only, so a wrong side
+  // could be fixed in the published posts (web_apply_correction) while the
+  // thread itself kept the error — and the thread is what feeds the next
+  // follow-up's prompt and the dedup key.
+  server.tool(
+    "web_thread_correct_laterality",
+    "Correct the stored laterality (side) on an injury thread. Use when a thread was opened with the wrong side and the posts have already been corrected — the entity's laterality feeds every follow-up's thread context and is half the (player_id, body_part, laterality) dedup key, so leaving it wrong keeps the error propagating. Audited as thread_laterality_corrected with the old and new values in the payload. Idempotent: correcting to the value already stored writes nothing and returns changed:false. Rejects VOID threads. Does not touch last_updated_at, so the matching recency window is unchanged.",
+    {
+      entity_id: z.string().uuid(),
+      laterality: z.enum(["LEFT", "RIGHT", "BILATERAL", "UNSPECIFIED"]),
+      corrected_by: z
+        .string()
+        .min(1)
+        .describe("MD user id, or the script name for an automated correction"),
+      actor: z
+        .enum(["md", "automation"])
+        .default("md")
+        .describe("Who is making the call — 'automation' for a repair script, 'md' for a person"),
+      reason: z
+        .string()
+        .min(1)
+        .describe("Why the side is being changed; recorded verbatim in the audit payload"),
+    },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    async (input) => {
+      try {
+        const result = await client.correctThreadLaterality(input);
+        return toolSuccess(result);
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
   // ── web_thread_get ──────────────────────────────────────────────────
   server.tool(
     "web_thread_get",

@@ -2255,6 +2255,87 @@ export class WebDatabaseClient {
     return closed;
   }
 
+  /**
+   * Correct the stored laterality on an injury thread.
+   *
+   * The three clinical attributes on injury_entities — laterality, body_part,
+   * injury_type — were written at INSERT and by nothing else, so a wrong side
+   * was uncorrectable through any tool. That is not a cosmetic gap: the entity's
+   * laterality is read back into every follow-up's prompt as thread context, and
+   * it is half of the (player_id, body_part, laterality) dedup key, so a wrong
+   * side both propagates into published prose and makes every correct later
+   * report look like a laterality_thread_mismatch for the whole 21-day window.
+   *
+   * Scoped to laterality on purpose. body_part and injury_type key entity
+   * matching in a way a correction cannot repair in place — changing them
+   * retroactively re-points which reports should have matched this thread — and
+   * that is a different, larger decision than "the side is wrong".
+   *
+   * Deliberately does NOT touch last_updated_at. That column drives
+   * web_find_matching_entity's recency window, and a correction is bookkeeping,
+   * not new injury activity: bumping it would silently extend the window in
+   * which this thread absorbs new reports.
+   */
+  async correctThreadLaterality(input: {
+    entity_id: string;
+    laterality: Laterality;
+    corrected_by: string;
+    actor?: "md" | "automation";
+    reason: string;
+  }): Promise<{ entity: InjuryEntity; changed: boolean; previous_laterality: Laterality }> {
+    const entity = await this.getEntity(input.entity_id);
+    if (!entity) {
+      throw new McpToolError(
+        `Injury thread ${input.entity_id} not found`,
+        "Verify the entity_id. web_list_threads or web_get_entity_for_post will give you a valid one.",
+      );
+    }
+    if (entity.status === "VOID") {
+      throw new McpToolError(
+        `Injury thread ${input.entity_id} is VOID`,
+        "A voided thread was retracted as never having described a real injury, so there is no side to correct. Leave it alone.",
+      );
+    }
+
+    const previous = entity.laterality;
+    // Idempotent: re-running a correction script must not manufacture a second
+    // audit row claiming a change that did not happen.
+    if (previous === input.laterality) {
+      return { entity, changed: false, previous_laterality: previous };
+    }
+
+    const rows = await this.sql`
+      UPDATE injury_entities SET
+        laterality = ${input.laterality},
+        updated_at = NOW()
+      WHERE id = ${input.entity_id}
+      RETURNING *
+    `;
+    const corrected = normalizeEntityDates(rows[0] as InjuryEntity);
+
+    await this.auditAppend({
+      actor: input.actor ?? "md",
+      actor_id: input.corrected_by,
+      entity_type: "injury_thread",
+      entity_id: input.entity_id,
+      action: "thread_laterality_corrected",
+      before: entity,
+      after: corrected,
+      // before/after are stored only as hashes, so the readable diff has to live
+      // here — same rule as otm_projection_reanchored.
+      payload: {
+        previous_laterality: previous,
+        new_laterality: input.laterality,
+        reason: input.reason,
+        corrected_by: input.corrected_by,
+        body_part: entity.body_part,
+        player_id: entity.player_id,
+      },
+    });
+
+    return { entity: corrected, changed: true, previous_laterality: previous };
+  }
+
   async getThread(
     entityId: string,
   ): Promise<{ entity: InjuryEntity; updates: InjuryUpdate[] } | null> {
