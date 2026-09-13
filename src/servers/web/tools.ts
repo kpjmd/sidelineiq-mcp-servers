@@ -140,6 +140,12 @@ export function registerWebTools(server: McpServer): void {
         .describe(
           "Why the post needs physician review. With status PENDING_REVIEW, the review-queue item is filed in the SAME write as the post, and the result's md_review_filed is true; no separate web_flag_for_md_review call is needed. Without it, a PENDING_REVIEW post is created with no queue item and md_review_filed is false.",
         ),
+      subject_kind: z
+        .enum(["INJURY_TYPE", "ATHLETE"])
+        .optional()
+        .describe(
+          "What the post is ABOUT, recorded by the code that produced it — never inferred from the headline. INJURY_TYPE: an educational analysis of an injury type across several athletes (the trending-type DEEP_DIVE scheduler). ATHLETE: one named athlete's injury (every news-driven post, including a DEEP_DIVE forced onto a single athlete). The commercial referral CTA is shown ONLY on DEEP_DIVE posts marked INJURY_TYPE. Omitted is stored as NULL and treated as not injury-type-led.",
+        ),
     },
     {
       readOnlyHint: false,
@@ -175,6 +181,7 @@ export function registerWebTools(server: McpServer): void {
           injury_date: input.injury_date,
           status: input.status,
           md_review_reason: input.md_review_reason,
+          subject_kind: input.subject_kind,
         });
 
         return toolSuccess({

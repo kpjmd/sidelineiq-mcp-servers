@@ -134,6 +134,8 @@ export interface CreatePostInput {
   status?: 'PUBLISHED' | 'PENDING_REVIEW';
   /** With status PENDING_REVIEW, files the md_reviews row in the same statement. */
   md_review_reason?: string;
+  /** Migration 023. Omitted ⇒ NULL, which consumers read as not injury-type-led. */
+  subject_kind?: 'INJURY_TYPE' | 'ATHLETE';
 }
 
 export interface UpdatePostInput {
@@ -738,7 +740,7 @@ export class WebDatabaseClient {
           rtp_probability_week_2, rtp_probability_week_4, rtp_probability_week_8,
           rtp_confidence, farcaster_hash, twitter_id, source_url, md_review_required,
           md_review_confidence, parent_post_id, slug, conflict_reason, team_timeline_weeks,
-          injury_date, status, md_review_reason
+          injury_date, status, md_review_reason, subject_kind
         ) VALUES (
           ${data.athlete_name}, ${data.sport}, ${data.team},
           ${data.injury_type}, ${data.injury_severity},
@@ -752,7 +754,7 @@ export class WebDatabaseClient {
           ${data.parent_post_id ?? null}, ${slug},
           ${data.conflict_reason ?? null}, ${data.team_timeline_weeks ?? null},
           ${data.injury_date ?? null}, ${data.status ?? 'PUBLISHED'},
-          ${data.md_review_reason ?? null}
+          ${data.md_review_reason ?? null}, ${data.subject_kind ?? null}
         )
         RETURNING *
       ),
