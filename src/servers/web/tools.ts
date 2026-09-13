@@ -1559,11 +1559,18 @@ export function registerWebTools(server: McpServer): void {
   // ── web_list_threads ────────────────────────────────────────────────
   server.tool(
     "web_list_threads",
-    "List injury threads for the MD dashboard, joined with athlete name / sport / team. Filter by status (ACTIVE/RESOLVED/RETIRED/VOID) and/or needs_date_review to drive the active, date-review, and accuracy views. Ordered by last_updated_at. VOID rows are retracted threads kept for the audit trail — omit them from accuracy views and default listings. Rows also carry date_resolution_sources (JSONB provenance for the stored dates; NULL on any thread the resolver has never run on) and canonical_post_id (the post the thread was created from; NULL when the entity was minted before any post existed), so a caller can classify a thread's date provenance from the list alone instead of a per-entity web_thread_get.",
+    "List injury threads for the MD dashboard, joined with athlete name / sport / team. Filter by status (ACTIVE/RESOLVED/RETIRED/VOID) and/or needs_date_review to drive the active, date-review, and accuracy views. Ordered by last_updated_at, newest first, with id as the tiebreak. Paged: follow next_offset while has_more is true; total is the full match count, so a caller can tell a complete list from a truncated one. VOID rows are retracted threads kept for the audit trail — omit them from accuracy views and default listings. Rows also carry date_resolution_sources (JSONB provenance for the stored dates; NULL on any thread the resolver has never run on) and canonical_post_id (the post the thread was created from; NULL when the entity was minted before any post existed), so a caller can classify a thread's date provenance from the list alone instead of a per-entity web_thread_get.",
     {
-      status: z.enum(["ACTIVE", "RESOLVED", "RETIRED", "VOID"]).optional(),
-      needs_date_review: z.boolean().optional(),
-      limit: z.number().int().min(1).max(500).default(100),
+      status: z
+        .enum(["ACTIVE", "RESOLVED", "RETIRED", "VOID"])
+        .optional()
+        .describe("Filter by thread status"),
+      needs_date_review: z
+        .boolean()
+        .optional()
+        .describe("Filter to threads flagged (or not flagged) for MD date review"),
+      limit: z.number().int().min(1).max(500).default(100).describe("Results per page (max 500)"),
+      offset: z.number().int().min(0).default(0).describe("Pagination offset"),
     },
     {
       readOnlyHint: true,
@@ -1573,8 +1580,18 @@ export function registerWebTools(server: McpServer): void {
     },
     async (input) => {
       try {
-        const threads = await client.listThreads(input);
-        return toolSuccess({ threads });
+        const { threads, total } = await client.listThreads(input);
+        // Advance by the rows actually returned, not by `limit`, and never
+        // report more behind an empty page: the count and the page are two
+        // statements, and a thread closed between them must not hand a caller
+        // a next_offset equal to the one it just asked for.
+        const hasMore = threads.length > 0 && input.offset + threads.length < total;
+        return toolSuccess({
+          threads,
+          total,
+          has_more: hasMore,
+          next_offset: hasMore ? input.offset + threads.length : null,
+        });
       } catch (err) {
         return handleToolError(err, logger);
       }

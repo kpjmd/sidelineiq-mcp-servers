@@ -73,8 +73,11 @@ describe("web_list_threads column projection", () => {
   });
 
   it("selects date_resolution_sources and canonical_post_id", async () => {
-    await tool("web_list_threads").handler({ status: "ACTIVE", limit: 100 }, {});
-    const call = mockSql.mock.calls.find((c) => /FROM injury_entities e/i.test(stmt(c)));
+    await tool("web_list_threads").handler({ status: "ACTIVE", limit: 100, offset: 0 }, {});
+    // listThreads also issues a COUNT over the same FROM; the projection is on the page.
+    const call = mockSql.mock.calls.find(
+      (c) => /FROM injury_entities e/i.test(stmt(c)) && !/SELECT COUNT/i.test(stmt(c)),
+    );
     expect(call, "no injury_entities SELECT was issued").toBeDefined();
     const sql = stmt(call as unknown[]);
     expect(sql).toContain("e.date_resolution_sources");
@@ -90,7 +93,7 @@ describe("web_list_threads column projection", () => {
     mockSql.mockResolvedValue([row]);
 
     const res = (await tool("web_list_threads").handler(
-      { status: "ACTIVE", limit: 100 },
+      { status: "ACTIVE", limit: 100, offset: 0 },
       {},
     )) as { content: Array<{ text: string }> };
     const { threads } = JSON.parse(res.content[0].text) as { threads: ThreadListItem[] };
