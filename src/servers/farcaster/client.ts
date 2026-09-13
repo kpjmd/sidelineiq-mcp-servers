@@ -56,6 +56,22 @@ export interface GetNotificationsResult {
   nextCursor?: string;
 }
 
+export interface FarcasterProfileStats {
+  fid: number;
+  username: string;
+  follower_count: number;
+  following_count: number;
+}
+
+interface NeynarUserBulkResponse {
+  users?: Array<{
+    fid?: number;
+    username?: string;
+    follower_count?: unknown;
+    following_count?: unknown;
+  }>;
+}
+
 export class NeynarClient {
   private baseUrl = "https://api.neynar.com/v2/farcaster";
   private apiKey: string;
@@ -148,6 +164,46 @@ export class NeynarClient {
       hash: data.cast.hash,
       timestamp: data.cast.timestamp,
       url: `https://warpcast.com/~/conversations/${data.cast.hash}`,
+    };
+  }
+
+  // The account's own follower count, for the baseline metrics series. The FID
+  // is read here rather than in the constructor so a missing value fails this
+  // one tool, never publishing. Every malformed shape THROWS: the caller
+  // records a reading only on success, and a 0 invented from a missing field
+  // would read as "lost every follower" in the growth gate.
+  async getProfileStats(): Promise<FarcasterProfileStats> {
+    const rawFid = requireEnv("SIDELINEIQ_FARCASTER_FID");
+    const fid = Number(rawFid);
+    if (!Number.isInteger(fid) || fid <= 0) {
+      throw new McpToolError(
+        `SIDELINEIQ_FARCASTER_FID is not a positive integer: ${rawFid}`,
+        "Set SIDELINEIQ_FARCASTER_FID to the account's numeric FID.",
+      );
+    }
+
+    const data = await this.request<NeynarUserBulkResponse>("GET", "/user/bulk", undefined, {
+      fids: String(fid),
+    });
+    const user = data.users?.find((u) => u.fid === fid);
+    if (!user) {
+      throw new McpToolError(
+        `Neynar /user/bulk returned no user for fid ${fid}`,
+        "Verify SIDELINEIQ_FARCASTER_FID is the SidelineIQ account's FID.",
+      );
+    }
+    if (!isCount(user.follower_count) || !isCount(user.following_count)) {
+      throw new McpToolError(
+        `Neynar /user/bulk returned a non-numeric follower count for fid ${fid}`,
+        "Neynar's user shape may have changed; re-record tests/fixtures/neynar-user-bulk.json.",
+      );
+    }
+
+    return {
+      fid,
+      username: user.username ?? "",
+      follower_count: user.follower_count,
+      following_count: user.following_count,
     };
   }
 
@@ -246,4 +302,8 @@ export class NeynarClient {
 
     return { success: true, deleted_hash: hash };
   }
+}
+
+function isCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
 }

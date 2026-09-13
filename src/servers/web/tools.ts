@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { WebDatabaseClient } from "./client.js";
+import { WebDatabaseClient, METRIC_NAMES, METRIC_SOURCES, CTA_LINKS } from "./client.js";
 import type { InsertProcessedMentionInput, InsertPendingCorrectionInput } from "./client.js";
 import { handleToolError, McpToolError, toolSuccess } from "../../shared/errors.js";
 import { createLogger } from "../../shared/logger.js";
@@ -724,6 +724,125 @@ export function registerWebTools(server: McpServer): void {
       try {
         await client.setSocialState(input.key, input.value);
         return toolSuccess({ key: input.key, updated: true });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_record_metric_snapshot ──────────────────────────────────────
+  server.tool(
+    "web_record_metric_snapshot",
+    "Record one baseline metric reading (follower count, monthly uniques) for a UTC day. Upserts on (metric, day): the latest reading of a day wins. Call ONLY with a value actually read — a failed read must record nothing, never 0.",
+    {
+      metric: z.enum(METRIC_NAMES).describe("Which series this reading belongs to"),
+      value: z
+        .number()
+        .int()
+        .min(0)
+        .describe("The reading itself. Never a placeholder: if the count could not be read, do not call this tool."),
+      source: z
+        .enum(METRIC_SOURCES)
+        .describe("Where the number came from: neynar / x_api for automated reads, manual for a value typed in by a person"),
+      day: z
+        .string()
+        .date()
+        .optional()
+        .describe("UTC calendar day 'YYYY-MM-DD' the reading is for. Omit for today."),
+      detail: z
+        .record(z.unknown())
+        .optional()
+        .describe("Optional context stored beside the value, e.g. the account username and following count"),
+    },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    async (input) => {
+      try {
+        const snapshot = await client.recordMetricSnapshot(input);
+        return toolSuccess(snapshot);
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_list_metric_snapshots ───────────────────────────────────────
+  server.tool(
+    "web_list_metric_snapshots",
+    "List baseline metric readings, ordered by metric then day. A day with no row means no reading was taken or the read failed — never zero.",
+    {
+      metric: z.enum(METRIC_NAMES).optional().describe("Restrict to one series"),
+      since: z.string().date().optional().describe("Earliest UTC day to include, 'YYYY-MM-DD'"),
+    },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    async (input) => {
+      try {
+        const snapshots = await client.listMetricSnapshots(input.metric, input.since);
+        return toolSuccess({ snapshots });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_increment_cta_click ─────────────────────────────────────────
+  server.tool(
+    "web_increment_cta_click",
+    "Count one click on an AequOs link from a post page. Aggregate only — stores the day, post slug and which link, nothing about the visitor. Counts only when the slug belongs to a PUBLISHED post; returns counted=false otherwise.",
+    {
+      post_slug: z
+        .string()
+        .min(1)
+        .max(240)
+        .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/)
+        .describe("The injury post slug the click came from"),
+      link: z
+        .enum(CTA_LINKS)
+        .describe("cta = the 'Get Clinical Guidance' referral button; byline = the AequOs attribution link"),
+    },
+    // Each call adds one to a counter, so a replay double-counts.
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+    async (input) => {
+      try {
+        const result = await client.incrementCtaClick(input.post_slug, input.link);
+        return toolSuccess(result);
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_list_cta_clicks ─────────────────────────────────────────────
+  server.tool(
+    "web_list_cta_clicks",
+    "List daily AequOs link click counts from post pages, with totals by link and by post.",
+    {
+      since: z.string().date().optional().describe("Earliest UTC day to include, 'YYYY-MM-DD'"),
+    },
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    async (input) => {
+      try {
+        const summary = await client.listCtaClicks(input.since);
+        return toolSuccess(summary);
       } catch (err) {
         return handleToolError(err, logger);
       }

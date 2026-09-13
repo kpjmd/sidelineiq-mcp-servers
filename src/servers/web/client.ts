@@ -25,6 +25,7 @@ import {
   resolveActualIso,
   assertCanAttest,
   slugify,
+  summarizeCtaClicks,
 } from "./service.js";
 import type {
   InjuryPost,
@@ -64,6 +65,55 @@ export interface AuditEntry {
   before_hash: string | null;
   after_hash: string | null;
   payload: Record<string, unknown> | null;
+}
+
+// ── Baseline metrics types (024_metrics.sql) ─────────────────────────
+// The allowlists mirror the table's CHECK constraints; the zod enums in
+// tools.ts are built from these so the three cannot drift.
+export const METRIC_NAMES = [
+  "x_followers",
+  "farcaster_followers",
+  "web_monthly_uniques",
+  "web_monthly_pageviews",
+] as const;
+export type MetricName = (typeof METRIC_NAMES)[number];
+
+export const METRIC_SOURCES = ["neynar", "x_api", "manual"] as const;
+export type MetricSource = (typeof METRIC_SOURCES)[number];
+
+export const CTA_LINKS = ["cta", "byline"] as const;
+export type CtaLink = (typeof CTA_LINKS)[number];
+
+export interface RecordMetricSnapshotInput {
+  metric: MetricName;
+  value: number;
+  source: MetricSource;
+  /** 'YYYY-MM-DD'. Omitted → today in UTC, computed by the database. */
+  day?: string;
+  detail?: Record<string, unknown>;
+}
+
+export interface MetricSnapshot {
+  metric: MetricName;
+  day: string;
+  value: number;
+  source: MetricSource;
+  detail: Record<string, unknown> | null;
+  recorded_at: string;
+}
+
+export interface CtaClickRow {
+  day: string;
+  post_slug: string;
+  link: CtaLink;
+  clicks: number;
+}
+
+export interface CtaClickSummary {
+  rows: CtaClickRow[];
+  total: number;
+  by_link: Record<CtaLink, number>;
+  by_post: Array<{ post_slug: string; clicks: number }>;
 }
 
 // ── Social engagement types ───────────────────────────────────────────
@@ -1253,6 +1303,69 @@ export class WebDatabaseClient {
       VALUES (${key}, ${value}, NOW())
       ON CONFLICT (key) DO UPDATE SET value = ${value}, updated_at = NOW()
     `;
+  }
+
+  // ── Baseline metrics ────────────────────────────────────────────────
+  // Upsert on (metric, day): several readings in one day are normal (every
+  // redeploy restarts the snapshot loop) and the latest wins.
+  async recordMetricSnapshot(input: RecordMetricSnapshotInput): Promise<MetricSnapshot> {
+    const detail = input.detail === undefined ? null : JSON.stringify(input.detail);
+    const rows = await this.sql`
+      INSERT INTO metric_snapshots (metric, day, value, source, detail, recorded_at)
+      VALUES (
+        ${input.metric},
+        COALESCE(${input.day ?? null}::date, (NOW() AT TIME ZONE 'UTC')::date),
+        ${input.value},
+        ${input.source},
+        ${detail}::jsonb,
+        NOW()
+      )
+      ON CONFLICT (metric, day) DO UPDATE SET
+        value = EXCLUDED.value,
+        source = EXCLUDED.source,
+        detail = EXCLUDED.detail,
+        recorded_at = NOW()
+      RETURNING metric, to_char(day, 'YYYY-MM-DD') AS day, value, source, detail, recorded_at
+    `;
+    return rows[0] as MetricSnapshot;
+  }
+
+  async listMetricSnapshots(metric?: MetricName, since?: string): Promise<MetricSnapshot[]> {
+    const rows = await this.sql`
+      SELECT metric, to_char(day, 'YYYY-MM-DD') AS day, value, source, detail, recorded_at
+      FROM metric_snapshots
+      WHERE (${metric ?? null}::text IS NULL OR metric = ${metric ?? null})
+        AND (${since ?? null}::date IS NULL OR day >= ${since ?? null}::date)
+      ORDER BY metric, day
+    `;
+    return rows as MetricSnapshot[];
+  }
+
+  // Counts only a click on a PUBLISHED post that exists. The route is public
+  // and unauthenticated, so without the EXISTS any slug-shaped string would
+  // mint a row; and a PENDING_REVIEW page is reachable by slug (the MD's own
+  // preview clicks) but has reached no audience.
+  async incrementCtaClick(postSlug: string, link: CtaLink): Promise<{ counted: boolean }> {
+    const rows = await this.sql`
+      INSERT INTO cta_click_daily (day, post_slug, link, clicks)
+      SELECT (NOW() AT TIME ZONE 'UTC')::date, ${postSlug}, ${link}, 1
+      WHERE EXISTS (
+        SELECT 1 FROM injury_posts WHERE slug = ${postSlug} AND status = 'PUBLISHED'
+      )
+      ON CONFLICT (day, post_slug, link) DO UPDATE SET clicks = cta_click_daily.clicks + 1
+      RETURNING clicks
+    `;
+    return { counted: rows.length > 0 };
+  }
+
+  async listCtaClicks(since?: string): Promise<CtaClickSummary> {
+    const rows = (await this.sql`
+      SELECT to_char(day, 'YYYY-MM-DD') AS day, post_slug, link, clicks
+      FROM cta_click_daily
+      WHERE (${since ?? null}::date IS NULL OR day >= ${since ?? null}::date)
+      ORDER BY day, post_slug, link
+    `) as CtaClickRow[];
+    return summarizeCtaClicks(rows);
   }
 
   async checkMentionProcessed(platform: string, mentionId: string): Promise<boolean> {

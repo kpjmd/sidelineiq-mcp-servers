@@ -1,0 +1,75 @@
+{
+  "users": [
+    {
+      "object": "user",
+      "fid": 3125237,
+      "username": "sidelineiq",
+      "display_name": "sidelineiq",
+      "pfp_url": "https://imagedelivery.net/BXluQx4ige9GuW0Ia56BHw/64d10528-5004-4af4-6cef-edc088e3c700/original",
+      "custody_address": "0x9a508f43698e14525a23323f35927bd9dbe77acb",
+      "registered_at": "2026-03-26T00:28:42.921Z",
+      "profile": {
+        "bio": {
+          "text": "AI Sports Injury Intelligence\n \nFounded by @kj",
+          "mentioned_profiles": [
+            {
+              "object": "user_dehydrated",
+              "fid": 15230,
+              "username": "kj",
+              "display_name": "KPJMD",
+              "pfp_url": "https://i.imgur.com/WOFsV3M.gif",
+              "custody_address": "0x78299ffebcff7a0544f6f9e3aece9739bdfd504f"
+            }
+          ],
+          "mentioned_profiles_ranges": [
+            {
+              "start": 43,
+              "end": 46
+            }
+          ]
+        }
+      },
+      "follower_count": 16,
+      "following_count": 1,
+      "verifications": [
+        "0x2d237e78ead28f963fb63e70abae964ca515804b"
+      ],
+      "verified_addresses": {
+        "eth_addresses": [
+          "0x2d237e78ead28f963fb63e70abae964ca515804b"
+        ],
+        "sol_addresses": [
+          "757FsmfoNU6cvftyK75wHHPPYFVBYkUs3WcqbDmwPedh"
+        ],
+        "primary": {
+          "eth_address": "0x2d237e78ead28f963fb63e70abae964ca515804b",
+          "sol_address": "757FsmfoNU6cvftyK75wHHPPYFVBYkUs3WcqbDmwPedh"
+        }
+      },
+      "auth_addresses": [
+        {
+          "address": "0x2d237e78ead28f963fb63e70abae964ca515804b",
+          "app": {
+            "object": "user_dehydrated",
+            "fid": 9152
+          }
+        }
+      ],
+      "verified_accounts": [
+        {
+          "platform": "x",
+          "username": "sidelineiq_"
+        }
+      ],
+      "url": "https://sidelineiq.vercel.app",
+      "experimental": {
+        "neynar_user_score": 0.12,
+        "deprecation_notice": "The `neynar_user_score` field under `experimental` will be deprecated after June 1, 2025, as it will be formally promoted to a stable field named `score` within the user object."
+      },
+      "score": 0.12
+    }
+  ],
+  "next": {
+    "cursor": null
+  }
+}
