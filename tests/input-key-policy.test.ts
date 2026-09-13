@@ -212,6 +212,17 @@ describe("strict leaves the rest of the contract alone", () => {
     // of 20 and offset of 0 must survive the rebuild.
     expect(listCall![1]).toEqual([20, 0]);
   });
+
+  it("applies web_list_threads' default limit and offset through the strict rebuild", async () => {
+    mockSql.mockResolvedValue([]);
+    await call("strict", "web_list_threads", {});
+    // listThreads is a tagged template: (strings, ...values), LIMIT then OFFSET last.
+    const pageCall = mockSql.mock.calls.find(([s]) =>
+      (Array.isArray(s) ? s.join("$") : String(s)).includes("OFFSET"),
+    );
+    expect(pageCall).toBeDefined();
+    expect(pageCall!.slice(-2)).toEqual([100, 0]);
+  });
 });
 
 describe("the lever", () => {

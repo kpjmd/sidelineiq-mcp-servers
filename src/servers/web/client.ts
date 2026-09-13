@@ -2345,14 +2345,30 @@ export class WebDatabaseClient {
     return { entity, updates };
   }
 
+  // Paged, and the page is only half the answer: `total` is what lets a caller
+  // tell "that is every thread" from "that is the first hundred". Without it
+  // the list truncated silently at the default limit and every consumer —
+  // the accuracy view above all — computed over whatever happened to fit.
+  //
+  // `e.id` breaks last_updated_at ties. Offset paging over a non-unique sort
+  // key may repeat or skip a row at each page boundary.
   async listThreads(input: {
     status?: EntityStatus;
     needs_date_review?: boolean;
     limit?: number;
-  }): Promise<ThreadListItem[]> {
+    offset?: number;
+  }): Promise<{ threads: ThreadListItem[]; total: number }> {
     const status = input.status ?? null;
     const needsReview = input.needs_date_review ?? null;
     const limit = input.limit ?? 100;
+    const offset = input.offset ?? 0;
+    const countRows = await this.sql`
+      SELECT COUNT(*)::int AS total
+      FROM injury_entities e
+      JOIN players p ON p.id = e.player_id
+      WHERE (${status}::text IS NULL OR e.status = ${status})
+        AND (${needsReview}::boolean IS NULL OR e.needs_date_review = ${needsReview})
+    `;
     const rows = await this.sql`
       SELECT e.id, e.player_id, e.body_part, e.laterality, e.injury_type, e.status,
              e.injury_date, e.injury_date_confidence, e.surgery_date, e.surgery_confirmed,
@@ -2367,10 +2383,15 @@ export class WebDatabaseClient {
       LEFT JOIN teams t ON t.id = p.current_team_id
       WHERE (${status}::text IS NULL OR e.status = ${status})
         AND (${needsReview}::boolean IS NULL OR e.needs_date_review = ${needsReview})
-      ORDER BY e.last_updated_at DESC
+      ORDER BY e.last_updated_at DESC, e.id DESC
       LIMIT ${limit}
+      OFFSET ${offset}
     `;
-    return (rows as ThreadListItem[]).map(normalizeThreadListItem);
+    const total = Number((countRows as Array<{ total?: unknown }>)[0]?.total ?? 0);
+    return {
+      threads: (rows as ThreadListItem[]).map(normalizeThreadListItem),
+      total: Number.isFinite(total) ? total : 0,
+    };
   }
 
   // ── Audit log ────────────────────────────────────────────────────────
