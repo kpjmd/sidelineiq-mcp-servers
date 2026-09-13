@@ -112,11 +112,11 @@ describe("tools/list is byte-identical under strict and strip", () => {
     });
   }
 
-  it("covers all 72 tools", async () => {
+  it("covers all 78 tools", async () => {
     const counts = await Promise.all(
       Object.values(REGISTRARS).map((r) => connect(r, "strict").then((c) => c.listTools())),
     );
-    expect(counts.reduce((n, l) => n + l.tools.length, 0)).toBe(72);
+    expect(counts.reduce((n, l) => n + l.tools.length, 0)).toBe(78);
   });
 });
 

@@ -119,6 +119,27 @@ export function registerFarcasterTools(server: McpServer): void {
     },
   );
 
+  // ── farcaster_get_profile_stats ─────────────────────────────────────
+  server.tool(
+    "farcaster_get_profile_stats",
+    "Read the SidelineIQ Farcaster account's own follower and following counts via Neynar /user/bulk, for the FID in SIDELINEIQ_FARCASTER_FID. Used by the daily baseline metrics snapshot. Fails with an error rather than returning 0 when the counts cannot be read.",
+    {},
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    async () => {
+      try {
+        const result = await client.getProfileStats();
+        return toolSuccess(result);
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
   // ── farcaster_get_notifications ─────────────────────────────────────
   server.tool(
     "farcaster_get_notifications",

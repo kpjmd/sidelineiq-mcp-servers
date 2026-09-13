@@ -102,6 +102,27 @@ export function registerTwitterTools(server: McpServer): void {
     },
   );
 
+  // ── twitter_get_profile_stats ──────────────────────────────────────
+  server.tool(
+    "twitter_get_profile_stats",
+    "Read the authenticated SidelineIQ X account's own follower, following and post counts (GET /2/users/me). Used by the daily baseline metrics snapshot. Fails with an error rather than returning 0 when the counts cannot be read.",
+    {},
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    async () => {
+      try {
+        const result = await client.getProfileStats();
+        return toolSuccess(result);
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
   // ── twitter_get_mentions ────────────────────────────────────────────
   server.tool(
     "twitter_get_mentions",

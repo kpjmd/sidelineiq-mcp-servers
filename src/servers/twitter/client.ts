@@ -39,6 +39,14 @@ export interface GetMentionsResult {
   newestId?: string;
 }
 
+export interface TwitterProfileStats {
+  id: string;
+  username: string;
+  followers_count: number;
+  following_count: number;
+  tweet_count: number;
+}
+
 export class TwitterClient {
   private client: TwitterApi;
 
@@ -89,6 +97,35 @@ export class TwitterClient {
         },
       };
     } catch (err: unknown) {
+      this.handleTwitterError(err);
+    }
+  }
+
+  // The authenticated account's own counts (GET /2/users/me), for the baseline
+  // metrics series. A missing or non-numeric count THROWS rather than
+  // defaulting: the caller records a reading only on success.
+  async getProfileStats(): Promise<TwitterProfileStats> {
+    try {
+      const result = await this.client.v2.me({ "user.fields": ["public_metrics"] });
+      const metrics = result.data.public_metrics;
+      const followers = metrics?.followers_count;
+      const following = metrics?.following_count;
+      const tweets = metrics?.tweet_count;
+      if (!isCount(followers) || !isCount(following) || !isCount(tweets)) {
+        throw new McpToolError(
+          "Twitter users/me returned no numeric public_metrics",
+          "Confirm user.fields=public_metrics is honoured; re-record tests/fixtures/x-users-me.json.",
+        );
+      }
+      return {
+        id: result.data.id,
+        username: result.data.username,
+        followers_count: followers,
+        following_count: following,
+        tweet_count: tweets,
+      };
+    } catch (err: unknown) {
+      if (err instanceof McpToolError) throw err;
       this.handleTwitterError(err);
     }
   }
@@ -200,4 +237,8 @@ export class TwitterClient {
       err,
     );
   }
+}
+
+function isCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
 }

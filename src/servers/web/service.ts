@@ -15,6 +15,9 @@ import type { LintFinding } from "./linter.js";
 import type {
   AccuracyRecord,
   AttestInput,
+  CtaClickRow,
+  CtaClickSummary,
+  CtaLink,
   DeskAttestation,
   DeskPost,
   OtmProjection,
@@ -143,4 +146,29 @@ export function slugify(raw: string, maxLen = 200, fallback = ""): string {
     .replace(/^-|-$/g, "")
     .slice(0, maxLen);
   return slug || fallback;
+}
+
+// ── CTA click summary ──────────────────────────────────────────────────
+// Totals for the admin Metrics tab. Pure, so the arithmetic is testable
+// without a database. `by_link` always carries both keys: a link with no rows
+// is a genuine zero here — the row set is complete for the window, unlike a
+// failed follower read, which writes no row at all.
+export function summarizeCtaClicks(rows: CtaClickRow[]): CtaClickSummary {
+  const byLink: Record<CtaLink, number> = { cta: 0, byline: 0 };
+  const byPost = new Map<string, number>();
+  let total = 0;
+  for (const row of rows) {
+    const clicks = Number(row.clicks);
+    total += clicks;
+    byLink[row.link] += clicks;
+    byPost.set(row.post_slug, (byPost.get(row.post_slug) ?? 0) + clicks);
+  }
+  return {
+    rows,
+    total,
+    by_link: byLink,
+    by_post: [...byPost.entries()]
+      .map(([post_slug, clicks]) => ({ post_slug, clicks }))
+      .sort((a, b) => b.clicks - a.clicks || a.post_slug.localeCompare(b.post_slug)),
+  };
 }

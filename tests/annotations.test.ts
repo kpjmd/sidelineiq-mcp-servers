@@ -116,6 +116,12 @@ const WEB: Record<string, Hints> = {
   web_purge_all_posts: [false, true, true, false],
   web_get_social_state: READ,
   web_set_social_state: [false, false, true, false],
+  // Upsert on (metric, day): a replay rewrites the same reading.
+  web_record_metric_snapshot: [false, false, true, false],
+  web_list_metric_snapshots: READ,
+  // A counter: every call adds one, so a replay double-counts.
+  web_increment_cta_click: [false, false, false, false],
+  web_list_cta_clicks: READ,
   web_check_mention_processed: READ,
   web_insert_processed_mention: [false, false, true, false],
   web_insert_pending_correction: [false, false, false, false],
@@ -188,6 +194,7 @@ const FARCASTER: Record<string, Hints> = {
   farcaster_publish_thread: [false, false, false, true],
   farcaster_get_cast: READ_OPEN,
   farcaster_get_notifications: READ_OPEN,
+  farcaster_get_profile_stats: READ_OPEN,
   // Irreversible externally, but re-deleting the same hash converges.
   farcaster_delete_cast: [false, true, true, true],
 };
@@ -197,13 +204,14 @@ const TWITTER: Record<string, Hints> = {
   twitter_publish_thread: [false, false, false, true],
   twitter_get_tweet: READ_OPEN,
   twitter_get_mentions: READ_OPEN,
+  twitter_get_profile_stats: READ_OPEN,
   twitter_delete_tweet: [false, true, true, true],
 };
 
 const SERVERS = [
-  { label: "web", register: registerWebTools, expected: WEB, count: 62 },
-  { label: "farcaster", register: registerFarcasterTools, expected: FARCASTER, count: 5 },
-  { label: "twitter", register: registerTwitterTools, expected: TWITTER, count: 5 },
+  { label: "web", register: registerWebTools, expected: WEB, count: 66 },
+  { label: "farcaster", register: registerFarcasterTools, expected: FARCASTER, count: 6 },
+  { label: "twitter", register: registerTwitterTools, expected: TWITTER, count: 6 },
 ] as const;
 
 const HINT_KEYS = [
@@ -252,12 +260,12 @@ describe.each(SERVERS)("$label tool annotations", ({ register, expected, count }
 });
 
 describe("annotation coverage across all servers", () => {
-  it("covers all 72 tools", () => {
+  it("covers all 78 tools", () => {
     const total = SERVERS.reduce(
       (sum, { register }) => sum + Object.keys(annotationsByTool(register)).length,
       0,
     );
 
-    expect(total).toBe(72);
+    expect(total).toBe(78);
   });
 });
