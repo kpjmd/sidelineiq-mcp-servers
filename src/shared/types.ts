@@ -44,6 +44,9 @@ export interface ReturnToPlayEstimate {
   confidence: number;
 }
 
+/** Migration 023. INJURY_TYPE is the only value that permits the commercial CTA. */
+export type SubjectKind = 'INJURY_TYPE' | 'ATHLETE';
+
 export interface InjuryPost {
   id: string;
   athlete_name: string;
@@ -73,6 +76,8 @@ export interface InjuryPost {
   conflict_reason: string | null;
   team_timeline_weeks: number | null;
   injury_date: string | null;
+  /** Who the post is about. NULL = not recorded (pre-023). See migration 023. */
+  subject_kind: SubjectKind | null;
   /** Set when status is REJECTED or SUPERSEDED. See migration 021. */
   retired_at: string | null;
   retirement_reason: string | null;
