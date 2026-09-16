@@ -152,6 +152,10 @@ const WEB: Record<string, Hints> = {
   web_thread_update_dates: [false, false, true, false],
   web_thread_append_timeline: [false, false, false, false],
   web_thread_close: [false, false, true, false],
+  // NOT idempotent: it clears five columns and appends an audit row, and a
+  // second call is rejected outright because the thread is ACTIVE by then. A
+  // replay is a refusal, not a no-op, and the annotation should say so.
+  web_thread_reopen: [false, false, false, false],
   // Writes one column plus an audit row; re-correcting to the stored value
   // writes nothing at all, so a replay is genuinely a no-op.
   web_thread_correct_laterality: [false, false, true, false],
@@ -209,7 +213,7 @@ const TWITTER: Record<string, Hints> = {
 };
 
 const SERVERS = [
-  { label: "web", register: registerWebTools, expected: WEB, count: 66 },
+  { label: "web", register: registerWebTools, expected: WEB, count: 67 },
   { label: "farcaster", register: registerFarcasterTools, expected: FARCASTER, count: 6 },
   { label: "twitter", register: registerTwitterTools, expected: TWITTER, count: 6 },
 ] as const;
@@ -260,12 +264,12 @@ describe.each(SERVERS)("$label tool annotations", ({ register, expected, count }
 });
 
 describe("annotation coverage across all servers", () => {
-  it("covers all 78 tools", () => {
+  it("covers all 79 tools", () => {
     const total = SERVERS.reduce(
       (sum, { register }) => sum + Object.keys(annotationsByTool(register)).length,
       0,
     );
 
-    expect(total).toBe(78);
+    expect(total).toBe(79);
   });
 });

@@ -189,6 +189,59 @@ Side effect worth knowing: `computeAccuracyRecord` scores `error_days` off the f
 `projected_return_date` while `within_range` uses the live `injury_date`. The
 re-anchor keeps those two consistent for every row written after this shipped.
 
+### A close is not the end of the argument
+
+`web_thread_close` used to be the one write in this server that nothing checked.
+It would overwrite any `actual_return_date`, close a VOID thread, re-close a
+settled one, and — because `computeAccuracyRecord` returned null with no
+`otm_projection` — ERASE an accuracy record on the way past. All four were
+harmless for as long as only a person ever closed a thread, one at a time,
+knowing they had done it. The agents' return detector closes threads on a timer,
+which changes the shape of every one of those mistakes.
+
+**`return_source` (migration 025) is the missing half of the `md_manual` rule.**
+`date_resolution_sources` documents the injury and surgery dates only; nothing
+recorded where a RETURN date came from, so the guard above had nothing to key on.
+The column is backfilled to `'md'` because, as of 2026-09-15, every return date
+in the table was typed by a person. A system caller may not overwrite a stored
+`'md'` date: the write is dropped, logged, and audited as
+`md_return_write_refused` while **the close itself still proceeds** — refusing
+the date must not leave the thread ACTIVE forever.
+
+This matters more than the `injury_date` version. A wrong `injury_date` is
+revisited every cycle by the next feed event; a closed thread leaves ACTIVE and
+`web_find_matching_entity` never looks at it again, so nothing here is
+self-correcting.
+
+**Three refusals**, each mirroring a guard that already existed one tool over:
+a VOID thread cannot be closed at all (`correctThreadLaterality` has refused
+VOID since it shipped — closing one RESOLVED would score a projection built on a
+wrong athlete, which is what migration 020 exists to prevent); a **system**
+caller may only close an ACTIVE thread (a human may still re-close their own);
+and `computeAccuracyRecord` now **always returns a record**, so the erase is
+structurally unreachable rather than merely unlikely.
+
+**`accuracy_record.scoreable`** carries that last change. Every other field is
+nullable, so a reader could not tell "the projection was wrong" from "we never
+had the inputs" — and an accuracy page that drops the second kind while counting
+the first in its denominator is reporting a different number than the one it
+names. `scoreable: false` names the missing input (`no_projection`,
+`no_injury_date`, `no_actual_return_date`). It is **absent** on every row written
+before 2026-09-15: readers must treat `scoreable === undefined` as "derive it"
+(the historical equivalent is `within_range != null`), never as `false`.
+`scoreable` tracks `within_range`, the headline metric — `error_days` may be null
+on a scoreable record, which is why the median-signed-error metric carries its
+own n.
+
+**`web_thread_reopen` is the undo.** Until it shipped, `status` could never
+return to `'ACTIVE'` through any tool in any of the three repos, so a wrong close
+was repairable only by hand-written SQL against production, with no audit row. It
+clears everything the close wrote — a half-reopened thread is worse than either
+state, because an accuracy view would still score its stale record. VOID is
+deliberately not reopenable, and it does not touch `last_updated_at`: a thread
+reopened outside the 21-day matching window must not start absorbing reports
+again because we fixed our own mistake.
+
 ### An unknown input key is an error, not a dropped field
 
 Every tool registers a raw zod shape, which the SDK wraps in a plain `z.object`
@@ -205,7 +258,8 @@ every depth, cloning wrapper defs so `.describe()` text survives. `z.record` /
 `MCP_UNKNOWN_KEYS=strict|strip`, default strict; only an explicit `strip`
 reopens it. tools/list is byte-identical under both modes — strict changes what
 is ENFORCED, not what is ADVERTISED; `tests/input-key-policy.test.ts` pins that
-for all 71 tools.
+for all of them (79 as of 2026-09-15; the number is pinned in that test and in
+`tests/annotations.test.ts`, so adding a tool means three edits, not one).
 
 Before it shipped (2026-09-11) every caller was audited: all 123 agents call
 sites, all 33 frontend ones, and a replay of every payload the agents test suite
