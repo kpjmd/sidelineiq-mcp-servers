@@ -324,6 +324,19 @@ export interface OtmProjection {
   created_at?: string;
 }
 
+/**
+ * Provenance of injury_entities.actual_return_date (migration 025).
+ * 'detector' — src/monitoring/return-detector.ts in the agents repo.
+ * 'md'       — a person, through the dashboard or a hand-run close.
+ * 'backfill' — a retrospective script.
+ */
+export type ReturnSource = "detector" | "md" | "backfill";
+
+export type UnscoreableReason =
+  | "no_projection"
+  | "no_injury_date"
+  | "no_actual_return_date";
+
 export interface AccuracyRecord {
   projected_return_date: string | null;
   actual_return_date: string | null;
@@ -331,6 +344,22 @@ export interface AccuracyRecord {
   within_range: boolean | null;
   otm_min_weeks: number | null;
   otm_max_weeks: number | null;
+  /**
+   * Whether this record can be counted in an accuracy number at all.
+   *
+   * Every field above is nullable, so a reader could not tell "the projection
+   * was wrong" from "we never had the inputs to score it" — and an accuracy
+   * page that drops the second kind while counting the first in its
+   * denominator reports a different number than the one it names.
+   * `scoreable: false` names the missing input instead of going quiet.
+   *
+   * ABSENT on every row written before 2026-09-15. Readers must treat
+   * `scoreable === undefined` as "derive it" — the historical equivalent is
+   * `within_range != null` — and never as `false`.
+   */
+  scoreable?: boolean;
+  /** Set only when `scoreable` is false. */
+  unscoreable_reason?: UnscoreableReason;
 }
 
 export interface InjuryEntity {
@@ -358,6 +387,10 @@ export interface InjuryEntity {
   needs_date_review: boolean;
   // Migration 020. Non-null only on status VOID.
   void_reason: string | null;
+  // Who set actual_return_date (migration 025). NULL on every row written
+  // before it, and on any close that recorded no date. 'md' is the only value
+  // that blocks a system write — see closeThread.
+  return_source: ReturnSource | null;
 }
 
 // A thread row joined with player/team display fields for the MD dashboard list.
@@ -387,9 +420,18 @@ export interface ThreadListItem {
   // was minted before any post existed.
   canonical_post_id: string | null;
   actual_return_date: string | null;
+  // Provenance of actual_return_date (migration 025). ABSENT on a server that
+  // predates it, which is why the return detector treats an undefined here as
+  // "unknown", never as "not md".
+  return_source: ReturnSource | null;
   returned_at: string | null;
   closed_at: string | null;
   void_reason: string | null;
+  // The athlete's ESPN id, off the players join. The detector needs it to build
+  // a gamelog URL, and a thread carrying player_id and a name alone gives it no
+  // way to reach ESPN — a name lookup would resolve the misspellings the
+  // roster is deliberately keyed on.
+  espn_athlete_id: string | null;
   first_reported_at: string;
   last_updated_at: string;
 }
@@ -2305,6 +2347,7 @@ export class WebDatabaseClient {
     outcome?: "RESOLVED" | "RETIRED" | "VOID";
     closed_by?: string;
     void_reason?: string;
+    return_source?: ReturnSource;
   }): Promise<InjuryEntity> {
     const entity = await this.getEntity(input.entity_id);
     if (!entity) {
@@ -2314,6 +2357,35 @@ export class WebDatabaseClient {
       );
     }
     const outcome = input.outcome ?? "RESOLVED";
+    // Mirrors the audit actor derivation at the bottom of this method: anything
+    // but an explicit non-"system" caller is a machine.
+    const callerIsSystem = !input.closed_by || input.closed_by === "system";
+
+    // A VOID thread is a retraction — it asserts the injury was never real, so
+    // there is nothing to resolve and nothing to score. Closing one RESOLVED
+    // would write an accuracy_record against a projection built on a wrong body
+    // part or a wrong athlete, which is the exact pollution migration 020 exists
+    // to prevent. correctThreadLaterality already refuses VOID for the same
+    // reason; this is that guard, one tool over.
+    if (entity.status === "VOID") {
+      throw new McpToolError(
+        `Injury thread ${input.entity_id} is VOID and cannot be closed`,
+        "A retracted thread stays retracted. If the athlete really was injured, the next report opens a fresh thread.",
+      );
+    }
+
+    // Re-closing used to be free: it re-stamped closed_at and recomputed the
+    // accuracy_record in place. That is fine when a person does it deliberately
+    // and wrong when a machine does it on a timer — the return detector visits
+    // the corpus every cycle, and a retry would churn closed_at and the audit
+    // trail on threads whose outcome was settled weeks ago. A human may still
+    // correct their own close.
+    if (entity.status !== "ACTIVE" && callerIsSystem) {
+      throw new McpToolError(
+        `Injury thread ${input.entity_id} is already ${entity.status}`,
+        "A system caller may only close an ACTIVE thread. To change a settled outcome, reopen the thread (web_thread_reopen) or close it as an MD.",
+      );
+    }
     // VOID says the thread was never a real injury record, so there is nothing
     // to score and no return to stamp. Writing an accuracy_record here would
     // grade a projection built on a wrong body part / wrong athlete and drag
@@ -2331,16 +2403,46 @@ export class WebDatabaseClient {
         "Use outcome VOID to retract a thread that should not exist, or drop void_reason.",
       );
     }
+    // ── The MD's return date is not re-derived ──────────────────────────
+    // Same rule updateThreadDates applies to injury_date, and for the same
+    // reason: the physician's value is the only one backed by a person who read
+    // the case. It matters more here than there, because a closed thread leaves
+    // ACTIVE and no feed event ever visits it again — a machine overwrite of a
+    // hand-entered return date is not self-correcting. The guard keys on WHO is
+    // writing, so an MD can always correct their own correction.
+    const deferToMd = entity.return_source === "md" && callerIsSystem;
+    const requestedActual = deferToMd ? undefined : input.actual_return_date;
+
     // entity dates are already normalized to 'YYYY-MM-DD' by getEntity; the pure
     // service functions accept strings or Dates either way.
-    const actualIso = isVoid ? null : resolveActualIso(entity, input.actual_return_date);
+    const actualIso = isVoid ? null : resolveActualIso(entity, requestedActual);
+    // Non-null for every non-VOID close now: a thread with no otm_projection
+    // gets a record saying `scoreable: false` rather than a NULL that reads as
+    // "never closed". The old unconditional assignment could also ERASE a good
+    // record on a re-close; it no longer can, because this is never null.
     const accuracy = isVoid ? null : computeAccuracyRecord(entity, actualIso);
     const voidReason = isVoid ? (input.void_reason ?? null) : null;
+
+    // Only stamp provenance when this call actually supplies a date. An omitted
+    // actual_return_date leaves both the date and its source alone (COALESCE).
+    const returnSourceIn =
+      !isVoid && !deferToMd && input.actual_return_date != null
+        ? (input.return_source ?? (callerIsSystem ? "detector" : "md"))
+        : null;
+
+    // Interesting only when the machine wanted a DIFFERENT date; re-deriving
+    // the same value is the normal, silent case.
+    const refusedReturnDate =
+      deferToMd &&
+      input.actual_return_date != null &&
+      (entity.actual_return_date == null ||
+        toIsoDate(input.actual_return_date) !== toIsoDate(entity.actual_return_date));
 
     const rows = await this.sql`
       UPDATE injury_entities SET
         status = ${outcome},
         actual_return_date = COALESCE(${actualIso}::date, actual_return_date),
+        return_source = COALESCE(${returnSourceIn}, return_source),
         accuracy_record = ${accuracy ? JSON.stringify(accuracy) : null}::jsonb,
         void_reason = ${voidReason},
         returned_at = CASE WHEN ${outcome} = 'RESOLVED' THEN NOW() ELSE returned_at END,
@@ -2351,6 +2453,39 @@ export class WebDatabaseClient {
       RETURNING *
     `;
     const closed = normalizeEntityDates(rows[0] as InjuryEntity);
+
+    if (refusedReturnDate) {
+      // Durable and greppable, because silence is what made the injury_date
+      // version of this bug expensive to find: the write simply had not saved,
+      // with no log line and no audit row.
+      console.warn(
+        `[Thread] ${input.entity_id} — kept the MD's actual_return_date ` +
+          `${entity.actual_return_date ? toIsoDate(entity.actual_return_date) : "(none)"} over a system write of ` +
+          `${toIsoDate(input.actual_return_date!)}. A hand-set return date is not re-derived.`,
+      );
+      // Best-effort: the GUARD is the guarantee, the record of it is not.
+      try {
+        await this.auditAppend({
+          actor: "system",
+          entity_type: "injury_thread",
+          entity_id: input.entity_id,
+          action: "md_return_write_refused",
+          before: { actual_return_date: entity.actual_return_date ?? null },
+          after: { actual_return_date: entity.actual_return_date ?? null },
+          payload: {
+            kept_actual_return_date: entity.actual_return_date
+              ? toIsoDate(entity.actual_return_date)
+              : null,
+            refused_actual_return_date: toIsoDate(input.actual_return_date!),
+            reason: "stored return_source is md; caller is system",
+          },
+        });
+      } catch (err) {
+        console.warn(
+          `[Thread] ${input.entity_id} — could not record md_return_write_refused: ${String(err)}`,
+        );
+      }
+    }
 
     await this.auditAppend({
       actor: input.closed_by && input.closed_by !== "system" ? "md" : "system",
@@ -2364,7 +2499,12 @@ export class WebDatabaseClient {
       after: closed,
       payload: isVoid
         ? { outcome, void_reason: voidReason }
-        : { outcome, actual_return_date: actualIso, accuracy_record: accuracy },
+        : {
+            outcome,
+            actual_return_date: actualIso,
+            return_source: returnSourceIn ?? entity.return_source ?? null,
+            accuracy_record: accuracy,
+          },
     });
 
     return closed;
@@ -2451,6 +2591,97 @@ export class WebDatabaseClient {
     return { entity: corrected, changed: true, previous_laterality: previous };
   }
 
+  /**
+   * Reopen a closed thread — the undo for a wrong close.
+   *
+   * Until this shipped, `status` could never go back to 'ACTIVE' through any
+   * tool in any of the three repos. That was survivable while only a person
+   * ever closed a thread, because a person closes one thread at a time and
+   * knows they did it. A return detector on a timer changes the shape of the
+   * mistake: it can close the wrong thread, on its own, at three in the
+   * morning, and the only repair was hand-written SQL against production with
+   * no audit row. A machine must not be able to write something a human cannot
+   * take back.
+   *
+   * Clears everything the close wrote — actual_return_date, return_source,
+   * returned_at, closed_at, accuracy_record — because a half-reopened thread is
+   * worse than either state: it would sit ACTIVE while an accuracy view still
+   * scored its stale record.
+   *
+   * VOID is deliberately NOT reopenable. A retraction says the thread never
+   * described a real injury; if the athlete really was hurt, the next report
+   * opens a fresh thread through the normal path, which is both cheaper and
+   * more honest than resurrecting a row we already said was wrong.
+   *
+   * Deliberately does NOT touch last_updated_at — same argument as
+   * correctThreadLaterality. That column drives web_find_matching_entity's
+   * 21-day window, and reopening is a correction of our own bookkeeping, not
+   * new injury activity. A thread reopened outside the window should not start
+   * absorbing reports again just because we fixed a mistake.
+   */
+  async reopenThread(input: {
+    entity_id: string;
+    reopened_by: string;
+    reason: string;
+  }): Promise<{ entity: InjuryEntity; previous_status: EntityStatus }> {
+    const entity = await this.getEntity(input.entity_id);
+    if (!entity) {
+      throw new McpToolError(
+        `Injury thread ${input.entity_id} not found`,
+        "Verify the entity_id. web_list_threads will give you a valid one.",
+      );
+    }
+    if (entity.status === "ACTIVE") {
+      throw new McpToolError(
+        `Injury thread ${input.entity_id} is already ACTIVE`,
+        "Nothing to reopen.",
+      );
+    }
+    if (entity.status === "VOID") {
+      throw new McpToolError(
+        `Injury thread ${input.entity_id} is VOID and cannot be reopened`,
+        "A retracted thread stays retracted. If the athlete really was injured, let the next report open a fresh thread.",
+      );
+    }
+
+    const previous = entity.status;
+    const rows = await this.sql`
+      UPDATE injury_entities SET
+        status = 'ACTIVE',
+        actual_return_date = NULL,
+        return_source = NULL,
+        accuracy_record = NULL,
+        returned_at = NULL,
+        closed_at = NULL,
+        updated_at = NOW()
+      WHERE id = ${input.entity_id}
+      RETURNING *
+    `;
+    const reopened = normalizeEntityDates(rows[0] as InjuryEntity);
+
+    await this.auditAppend({
+      actor: input.reopened_by === "system" ? "system" : "md",
+      actor_id: input.reopened_by,
+      entity_type: "injury_thread",
+      entity_id: input.entity_id,
+      action: "thread_reopened",
+      before: entity,
+      after: reopened,
+      // before/after are stored only as hashes, so the readable diff — the
+      // thing someone auditing a wrong close actually needs — lives here.
+      payload: {
+        previous_status: previous,
+        cleared_actual_return_date: entity.actual_return_date ?? null,
+        cleared_return_source: entity.return_source ?? null,
+        cleared_accuracy_record: entity.accuracy_record ?? null,
+        reason: input.reason,
+        reopened_by: input.reopened_by,
+      },
+    });
+
+    return { entity: reopened, previous_status: previous };
+  }
+
   async getThread(
     entityId: string,
   ): Promise<{ entity: InjuryEntity; updates: InjuryUpdate[] } | null> {
@@ -2469,11 +2700,17 @@ export class WebDatabaseClient {
   // key may repeat or skip a row at each page boundary.
   async listThreads(input: {
     status?: EntityStatus;
+    sport?: string;
     needs_date_review?: boolean;
     limit?: number;
     offset?: number;
   }): Promise<{ threads: ThreadListItem[]; total: number }> {
     const status = input.status ?? null;
+    // Sport lives on players, not entities, and the join is already here. It
+    // was projected but not filterable, so a caller scoped to one sport — the
+    // return detector is NFL/NBA only — had to page the whole ACTIVE corpus
+    // and throw most of it away.
+    const sport = input.sport ?? null;
     const needsReview = input.needs_date_review ?? null;
     const limit = input.limit ?? 100;
     const offset = input.offset ?? 0;
@@ -2482,6 +2719,7 @@ export class WebDatabaseClient {
       FROM injury_entities e
       JOIN players p ON p.id = e.player_id
       WHERE (${status}::text IS NULL OR e.status = ${status})
+        AND (${sport}::text IS NULL OR p.sport = ${sport})
         AND (${needsReview}::boolean IS NULL OR e.needs_date_review = ${needsReview})
     `;
     const rows = await this.sql`
@@ -2490,13 +2728,16 @@ export class WebDatabaseClient {
              e.needs_date_review, e.otm_projection, e.accuracy_record,
              e.date_resolution_sources, e.canonical_post_id,
              e.actual_return_date, e.returned_at, e.closed_at, e.void_reason,
+             e.return_source,
              e.first_reported_at, e.last_updated_at,
              p.full_name AS athlete_name, p.sport AS sport,
+             p.espn_athlete_id AS espn_athlete_id,
              t.display_name AS team_name
       FROM injury_entities e
       JOIN players p ON p.id = e.player_id
       LEFT JOIN teams t ON t.id = p.current_team_id
       WHERE (${status}::text IS NULL OR e.status = ${status})
+        AND (${sport}::text IS NULL OR p.sport = ${sport})
         AND (${needsReview}::boolean IS NULL OR e.needs_date_review = ${needsReview})
       ORDER BY e.last_updated_at DESC, e.id DESC
       LIMIT ${limit}

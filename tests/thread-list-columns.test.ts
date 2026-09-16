@@ -82,6 +82,27 @@ describe("web_list_threads column projection", () => {
     const sql = stmt(call as unknown[]);
     expect(sql).toContain("e.date_resolution_sources");
     expect(sql).toContain("e.canonical_post_id");
+    // Migration 025 / the return detector: without espn_athlete_id a caller
+    // holding a thread has no way to reach ESPN for that athlete, and without
+    // return_source it cannot tell a physician's return date from a detected
+    // one — both would otherwise cost a read per thread.
+    expect(sql).toContain("p.espn_athlete_id");
+    expect(sql).toContain("e.return_source");
+  });
+
+  it("filters by sport on both the page and the count", async () => {
+    await tool("web_list_threads").handler(
+      { status: "ACTIVE", sport: "NFL", limit: 100, offset: 0 },
+      {},
+    );
+    const entityCalls = mockSql.mock.calls.filter((c) => /FROM injury_entities e/i.test(stmt(c)));
+    // Two statements: the page and the COUNT. A filter applied to only one of
+    // them makes `total` disagree with the rows and silently breaks has_more.
+    expect(entityCalls).toHaveLength(2);
+    for (const c of entityCalls) {
+      expect(stmt(c)).toContain("p.sport =");
+      expect(c.slice(1)).toContain("NFL");
+    }
   });
 
   it("returns both fields on the row it hands back", async () => {

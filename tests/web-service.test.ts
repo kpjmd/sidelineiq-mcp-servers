@@ -162,9 +162,35 @@ describe("service", () => {
       projected_return_date: "2026-03-01",
     };
 
-    it("returns null when the entity has no projection", () => {
+    // It used to return null here, which closeThread wrote as a NULL
+    // accuracy_record — indistinguishable from a thread that was never closed.
+    // A record naming the missing input is legible to anyone counting.
+    it("returns an unscoreable record when the entity has no projection", () => {
       const entity = { otm_projection: null, injury_date: "2026-01-01" } as unknown as InjuryEntity;
-      expect(computeAccuracyRecord(entity, "2026-03-01")).toBeNull();
+      const rec = computeAccuracyRecord(entity, "2026-03-01");
+      expect(rec).not.toBeNull();
+      expect(rec.scoreable).toBe(false);
+      expect(rec.unscoreable_reason).toBe("no_projection");
+      // The return itself is still recorded — it is a fact even when unscoreable.
+      expect(rec.actual_return_date).toBe("2026-03-01");
+      expect(rec.within_range).toBeNull();
+    });
+
+    it("marks a scoreable record and names the missing input otherwise", () => {
+      const withDate = { otm_projection: projection, injury_date: "2026-01-01" } as unknown as InjuryEntity;
+      expect(computeAccuracyRecord(withDate, "2026-02-10").scoreable).toBe(true);
+
+      // No injury_date means no window to fall inside, so within_range is null
+      // and the record must say why rather than read as a miss.
+      const noInjuryDate = { otm_projection: projection, injury_date: null } as unknown as InjuryEntity;
+      const rec = computeAccuracyRecord(noInjuryDate, "2026-02-10");
+      expect(rec.scoreable).toBe(false);
+      expect(rec.unscoreable_reason).toBe("no_injury_date");
+
+      // A RETIRED close records no return at all.
+      const noActual = computeAccuracyRecord(withDate, null);
+      expect(noActual.scoreable).toBe(false);
+      expect(noActual.unscoreable_reason).toBe("no_actual_return_date");
     });
 
     it("computes error_days from projected vs actual", () => {

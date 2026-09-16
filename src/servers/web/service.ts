@@ -22,6 +22,7 @@ import type {
   DeskPost,
   OtmProjection,
   PublishGate,
+  UnscoreableReason,
   User,
 } from "./client.js";
 
@@ -67,14 +68,39 @@ export function resolveActualIso(
 }
 
 // Compute the frozen accuracy_record from the entity's otm_projection vs the
-// resolved actual return. Returns null when there is no projection to score
-// against. Pure: all inputs may be Date objects or strings (see toIsoDate).
+// resolved actual return. Pure: all inputs may be Date objects or strings
+// (see toIsoDate).
+//
+// It ALWAYS returns a record now, where it used to return null whenever the
+// thread carried no otm_projection. A null accuracy_record and a record that
+// says `scoreable: false, unscoreable_reason: 'no_projection'` describe the
+// same thread, but only the second one is legible to a reader counting an
+// accuracy number: the first is indistinguishable from "this thread was never
+// closed". Callers that must write nothing at all — VOID — decide that
+// themselves; see closeThread.
+//
+// `scoreable` is defined as "within_range could be computed", because
+// within_range is the headline metric (monetization plan, Phase 2) and its
+// denominator is the number the platform is judged on. error_days is allowed
+// to be null on a scoreable record: the secondary median-signed-error metric
+// carries its own n for exactly that reason.
 export function computeAccuracyRecord(
   entity: Pick<import("./client.js").InjuryEntity, "otm_projection" | "injury_date">,
   actualIso: string | null,
-): AccuracyRecord | null {
+): AccuracyRecord {
   const proj: OtmProjection | null = entity.otm_projection;
-  if (!proj) return null;
+  if (!proj) {
+    return {
+      projected_return_date: null,
+      actual_return_date: actualIso,
+      error_days: null,
+      within_range: null,
+      otm_min_weeks: null,
+      otm_max_weeks: null,
+      scoreable: false,
+      unscoreable_reason: "no_projection",
+    };
+  }
 
   const projected = proj.projected_return_date ? toIsoDate(proj.projected_return_date) : null;
   const errorDays = actualIso && projected ? daysBetween(projected, actualIso) : null;
@@ -86,6 +112,15 @@ export function computeAccuracyRecord(
     withinRange = actualIso >= minReturn && actualIso <= maxReturn;
   }
 
+  // Precedence matters only for the label, not the verdict: a record missing
+  // both inputs is reported by the one a human would fix first.
+  const unscoreableReason: UnscoreableReason | null =
+    withinRange !== null
+      ? null
+      : actualIso == null
+        ? "no_actual_return_date"
+        : "no_injury_date";
+
   return {
     projected_return_date: projected,
     actual_return_date: actualIso,
@@ -93,6 +128,8 @@ export function computeAccuracyRecord(
     within_range: withinRange,
     otm_min_weeks: proj.min_weeks ?? null,
     otm_max_weeks: proj.max_weeks ?? null,
+    scoreable: unscoreableReason === null,
+    ...(unscoreableReason ? { unscoreable_reason: unscoreableReason } : {}),
   };
 }
 

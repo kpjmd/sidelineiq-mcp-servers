@@ -1581,12 +1581,23 @@ export function registerWebTools(server: McpServer): void {
   // ── web_thread_close ────────────────────────────────────────────────
   server.tool(
     "web_thread_close",
-    "Close an injury thread when the athlete returns (RESOLVED) or retires (RETIRED), or retract one that should never have existed (VOID). RESOLVED/RETIRED record actual_return_date and compute accuracy_record against the stored otm_projection. VOID does neither — it means the thread describes an injury we got wrong (wrong body part, wrong athlete, rejected post), so there is nothing to score; pass void_reason instead. All outcomes stamp closed_at, write an audit entry (thread_closed / thread_voided) and take the thread out of web_find_matching_entity, which only matches ACTIVE. Idempotent: re-closing recomputes in place.",
+    "Close an injury thread when the athlete returns (RESOLVED) or retires (RETIRED), or retract one that should never have existed (VOID). RESOLVED/RETIRED record actual_return_date and compute accuracy_record against the stored otm_projection; a thread with no projection now gets a record saying scoreable:false rather than a NULL that reads as 'never closed'. VOID does neither — it means the thread describes an injury we got wrong (wrong body part, wrong athlete, rejected post), so there is nothing to score; pass void_reason instead. All outcomes stamp closed_at, write an audit entry (thread_closed / thread_voided) and take the thread out of web_find_matching_entity, which only matches ACTIVE. REFUSALS: a VOID thread cannot be closed at all; a system caller (closed_by omitted or 'system') may only close an ACTIVE thread, and may not overwrite an actual_return_date whose stored return_source is 'md' — that write is dropped, logged, and audited as md_return_write_refused while the rest of the close proceeds. To change a settled outcome, reopen it with web_thread_reopen or close it as a named MD.",
     {
       entity_id: z.string().uuid(),
       actual_return_date: z.string().date().optional(),
       outcome: z.enum(["RESOLVED", "RETIRED", "VOID"]).default("RESOLVED"),
-      closed_by: z.string().optional(),
+      closed_by: z
+        .string()
+        .optional()
+        .describe(
+          "Who closed it. The literal 'system' (or omitted) means a machine: it stamps the audit actor as system AND subjects this call to the system-caller refusals above. Any other value is treated as a physician.",
+        ),
+      return_source: z
+        .enum(["detector", "md", "backfill"])
+        .optional()
+        .describe(
+          "Provenance of actual_return_date (migration 025). Defaults to 'detector' for a system caller and 'md' otherwise. Only written when this call supplies a date; 'md' is the value that blocks a later system overwrite.",
+        ),
       void_reason: z
         .string()
         .min(1)
@@ -1603,6 +1614,42 @@ export function registerWebTools(server: McpServer): void {
       try {
         const entity = await client.closeThread(input);
         return toolSuccess({ entity });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── web_thread_reopen ───────────────────────────────────────────────
+  // The undo for a wrong close. Until this shipped, status could never return
+  // to ACTIVE through any tool in any repo — survivable while only a person
+  // closed threads, and not survivable once a detector closes them on a timer.
+  server.tool(
+    "web_thread_reopen",
+    "Reopen a closed injury thread, returning it to ACTIVE and clearing everything the close wrote: actual_return_date, return_source, returned_at, closed_at and accuracy_record. Use when a return was detected or recorded in error — it is the only way back from RESOLVED or RETIRED, which were otherwise terminal. Rejects a VOID thread (a retraction stays retracted; the next report opens a fresh thread) and a thread that is already ACTIVE. Audited as thread_reopened with the cleared values in the payload. Does NOT touch last_updated_at, so a thread reopened outside web_find_matching_entity's 21-day window does not start absorbing new reports again.",
+    {
+      entity_id: z.string().uuid(),
+      reopened_by: z
+        .string()
+        .min(1)
+        .describe("Who is reopening it. Anything but the literal 'system' is audited as an MD."),
+      reason: z
+        .string()
+        .min(1)
+        .describe(
+          "Why the close was wrong. Required: this is the only durable record of a reversal, and it is what someone auditing the accuracy number will read.",
+        ),
+    },
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+    async (input) => {
+      try {
+        const { entity, previous_status } = await client.reopenThread(input);
+        return toolSuccess({ entity, previous_status });
       } catch (err) {
         return handleToolError(err, logger);
       }
@@ -1685,12 +1732,13 @@ export function registerWebTools(server: McpServer): void {
   // ── web_list_threads ────────────────────────────────────────────────
   server.tool(
     "web_list_threads",
-    "List injury threads for the MD dashboard, joined with athlete name / sport / team. Filter by status (ACTIVE/RESOLVED/RETIRED/VOID) and/or needs_date_review to drive the active, date-review, and accuracy views. Ordered by last_updated_at, newest first, with id as the tiebreak. Paged: follow next_offset while has_more is true; total is the full match count, so a caller can tell a complete list from a truncated one. VOID rows are retracted threads kept for the audit trail — omit them from accuracy views and default listings. Rows also carry date_resolution_sources (JSONB provenance for the stored dates; NULL on any thread the resolver has never run on) and canonical_post_id (the post the thread was created from; NULL when the entity was minted before any post existed), so a caller can classify a thread's date provenance from the list alone instead of a per-entity web_thread_get.",
+    "List injury threads for the MD dashboard, joined with athlete name / sport / team. Filter by status (ACTIVE/RESOLVED/RETIRED/VOID) and/or needs_date_review to drive the active, date-review, and accuracy views. Ordered by last_updated_at, newest first, with id as the tiebreak. Paged: follow next_offset while has_more is true; total is the full match count, so a caller can tell a complete list from a truncated one. VOID rows are retracted threads kept for the audit trail — omit them from accuracy views and default listings. Rows also carry date_resolution_sources (JSONB provenance for the stored dates; NULL on any thread the resolver has never run on) and canonical_post_id (the post the thread was created from; NULL when the entity was minted before any post existed), so a caller can classify a thread's date provenance from the list alone instead of a per-entity web_thread_get. Rows carry espn_athlete_id (off the players join) and return_source so a caller can reach ESPN for an athlete and tell a physician-entered return date from a detected one without a second read.",
     {
       status: z
         .enum(["ACTIVE", "RESOLVED", "RETIRED", "VOID"])
         .optional()
         .describe("Filter by thread status"),
+      sport: sportEnum.optional().describe("Filter by the athlete's sport"),
       needs_date_review: z
         .boolean()
         .optional()
