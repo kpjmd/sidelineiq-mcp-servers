@@ -1581,7 +1581,7 @@ export function registerWebTools(server: McpServer): void {
   // ── web_thread_close ────────────────────────────────────────────────
   server.tool(
     "web_thread_close",
-    "Close an injury thread when the athlete returns (RESOLVED) or retires (RETIRED), or retract one that should never have existed (VOID). RESOLVED/RETIRED record actual_return_date and compute accuracy_record against the stored otm_projection; a thread with no projection now gets a record saying scoreable:false rather than a NULL that reads as 'never closed'. VOID does neither — it means the thread describes an injury we got wrong (wrong body part, wrong athlete, rejected post), so there is nothing to score; pass void_reason instead. All outcomes stamp closed_at, write an audit entry (thread_closed / thread_voided) and take the thread out of web_find_matching_entity, which only matches ACTIVE. REFUSALS: a VOID thread cannot be closed at all; a system caller (closed_by omitted or 'system') may only close an ACTIVE thread, and may not overwrite an actual_return_date whose stored return_source is 'md' — that write is dropped, logged, and audited as md_return_write_refused while the rest of the close proceeds. To change a settled outcome, reopen it with web_thread_reopen or close it as a named MD.",
+    "Close an injury thread when the athlete returns (RESOLVED) or retires (RETIRED), or retract one that should never have existed (VOID). RESOLVED/RETIRED record actual_return_date and compute accuracy_record against the first PUBLISHED post on the thread that carries an RTP estimate (not the stored otm_projection, which later posts overwrite); a thread with no projection now gets a record saying scoreable:false rather than a NULL that reads as 'never closed'. VOID does neither — it means the thread describes an injury we got wrong (wrong body part, wrong athlete, rejected post), so there is nothing to score; pass void_reason instead. All outcomes stamp closed_at, write an audit entry (thread_closed / thread_voided) and take the thread out of web_find_matching_entity, which only matches ACTIVE. REFUSALS: a VOID thread cannot be closed at all; a system caller (closed_by omitted or 'system') may only close an ACTIVE thread, and may not overwrite an actual_return_date whose stored return_source is 'md' — that write is dropped, logged, and audited as md_return_write_refused while the rest of the close proceeds. To change a settled outcome, reopen it with web_thread_reopen or close it as a named MD.",
     {
       entity_id: z.string().uuid(),
       actual_return_date: z.string().date().optional(),
@@ -1603,6 +1603,12 @@ export function registerWebTools(server: McpServer): void {
         .min(1)
         .optional()
         .describe("Why the thread is being retracted. VOID only; rejected for other outcomes."),
+      return_censored: z
+        .boolean()
+        .optional()
+        .describe(
+          "Whether actual_return_date is the returning team's FIRST regular-season game after injury_date (pre-registration Amendment 1, A1.3). A return like that proves only that recovery happened on or before it: it is still scored as a miss when it falls before the window's floor, and is otherwise recorded unscoreable as calendar_censored. Send it only after checking the team schedule; omit it when you do not know, which is recorded as null, not as false.",
+        ),
     },
     {
       readOnlyHint: false,

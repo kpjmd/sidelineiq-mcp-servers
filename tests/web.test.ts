@@ -578,14 +578,25 @@ describe("Web MCP Server", () => {
       expect(audit.values).not.toContain("thread_closed");
     });
 
-    it("still scores RESOLVED against the projection", async () => {
+    it("scores RESOLVED against the first published estimate, not otm_projection", async () => {
       const projected = {
         ...sampleEntity,
-        otm_projection: { min_weeks: 2, max_weeks: 4, projected_return_date: "2026-04-07" },
+        // Written by a later post. Amendment 1: this is display only.
+        otm_projection: { min_weeks: 0, max_weeks: 6, projected_return_date: "2026-03-27" },
         injury_date: "2026-03-24",
       };
       mockSql
         .mockResolvedValueOnce([projected])
+        .mockResolvedValueOnce([
+          {
+            id: "post-first",
+            status: "PUBLISHED",
+            return_to_play_min_weeks: 2,
+            return_to_play_max_weeks: 4,
+            rtp_confidence: "0.700",
+            created_at: "2026-03-25T00:00:00Z",
+          },
+        ])
         .mockResolvedValueOnce([{ ...projected, status: "RESOLVED" }])
         .mockResolvedValueOnce([{ id: "audit-1" }]);
 
@@ -596,14 +607,21 @@ describe("Web MCP Server", () => {
         {},
       );
 
-      const { values } = callAt(1);
+      expect(callAt(1).text).toMatch(/p\.status = 'PUBLISHED'/);
+      const { values } = callAt(2);
       const accuracy = values.find(
         (v) => typeof v === "string" && v.includes("projected_return_date"),
       ) as string | undefined;
       expect(accuracy).toBeDefined();
-      expect(JSON.parse(accuracy!).actual_return_date).toBe("2026-04-05");
+      const rec = JSON.parse(accuracy!);
+      expect(rec.actual_return_date).toBe("2026-04-05");
+      expect(rec.scored_post_id).toBe("post-first");
+      expect(rec.otm_min_weeks).toBe(2);
+      expect(rec.otm_max_weeks).toBe(4);
+      // 2026-03-24 + 3w, not the stored 2026-03-27.
+      expect(rec.projected_return_date).toBe("2026-04-14");
 
-      const audit = callAt(2);
+      const audit = callAt(3);
       expect(audit.values).toContain("thread_closed");
     });
 
