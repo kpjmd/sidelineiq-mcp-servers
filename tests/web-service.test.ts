@@ -21,7 +21,8 @@ import {
   assertCanAttest,
   slugify,
 } from "../src/servers/web/service.js";
-import type { User, DeskPost, DeskAttestation, InjuryEntity, OtmProjection } from "../src/servers/web/client.js";
+import type { User, DeskPost, DeskAttestation, InjuryEntity } from "../src/servers/web/client.js";
+import type { ScoredWindow } from "../src/servers/web/service.js";
 import type { LintFinding } from "../src/servers/web/linter.js";
 import type { InjuryPost } from "../src/shared/types.js";
 
@@ -156,65 +157,60 @@ describe("service", () => {
   });
 
   describe("computeAccuracyRecord", () => {
-    const projection: OtmProjection = {
-      min_weeks: 4,
-      max_weeks: 8,
-      projected_return_date: "2026-03-01",
-    };
+    const window: ScoredWindow = { post_id: "post-1", min_weeks: 4, max_weeks: 8 };
+    const entity = { injury_date: "2026-01-01" } as unknown as InjuryEntity;
 
     // It used to return null here, which closeThread wrote as a NULL
     // accuracy_record — indistinguishable from a thread that was never closed.
     // A record naming the missing input is legible to anyone counting.
-    it("returns an unscoreable record when the entity has no projection", () => {
-      const entity = { otm_projection: null, injury_date: "2026-01-01" } as unknown as InjuryEntity;
-      const rec = computeAccuracyRecord(entity, "2026-03-01");
+    it("returns an unscoreable record when no published post carries an estimate", () => {
+      const rec = computeAccuracyRecord(entity, "2026-03-01", { window: null });
       expect(rec).not.toBeNull();
       expect(rec.scoreable).toBe(false);
       expect(rec.unscoreable_reason).toBe("no_projection");
+      expect(rec.scored_post_id).toBeNull();
       // The return itself is still recorded — it is a fact even when unscoreable.
       expect(rec.actual_return_date).toBe("2026-03-01");
       expect(rec.within_range).toBeNull();
     });
 
     it("marks a scoreable record and names the missing input otherwise", () => {
-      const withDate = { otm_projection: projection, injury_date: "2026-01-01" } as unknown as InjuryEntity;
-      expect(computeAccuracyRecord(withDate, "2026-02-10").scoreable).toBe(true);
+      expect(computeAccuracyRecord(entity, "2026-02-10", { window }).scoreable).toBe(true);
 
       // No injury_date means no window to fall inside, so within_range is null
       // and the record must say why rather than read as a miss.
-      const noInjuryDate = { otm_projection: projection, injury_date: null } as unknown as InjuryEntity;
-      const rec = computeAccuracyRecord(noInjuryDate, "2026-02-10");
+      const noInjuryDate = { injury_date: null } as unknown as InjuryEntity;
+      const rec = computeAccuracyRecord(noInjuryDate, "2026-02-10", { window });
       expect(rec.scoreable).toBe(false);
       expect(rec.unscoreable_reason).toBe("no_injury_date");
+      expect(rec.projected_return_date).toBeNull();
 
       // A RETIRED close records no return at all.
-      const noActual = computeAccuracyRecord(withDate, null);
+      const noActual = computeAccuracyRecord(entity, null, { window });
       expect(noActual.scoreable).toBe(false);
       expect(noActual.unscoreable_reason).toBe("no_actual_return_date");
     });
 
-    it("computes error_days from projected vs actual", () => {
-      const entity = { otm_projection: projection, injury_date: "2026-01-01" } as unknown as InjuryEntity;
-      const rec = computeAccuracyRecord(entity, "2026-03-05");
-      expect(rec?.error_days).toBe(4); // 2026-03-05 is 4 days after 2026-03-01
+    it("computes the projected date from the scored window's midpoint", () => {
+      // 2026-01-01 + 6w = 2026-02-12.
+      const rec = computeAccuracyRecord(entity, "2026-02-16", { window });
+      expect(rec.projected_return_date).toBe("2026-02-12");
+      expect(rec.error_days).toBe(4);
+      expect(rec.scored_post_id).toBe("post-1");
     });
 
     it("flags within_range when actual falls inside [injury+min, injury+max]", () => {
       // injury 2026-01-01, min 4w = 2026-01-29, max 8w = 2026-02-26.
-      const entity = { otm_projection: projection, injury_date: "2026-01-01" } as unknown as InjuryEntity;
-      expect(computeAccuracyRecord(entity, "2026-02-10")?.within_range).toBe(true);
-      expect(computeAccuracyRecord(entity, "2026-03-15")?.within_range).toBe(false);
+      expect(computeAccuracyRecord(entity, "2026-02-10", { window }).within_range).toBe(true);
+      expect(computeAccuracyRecord(entity, "2026-03-15", { window }).within_range).toBe(false);
     });
 
     it("handles a Date-object injury_date (the 15bb517 driver case)", () => {
       // Before the fix, a Date here produced NaN math / a mis-typed comparison.
-      const entity = {
-        otm_projection: projection,
-        injury_date: new Date("2026-01-01T00:00:00.000Z"),
-      } as unknown as InjuryEntity;
-      const rec = computeAccuracyRecord(entity, "2026-02-10");
-      expect(rec?.within_range).toBe(true);
-      expect(rec?.error_days).toBe(daysBetween("2026-03-01", "2026-02-10"));
+      const dated = { injury_date: new Date("2026-01-01T00:00:00.000Z") } as unknown as InjuryEntity;
+      const rec = computeAccuracyRecord(dated, "2026-02-10", { window });
+      expect(rec.within_range).toBe(true);
+      expect(rec.error_days).toBe(daysBetween("2026-02-12", "2026-02-10"));
     });
   });
 

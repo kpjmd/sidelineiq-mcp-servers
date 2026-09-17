@@ -20,7 +20,6 @@ import type {
   CtaLink,
   DeskAttestation,
   DeskPost,
-  OtmProjection,
   PublishGate,
   UnscoreableReason,
   User,
@@ -67,29 +66,102 @@ export function resolveActualIso(
   return null;
 }
 
-// Compute the frozen accuracy_record from the entity's otm_projection vs the
-// resolved actual return. Pure: all inputs may be Date objects or strings
-// (see toIsoDate).
+// ── Which window is scored (pre-registration Amendment 1, A1.1/A1.2) ────
+// The thread's stored otm_projection is NOT the scored window. Every later
+// post rewrote it, of any status — Robinson's came from a post a physician
+// later rejected, and Pierce's 10-16w was replaced five months on by 0-6w —
+// so it is a display value only. The scored window is the earliest-created
+// PUBLISHED post on the thread that carries an estimate, read at close.
+
+/** One PUBLISHED post linked to a thread, as the scorer sees it. */
+export interface PublishedWindowRow {
+  id: string;
+  return_to_play_min_weeks: number | string | null;
+  return_to_play_max_weeks: number | string | null;
+  // DECIMAL(4,3) arrives from the driver as a string ("0.880").
+  rtp_confidence: number | string | null;
+  created_at: string | Date;
+}
+
+export interface ScoredWindow {
+  post_id: string;
+  min_weeks: number;
+  max_weeks: number;
+}
+
+const asNumber = (v: unknown): number | null => {
+  if (v === null || v === undefined || v === "") return null;
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? n : null;
+};
+
+/**
+ * Does this post state an RTP estimate at all? SKILL.md forbids one for
+ * CONCUSSION and SYSTEMIC events, and those posts still publish — carrying
+ * 0/0 weeks and rtp_confidence 0 by instruction. That is "we decline to
+ * estimate", not "back in zero weeks", and scoring it grades a claim nobody
+ * made. A zero FLOOR with a real ceiling (0-2w, "may not miss a game") is an
+ * estimate and is kept.
+ */
+export function carriesEstimate(row: PublishedWindowRow): boolean {
+  const conf = asNumber(row.rtp_confidence);
+  const min = asNumber(row.return_to_play_min_weeks);
+  const max = asNumber(row.return_to_play_max_weeks);
+  return conf !== null && conf > 0 && min !== null && max !== null && min >= 0 && max >= 1 && max >= min;
+}
+
+/**
+ * The first estimate that reached an audience. Rows need not be pre-sorted
+ * or pre-filtered by status — the caller's SQL should do both, but a forecast
+ * scored against the wrong post is the failure this exists to prevent, so the
+ * order is re-imposed here rather than trusted.
+ */
+export function pickScoredWindow(
+  rows: Array<PublishedWindowRow & { status?: string }>,
+): ScoredWindow | null {
+  const eligible = rows
+    .filter((r) => (r.status === undefined || r.status === "PUBLISHED") && carriesEstimate(r))
+    .sort((a, b) => {
+      const ta = new Date(a.created_at).getTime();
+      const tb = new Date(b.created_at).getTime();
+      return ta !== tb ? ta - tb : String(a.id).localeCompare(String(b.id));
+    });
+  const first = eligible[0];
+  if (!first) return null;
+  return {
+    post_id: first.id,
+    min_weeks: asNumber(first.return_to_play_min_weeks)!,
+    max_weeks: asNumber(first.return_to_play_max_weeks)!,
+  };
+}
+
+// Compute the frozen accuracy_record for a close. Pure: dates may be Date
+// objects or strings (see toIsoDate).
 //
-// It ALWAYS returns a record now, where it used to return null whenever the
-// thread carried no otm_projection. A null accuracy_record and a record that
-// says `scoreable: false, unscoreable_reason: 'no_projection'` describe the
-// same thread, but only the second one is legible to a reader counting an
-// accuracy number: the first is indistinguishable from "this thread was never
-// closed". Callers that must write nothing at all — VOID — decide that
-// themselves; see closeThread.
+// It ALWAYS returns a record, where it once returned null for a thread with no
+// window. A null accuracy_record and a record that says `scoreable: false,
+// unscoreable_reason: 'no_projection'` describe the same thread, but only the
+// second one is legible to a reader counting an accuracy number. Callers that
+// must write nothing at all — VOID — decide that themselves; see closeThread.
 //
-// `scoreable` is defined as "within_range could be computed", because
-// within_range is the headline metric (monetization plan, Phase 2) and its
-// denominator is the number the platform is judged on. error_days is allowed
-// to be null on a scoreable record: the secondary median-signed-error metric
-// carries its own n for exactly that reason.
+// `scoreable` is "within_range could be computed AND means something".
+// error_days may be null on a scoreable record: the secondary median-signed-
+// error metric carries its own n for exactly that reason.
+//
+// `censored` (Amendment 1, A1.3): the return was the returning team's first
+// regular-season game after injury_date, so it proves only that recovery
+// happened ON OR BEFORE that date. A censored return before the window's floor
+// is still a provable miss and is scored; one on or after the floor says
+// nothing and is `calendar_censored`. `undefined` means the closer could not
+// say (an MD's hand close) and is recorded as null — not as "not censored".
 export function computeAccuracyRecord(
-  entity: Pick<import("./client.js").InjuryEntity, "otm_projection" | "injury_date">,
+  entity: Pick<import("./client.js").InjuryEntity, "injury_date">,
   actualIso: string | null,
+  opts: { window: ScoredWindow | null; censored?: boolean },
 ): AccuracyRecord {
-  const proj: OtmProjection | null = entity.otm_projection;
-  if (!proj) {
+  const win = opts.window;
+  const censored = opts.censored ?? null;
+  if (!win) {
     return {
       projected_return_date: null,
       actual_return_date: actualIso,
@@ -97,25 +169,37 @@ export function computeAccuracyRecord(
       within_range: null,
       otm_min_weeks: null,
       otm_max_weeks: null,
+      scored_post_id: null,
+      censored,
       scoreable: false,
       unscoreable_reason: "no_projection",
     };
   }
 
-  const projected = proj.projected_return_date ? toIsoDate(proj.projected_return_date) : null;
-  const errorDays = actualIso && projected ? daysBetween(projected, actualIso) : null;
+  const injury = entity.injury_date != null ? toIsoDate(entity.injury_date) : null;
+  // Computed from the scored window, never read from otm_projection: the
+  // stored projected_return_date belongs to whichever post wrote last.
+  const projected = injury ? addWeeks(injury, (win.min_weeks + win.max_weeks) / 2) : null;
+  let errorDays = actualIso && projected ? daysBetween(projected, actualIso) : null;
 
   let withinRange: boolean | null = null;
-  if (actualIso && entity.injury_date != null) {
-    const minReturn = addWeeks(entity.injury_date, proj.min_weeks);
-    const maxReturn = addWeeks(entity.injury_date, proj.max_weeks);
+  let censoredOut = false;
+  if (actualIso && injury) {
+    const minReturn = addWeeks(injury, win.min_weeks);
+    const maxReturn = addWeeks(injury, win.max_weeks);
     withinRange = actualIso >= minReturn && actualIso <= maxReturn;
+    if (censored === true && actualIso >= minReturn) {
+      censoredOut = true;
+      withinRange = null;
+      errorDays = null;
+    }
   }
 
   // Precedence matters only for the label, not the verdict: a record missing
-  // both inputs is reported by the one a human would fix first.
-  const unscoreableReason: UnscoreableReason | null =
-    withinRange !== null
+  // an input is reported by the one a human would fix first.
+  const unscoreableReason: UnscoreableReason | null = censoredOut
+    ? "calendar_censored"
+    : withinRange !== null
       ? null
       : actualIso == null
         ? "no_actual_return_date"
@@ -126,8 +210,10 @@ export function computeAccuracyRecord(
     actual_return_date: actualIso,
     error_days: errorDays,
     within_range: withinRange,
-    otm_min_weeks: proj.min_weeks ?? null,
-    otm_max_weeks: proj.max_weeks ?? null,
+    otm_min_weeks: win.min_weeks,
+    otm_max_weeks: win.max_weeks,
+    scored_post_id: win.post_id,
+    censored,
     scoreable: unscoreableReason === null,
     ...(unscoreableReason ? { unscoreable_reason: unscoreableReason } : {}),
   };

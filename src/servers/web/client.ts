@@ -22,11 +22,13 @@ import {
 import {
   evaluatePublishGate,
   computeAccuracyRecord,
+  pickScoredWindow,
   resolveActualIso,
   assertCanAttest,
   slugify,
   summarizeCtaClicks,
 } from "./service.js";
+import type { PublishedWindowRow, ScoredWindow } from "./service.js";
 import type {
   InjuryPost,
   MdReview,
@@ -335,7 +337,9 @@ export type ReturnSource = "detector" | "md" | "backfill";
 export type UnscoreableReason =
   | "no_projection"
   | "no_injury_date"
-  | "no_actual_return_date";
+  | "no_actual_return_date"
+  /** Amendment 1, A1.3: first game available, on or after the window floor. */
+  | "calendar_censored";
 
 export interface AccuracyRecord {
   projected_return_date: string | null;
@@ -344,6 +348,17 @@ export interface AccuracyRecord {
   within_range: boolean | null;
   otm_min_weeks: number | null;
   otm_max_weeks: number | null;
+  /**
+   * The PUBLISHED post whose window was scored (Amendment 1, A1.1). null when
+   * no published post carried an estimate. ABSENT before 2026-09-16, when the
+   * window was read from otm_projection instead.
+   */
+  scored_post_id?: string | null;
+  /**
+   * Whether the return was the returning team's first game after injury_date
+   * (A1.3). null = the closer could not say. ABSENT before 2026-09-16.
+   */
+  censored?: boolean | null;
   /**
    * Whether this record can be counted in an accuracy number at all.
    *
@@ -432,6 +447,14 @@ export interface ThreadListItem {
   // way to reach ESPN — a name lookup would resolve the misspellings the
   // roster is deliberately keyed on.
   espn_athlete_id: string | null;
+  /**
+   * The window accuracy is scored against (pre-registration Amendment 1): the
+   * first PUBLISHED post on the thread that carries an estimate. Not the same
+   * as otm_projection, which the latest post of any status wrote. The return
+   * detector's too-early bar reads this so that it and the scorer judge one
+   * window. null when no published post carries an estimate.
+   */
+  scored_window: ScoredWindow | null;
   first_reported_at: string;
   last_updated_at: string;
 }
@@ -2336,6 +2359,25 @@ export class WebDatabaseClient {
     return updated;
   }
 
+  // Every PUBLISHED post linked to a thread — through injury_updates or as
+  // its canonical post — with the columns the scorer reads. pickScoredWindow
+  // chooses among them; the predicate lives there and only there.
+  async listPublishedWindows(entityId: string): Promise<PublishedWindowRow[]> {
+    const rows = await this.sql`
+      SELECT p.id, p.status, p.return_to_play_min_weeks, p.return_to_play_max_weeks,
+             p.rtp_confidence, p.created_at
+      FROM injury_posts p
+      WHERE p.status = 'PUBLISHED'
+        AND (
+          p.id IN (SELECT u.post_id FROM injury_updates u
+                   WHERE u.entity_id = ${entityId} AND u.post_id IS NOT NULL)
+          OR p.id = (SELECT e.canonical_post_id FROM injury_entities e WHERE e.id = ${entityId})
+        )
+      ORDER BY p.created_at ASC, p.id ASC
+    `;
+    return rows as PublishedWindowRow[];
+  }
+
   // Close a thread when the athlete returns (RESOLVED) or retires (RETIRED),
   // or retract one that should never have existed (VOID, migration 020).
   // RESOLVED/RETIRED compute accuracy_record from the frozen otm_projection vs
@@ -2348,6 +2390,8 @@ export class WebDatabaseClient {
     closed_by?: string;
     void_reason?: string;
     return_source?: ReturnSource;
+    /** Amendment 1, A1.3. Only a caller that checked the schedule may say. */
+    return_censored?: boolean;
   }): Promise<InjuryEntity> {
     const entity = await this.getEntity(input.entity_id);
     if (!entity) {
@@ -2420,7 +2464,12 @@ export class WebDatabaseClient {
     // gets a record saying `scoreable: false` rather than a NULL that reads as
     // "never closed". The old unconditional assignment could also ERASE a good
     // record on a re-close; it no longer can, because this is never null.
-    const accuracy = isVoid ? null : computeAccuracyRecord(entity, actualIso);
+    const accuracy = isVoid
+      ? null
+      : computeAccuracyRecord(entity, actualIso, {
+          window: pickScoredWindow(await this.listPublishedWindows(input.entity_id)),
+          censored: input.return_censored,
+        });
     const voidReason = isVoid ? (input.void_reason ?? null) : null;
 
     // Only stamp provenance when this call actually supplies a date. An omitted
@@ -2732,10 +2781,33 @@ export class WebDatabaseClient {
              e.first_reported_at, e.last_updated_at,
              p.full_name AS athlete_name, p.sport AS sport,
              p.espn_athlete_id AS espn_athlete_id,
-             t.display_name AS team_name
+             t.display_name AS team_name,
+             pw.published_windows
       FROM injury_entities e
       JOIN players p ON p.id = e.player_id
       LEFT JOIN teams t ON t.id = p.current_team_id
+      -- Same rows listPublishedWindows returns for one thread. The estimate
+      -- predicate is applied in TypeScript (pickScoredWindow), never here.
+      LEFT JOIN LATERAL (
+        SELECT json_agg(
+                 json_build_object(
+                   'id', ip.id,
+                   'status', ip.status,
+                   'return_to_play_min_weeks', ip.return_to_play_min_weeks,
+                   'return_to_play_max_weeks', ip.return_to_play_max_weeks,
+                   'rtp_confidence', ip.rtp_confidence,
+                   'created_at', ip.created_at
+                 )
+                 ORDER BY ip.created_at, ip.id
+               ) AS published_windows
+        FROM injury_posts ip
+        WHERE ip.status = 'PUBLISHED'
+          AND (
+            ip.id = e.canonical_post_id
+            OR ip.id IN (SELECT u.post_id FROM injury_updates u
+                         WHERE u.entity_id = e.id AND u.post_id IS NOT NULL)
+          )
+      ) pw ON TRUE
       WHERE (${status}::text IS NULL OR e.status = ${status})
         AND (${sport}::text IS NULL OR p.sport = ${sport})
         AND (${needsReview}::boolean IS NULL OR e.needs_date_review = ${needsReview})
@@ -2745,7 +2817,13 @@ export class WebDatabaseClient {
     `;
     const total = Number((countRows as Array<{ total?: unknown }>)[0]?.total ?? 0);
     return {
-      threads: (rows as ThreadListItem[]).map(normalizeThreadListItem),
+      threads: (rows as Array<ThreadListItem & { published_windows?: PublishedWindowRow[] | null }>).map(
+        ({ published_windows, ...row }) =>
+          normalizeThreadListItem({
+            ...row,
+            scored_window: pickScoredWindow(published_windows ?? []),
+          } as ThreadListItem),
+      ),
       total: Number.isFinite(total) ? total : 0,
     };
   }

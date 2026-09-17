@@ -63,11 +63,13 @@ const baseEntity = {
   otm_projection: { min_weeks: 26, max_weeks: 39, projected_return_date: "2026-09-01" },
 };
 
-// closeThread issues getEntity → UPDATE → auditAppend (plus one more audit
-// append when it refuses a write).
+// closeThread issues getEntity → listPublishedWindows → UPDATE → auditAppend
+// (plus one more audit append when it refuses a write).
+const UPDATE = 2;
 function queue(entity: Record<string, unknown>, returned?: Record<string, unknown>): void {
   mockSql
     .mockResolvedValueOnce([entity])
+    .mockResolvedValueOnce([]) // no published estimate on the thread
     .mockResolvedValueOnce([returned ?? { ...entity, status: "RESOLVED" }])
     .mockResolvedValueOnce([{ id: "audit-1" }])
     .mockResolvedValueOnce([{ id: "audit-2" }]);
@@ -105,7 +107,7 @@ describe("closeThread — the MD's return date is not re-derived", () => {
     );
 
     expect(isErrorResult(result)).toBe(false);
-    const update = callAt(1);
+    const update = callAt(UPDATE);
     // The refused date must not appear anywhere in the bound values: COALESCE
     // resolves to the STORED date, so the column is rewritten with its own value.
     expect(update.values).not.toContain("2026-08-14");
@@ -131,7 +133,7 @@ describe("closeThread — the MD's return date is not re-derived", () => {
       { entity_id: ENTITY_ID, actual_return_date: "2026-08-14", closed_by: "dr-johnson" },
       {},
     );
-    expect(callAt(1).values).toContain("2026-08-14");
+    expect(callAt(UPDATE).values).toContain("2026-08-14");
   });
 
   it("lets a system caller write a date when the stored source is not md", async () => {
@@ -140,7 +142,7 @@ describe("closeThread — the MD's return date is not re-derived", () => {
       { entity_id: ENTITY_ID, actual_return_date: "2026-08-14", closed_by: "system" },
       {},
     );
-    const update = callAt(1);
+    const update = callAt(UPDATE);
     expect(update.values).toContain("2026-08-14");
     // A system caller defaults to 'detector', which is what a later system
     // write is allowed to replace.
@@ -153,7 +155,7 @@ describe("closeThread — the MD's return date is not re-derived", () => {
       { entity_id: ENTITY_ID, actual_return_date: "2026-08-14", closed_by: "dr-johnson" },
       {},
     );
-    expect(callAt(1).values).toContain("md");
+    expect(callAt(UPDATE).values).toContain("md");
 
     mockSql.mockReset();
     queue(baseEntity);
@@ -162,7 +164,7 @@ describe("closeThread — the MD's return date is not re-derived", () => {
       {},
     );
     // No date in, no provenance out: COALESCE(null, return_source) keeps it.
-    expect(callAt(1).values).not.toContain("md");
+    expect(callAt(UPDATE).values).not.toContain("md");
   });
 });
 
@@ -199,7 +201,7 @@ describe("closeThread — refusals", () => {
       {},
     );
     expect(isErrorResult(result)).toBe(false);
-    expect(callAt(1).values).toContain("2026-08-21");
+    expect(callAt(UPDATE).values).toContain("2026-08-21");
   });
 });
 
@@ -210,7 +212,7 @@ describe("closeThread — accuracy_record is never erased", () => {
       { entity_id: ENTITY_ID, actual_return_date: "2026-08-14", closed_by: "system" },
       {},
     );
-    const written = callAt(1).values.find(
+    const written = callAt(UPDATE).values.find(
       (v) => typeof v === "string" && v.includes("unscoreable_reason"),
     ) as string | undefined;
     expect(written).toBeDefined();
@@ -221,7 +223,7 @@ describe("closeThread — accuracy_record is never erased", () => {
     // here, which on a re-close erased whatever was already stored. (Not
     // asserted as "no null in values": void_reason legitimately binds null on
     // every non-VOID close.)
-    const accuracyParam = callAt(1).values[callAt(1).text.split("?").findIndex((seg) => seg.trimEnd().endsWith("accuracy_record ="))];
+    const accuracyParam = callAt(UPDATE).values[callAt(UPDATE).text.split("?").findIndex((seg) => seg.trimEnd().endsWith("accuracy_record ="))];
     expect(typeof accuracyParam).toBe("string");
   });
 });
