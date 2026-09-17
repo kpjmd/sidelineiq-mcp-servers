@@ -189,7 +189,7 @@ export class NeynarClient {
     if (!user) {
       throw new McpToolError(
         `Neynar /user/bulk returned no user for fid ${fid}`,
-        "Verify SIDELINEIQ_FARCASTER_FID is the SidelineIQ account's FID.",
+        "Verify SIDELINEIQ_FARCASTER_FID is the platform account's FID.",
       );
     }
     if (!isCount(user.follower_count) || !isCount(user.following_count)) {

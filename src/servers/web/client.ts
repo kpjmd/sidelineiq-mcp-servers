@@ -3513,7 +3513,7 @@ export class WebDatabaseClient {
     if (post.status !== "PUBLISHED") {
       throw new McpToolError(
         `Desk post ${deskPostId} is ${post.status}, not PUBLISHED`,
-        "Publish the post on SidelineIQ before confirming it live on kpjmd.com.",
+        "Publish the post on ParatrOs before confirming it live on kpjmd.com.",
       );
     }
 

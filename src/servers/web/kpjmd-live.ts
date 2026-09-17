@@ -110,7 +110,7 @@ export async function checkKpjmdLive(
       redirect: "follow",
       cache: "no-store",
       signal: controller.signal,
-      headers: { "User-Agent": "SidelineIQ-DeskHandoff/1.0" },
+      headers: { "User-Agent": "ParatrOs-DeskHandoff/1.0" },
     });
     const html = res.ok ? await res.text() : null;
     return evaluateLiveCheck(url, expectedHash, res.status, html);
