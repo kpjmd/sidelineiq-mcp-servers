@@ -1094,7 +1094,10 @@ export class WebDatabaseClient {
     }
 
     await this.auditAppend({
-      actor: "md",
+      // Same rule as closeThread / reopenThread: only the literal "system" is a
+      // machine. This used to hardcode "md", so an ops retirement had no way to
+      // be recorded as anything but a physician's decision.
+      actor: input.rejected_by === "system" ? "system" : "md",
       actor_id: input.rejected_by,
       entity_type: "injury_post",
       entity_id: postId!,

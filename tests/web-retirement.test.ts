@@ -161,6 +161,32 @@ describe("web_reject_injury_post", () => {
     expect(out.post_updated).toBe(true);
   });
 
+  /** actor and actor_id are the first two bound parameters of the audit INSERT. */
+  function auditActor(): { actor: unknown; actor_id: unknown } {
+    const inserts = mockSql.mock.calls.filter((c) => {
+      const first = c[0];
+      const text = Array.isArray(first) ? first.join(" ? ") : String(first);
+      return /INSERT INTO audit_log/i.test(text);
+    });
+    expect(inserts).toHaveLength(1);
+    return { actor: inserts[0][1], actor_id: inserts[0][2] };
+  }
+
+  // FAILS-ON-OLD: rejectPost hardcoded actor "md", so the only ops retirement
+  // ever made (2026-09-11, actor_id ops:pre-021-straggler-sweep) is recorded as
+  // a physician's decision, and passing 'system' could not have prevented it.
+  it("records the literal 'system' as a system actor", async () => {
+    stubPendingReject();
+    await tool("web_reject_injury_post").handler({ post_id: POST, rejected_by: "system" }, {});
+    expect(auditActor()).toEqual({ actor: "system", actor_id: "system" });
+  });
+
+  it("records any other rejected_by as a physician", async () => {
+    stubPendingReject();
+    await tool("web_reject_injury_post").handler({ post_id: POST, rejected_by: "md-1" }, {});
+    expect(auditActor()).toEqual({ actor: "md", actor_id: "md-1" });
+  });
+
   it("refuses both post_id and review_id together", async () => {
     const result = await tool("web_reject_injury_post").handler(
       { post_id: POST, review_id: REVIEW, rejected_by: "md-1" },

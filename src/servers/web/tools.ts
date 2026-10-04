@@ -317,7 +317,11 @@ export function registerWebTools(server: McpServer): void {
       post_id: z.string().uuid().optional().describe("The post to reject. Pass this OR review_id, not both."),
       review_id: z.string().uuid().optional().describe("The md_reviews row to reject, when the caller has the review rather than the post."),
       reason: z.string().optional().describe("Why the MD rejected it. Stored on the post and as the reviewer note."),
-      rejected_by: z.string().describe("The reviewing MD's user id, for the audit log"),
+      rejected_by: z
+        .string()
+        .describe(
+          "The reviewing MD's user id, for the audit log. The literal 'system' means a machine and stamps the audit actor as system; any other value is recorded as a physician.",
+        ),
     },
     {
       readOnlyHint: false,
