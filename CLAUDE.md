@@ -258,8 +258,10 @@ every depth, cloning wrapper defs so `.describe()` text survives. `z.record` /
 `MCP_UNKNOWN_KEYS=strict|strip`, default strict; only an explicit `strip`
 reopens it. tools/list is byte-identical under both modes — strict changes what
 is ENFORCED, not what is ADVERTISED; `tests/input-key-policy.test.ts` pins that
-for all of them (79 as of 2026-09-15; the number is pinned in that test and in
-`tests/annotations.test.ts`, so adding a tool means three edits, not one).
+for all of them (97 as of 2026-10-04, 18 of them the ledger's; the number is
+pinned in that test and TWICE in `tests/annotations.test.ts` — the all-server
+total and the per-server `count` — plus the per-tool hints map, so adding a tool
+means four edits, not one).
 
 Before it shipped (2026-09-11) every caller was audited: all 123 agents call
 sites, all 33 frontend ones, and a replay of every payload the agents test suite
@@ -272,6 +274,47 @@ for every caller at once.
 RAW callback — zod never runs, so neither stripping nor rejection is visible to
 it. Use `tool.inputSchema.parse()` first, or a real `Client` over
 `InMemoryTransport` (see `tests/input-key-policy.test.ts`).
+
+### The Prognosis Ledger is immutable by trigger, not by convention
+
+Migration 026 adds the ledger (agents `docs/paratrOs Prognosis Ledger — Working
+Spec.md`; rules in agents `docs/ledger-preregistration.md`). Tools live in
+`src/servers/web/ledger-tools.ts` and are registered from `registerWebTools`;
+queries in `ledger-client.ts`; the pure publish gate in `ledger-service.ts`.
+
+- **A published `ledger_forecasts` row never changes.** The trigger
+  `ledger_forecasts_no_mutation` compares `to_jsonb(OLD)` and `to_jsonb(NEW)`
+  minus the provenance columns and raises on any other difference, refuses
+  DELETE of a published row, and lets each provenance column (`row_hash`,
+  `commit_sha`, `commit_url`, `x_post_id`, `x_self_reply_id`, `farcaster_hash`)
+  go from NULL to a value exactly once. Revisions are new rows; clerical fixes
+  are `ledger_corrections` rows. Do not add a "fix" path that updates a
+  published row — the trigger will refuse it, and that is the point.
+- **`published_at` is INSIDE `row_hash` (D7).** The publish UPDATE stamps
+  `date_trunc('milliseconds', NOW())` so the Date the driver returns hashes to
+  what Postgres stored; `publishedRowHash` then computes the hash from the
+  RETURNING row and writes it once. `src/servers/web/ledger-hash.ts` is a
+  byte-identical twin of agents `src/ledger/row-hash.ts` (and the frontend's),
+  pinned by `tests/fixtures/ledger-hash-cases.json` in every repo.
+- **The entry id is allocated inside the publish statement** from
+  `ledger_entry_sequence`, conditioned on the draft still being an unpublished
+  new entry, so an abandoned draft never burns a number. A gap would read as a
+  deletion. Revisions reuse the parent id and never touch the sequence.
+- **Only an MD publishes, confirms a resolution, records a correction or
+  decides a reply.** Every one of those tools takes `reviewer_user_id` and the
+  client re-derives the role from `users`; the `confirmed_by`/`decided_by`
+  columns and the audit row record who and when. The ingest's only write is
+  `web_propose_ledger_resolution`; the reply agent's only write is
+  `web_propose_reply`. Neither can resolve or post anything.
+- **Confirm is one data-modifying CTE** over the proposal and the open
+  resolution row, conditioned on the row still being `open`, so a proposal can
+  never read "confirmed" while the resolution stayed open, and a locked field
+  can never be re-decided. `ledger_resolutions_no_mutation` refuses any UPDATE
+  of a resolved/void row and every DELETE.
+- Triggers cannot be exercised through `mockSql`.
+  `src/scripts/ledger-schema-check.ts` proves them against a scratch Neon
+  branch after the migration is applied there; it publishes a permanent test
+  row, so never point it at production.
 
 ## Environment Variables
 

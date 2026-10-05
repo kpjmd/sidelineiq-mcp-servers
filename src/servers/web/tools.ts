@@ -4,6 +4,7 @@ import { WebDatabaseClient, METRIC_NAMES, METRIC_SOURCES, CTA_LINKS } from "./cl
 import type { InsertProcessedMentionInput, InsertPendingCorrectionInput } from "./client.js";
 import { handleToolError, McpToolError, toolSuccess } from "../../shared/errors.js";
 import { createLogger } from "../../shared/logger.js";
+import { registerLedgerTools } from "./ledger-tools.js";
 
 const logger = createLogger("web-tools");
 
@@ -2462,4 +2463,9 @@ export function registerWebTools(server: McpServer): void {
       }
     },
   );
+
+  // ── Prognosis Ledger (migration 026) ────────────────────────────────
+  // Registered here so the pinned tool-count tests and the strict-input policy
+  // cover the ledger like every other web tool. See ledger-tools.ts.
+  registerLedgerTools(server, client, logger);
 }
