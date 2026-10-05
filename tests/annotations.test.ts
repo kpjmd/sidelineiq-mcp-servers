@@ -189,6 +189,35 @@ const WEB: Record<string, Hints> = {
   desk_list_updates: READ,
   desk_list: READ,
   desk_get: READ,
+  // ── Prognosis Ledger (ledger-tools.ts). Reads are plain SELECTs. ──
+  // Upsert converges; forecasts copy the values they used, so nothing is lost.
+  web_upsert_ledger_base_rate: [false, false, true, false],
+  web_list_ledger_base_rates: READ,
+  // A new draft row per call.
+  web_create_ledger_draft: [false, false, false, false],
+  // Drafts are mutable by design; the same patch converges.
+  web_update_ledger_draft: [false, false, true, false],
+  // Deletes a draft (never a published row — the trigger refuses).
+  web_delete_ledger_draft: [false, true, true, false],
+  // The confirmation step: allocates an entry id and publishes; a repeat is blocked.
+  web_publish_ledger_forecast: [false, false, false, false],
+  // COALESCE keeps the first value; the trigger refuses a second.
+  web_record_ledger_provenance: [false, false, true, false],
+  web_get_ledger_entry: READ,
+  web_list_ledger_entries: READ,
+  web_list_ledger_resolutions: READ,
+  web_export_ledger: READ,
+  // Idempotent on identical pending content; a locked field takes none.
+  web_propose_ledger_resolution: [false, false, true, false],
+  web_list_ledger_proposals: READ,
+  // Locks a resolution row; a repeat throws.
+  web_decide_ledger_proposal: [false, false, false, false],
+  // Append-only correction rows.
+  web_record_ledger_correction: [false, false, false, false],
+  // Idempotent per (platform, mention_id).
+  web_propose_reply: [false, false, true, false],
+  web_list_reply_proposals: READ,
+  web_decide_reply: [false, false, false, false],
 };
 
 // Both social servers are pure external-API proxies — every tool is open-world.
@@ -213,7 +242,7 @@ const TWITTER: Record<string, Hints> = {
 };
 
 const SERVERS = [
-  { label: "web", register: registerWebTools, expected: WEB, count: 67 },
+  { label: "web", register: registerWebTools, expected: WEB, count: 85 },
   { label: "farcaster", register: registerFarcasterTools, expected: FARCASTER, count: 6 },
   { label: "twitter", register: registerTwitterTools, expected: TWITTER, count: 6 },
 ] as const;
@@ -264,12 +293,12 @@ describe.each(SERVERS)("$label tool annotations", ({ register, expected, count }
 });
 
 describe("annotation coverage across all servers", () => {
-  it("covers all 79 tools", () => {
+  it("covers all 97 tools", () => {
     const total = SERVERS.reduce(
       (sum, { register }) => sum + Object.keys(annotationsByTool(register)).length,
       0,
     );
 
-    expect(total).toBe(79);
+    expect(total).toBe(97);
   });
 });
