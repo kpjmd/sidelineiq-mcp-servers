@@ -1,5 +1,5 @@
 /**
- * Prove migration 026's triggers against a real database.
+ * Prove migration 026's triggers (and 027's reply state machine) against a real database.
  *
  * `mockSql` cannot exercise a trigger, and the ledger's whole promise — a
  * published forecast row is immutable — lives in one. This script publishes a
@@ -8,8 +8,8 @@
  * to succeed exactly once.
  *
  * It leaves a PUBLISHED test row behind (by design it cannot delete it), so it
- * must only ever run against a scratch Neon branch on which 026 has already
- * been applied with psql:
+ * must only ever run against a scratch Neon branch on which 026 and 027 have
+ * already been applied with psql:
  *
  *   LEDGER_SCHEMA_CHECK_DATABASE_URL=postgres://… \
  *     npx tsx src/scripts/ledger-schema-check.ts --scratch
@@ -168,6 +168,26 @@ async function main(): Promise<void> {
       'Schema check.', ${rowKey}, 'thin', 0.1, 0.2, 0.3, 2, 1, 3, 0.1, false, 'Nothing.', 2, ${mdId}
     )` });
   await check({ name: "draft: DELETE", expect: "ok", run: () => sql`DELETE FROM ledger_forecasts WHERE id = ${d2[0].id} AND status = 'draft'` });
+
+  // ── Reply proposals (027): the record precedes the act ──
+  const rp = (await sql`
+    INSERT INTO reply_proposals (platform, mention_id, proposed_text)
+    VALUES ('x', ${"schema-check-" + stamp}, 'Schema check reply.') RETURNING id
+  `) as { id: string }[];
+  const rpId = rp[0].id;
+  const oneRow = (q: () => Promise<unknown>) => async () => {
+    const r = (await q()) as unknown[];
+    if (r.length === 0) throw new Error("no row updated");
+  };
+  await check({ name: "reply: claim while pending (guarded UPDATE touches no row)", expect: "raise", run: oneRow(() => sql`UPDATE reply_proposals SET post_attempted_at = NOW() WHERE id = ${rpId} AND decision = 'approved' AND post_attempted_at IS NULL RETURNING id`) });
+  await check({ name: "reply: approved without decided_by (CHECK)", expect: "raise", run: () => sql`UPDATE reply_proposals SET decision = 'approved' WHERE id = ${rpId}` });
+  await check({ name: "reply: MD approves (decided_by, decided_at)", expect: "ok", run: oneRow(() => sql`UPDATE reply_proposals SET decision = 'approved', decided_by = ${mdId}, decided_at = NOW(), approved_text = 'Edited.' WHERE id = ${rpId} AND decision = 'pending' RETURNING id`) });
+  await check({ name: "reply: first claim", expect: "ok", run: oneRow(() => sql`UPDATE reply_proposals SET post_attempted_at = NOW() WHERE id = ${rpId} AND decision = 'approved' AND post_attempted_at IS NULL RETURNING id`) });
+  await check({ name: "reply: second claim (double-post lock)", expect: "raise", run: oneRow(() => sql`UPDATE reply_proposals SET post_attempted_at = NOW() WHERE id = ${rpId} AND decision = 'approved' AND post_attempted_at IS NULL RETURNING id`) });
+  await check({ name: "reply: posted without posted_id (CHECK)", expect: "raise", run: () => sql`UPDATE reply_proposals SET decision = 'posted' WHERE id = ${rpId}` });
+  await check({ name: "reply: posted with id after claim", expect: "ok", run: oneRow(() => sql`UPDATE reply_proposals SET decision = 'posted', posted_id = 'schema-check-tweet' WHERE id = ${rpId} AND decision = 'approved' AND post_attempted_at IS NOT NULL RETURNING id`) });
+  await check({ name: "reply: unknown decision value (CHECK)", expect: "raise", run: () => sql`UPDATE reply_proposals SET decision = 'queued' WHERE id = ${rpId}` });
+  await sql`DELETE FROM reply_proposals WHERE id = ${rpId}`;
 
   const width = Math.max(...results.map((r) => r.name.length));
   let failed = 0;

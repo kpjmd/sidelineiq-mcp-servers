@@ -333,16 +333,89 @@ describe("web_record_ledger_correction, web_propose_reply, web_decide_reply", ()
     expect(sql.some((s) => s.includes("UPDATE ledger_forecasts"))).toBe(false);
   });
 
-  it("a reply proposal posts nothing and a posted decision needs the platform id", async () => {
+  it("a reply proposal posts nothing", async () => {
     const server = makeServer();
     mockSql.mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: "rp1", platform: "x", mention_id: "m1", decision: "pending" }]).mockResolvedValueOnce([auditRow]);
     const proposed = (await callParsed(server, "web_propose_reply", { platform: "x", mention_id: "m1", proposed_text: "Reference-class estimate: 2–4 games." })) as { status: string };
     expect(proposed.status).toBe("created");
     expect(mockSql.mock.calls[2][1]).toBe("agent");
+    expect(issued().some((s) => s.includes("UPDATE"))).toBe(false);
+  });
+
+  // 027: the MD's decision is recorded BEFORE anything is posted, and the MD
+  // cannot record 'posted' — only the publisher's state machine can.
+  it("the MD approves or discards; 'posted' is not a decision the schema accepts", async () => {
+    const server = makeServer();
+    const schema = getTool(server, "web_decide_reply").inputSchema;
+    expect(schema.safeParse({ proposal_id: DRAFT_ID, reviewer_user_id: MD_ID, decision: "posted" }).success).toBe(false);
+    // posted_id is no longer declared on this tool; under the strict policy an
+    // undeclared key fails the whole call (see the strict test below).
+    expect(Object.keys(schema.shape)).not.toContain("posted_id");
+
+    mockSql.mockResolvedValueOnce([mdUser])
+      .mockResolvedValueOnce([{ id: DRAFT_ID, platform: "x", mention_id: "m1", decision: "approved", proposed_text: "a", approved_text: "b", posted_id: null }])
+      .mockResolvedValueOnce([auditRow]);
+    const r = (await callParsed(server, "web_decide_reply", { proposal_id: DRAFT_ID, reviewer_user_id: MD_ID, decision: "approved", approved_text: "b" })) as { proposal: { decision: string } };
+    expect(r.proposal.decision).toBe("approved");
+    const sql = issued();
+    expect(sql[1]).toContain("UPDATE reply_proposals");
+    expect(sql[1]).toContain("decision = 'pending'");
+    expect(sql[1]).toContain("approved_text");
+    expect(sql[1]).not.toContain("posted_id");
+    expect(mockSql.mock.calls[2][1]).toBe("md");
+    expect(mockSql.mock.calls[2]).toContain("reply_approved");
+  });
+
+  it("a non-MD cannot decide a reply", async () => {
+    const server = makeServer();
+    mockSql.mockResolvedValueOnce([editorUser]);
+    await expect(callParsed(server, "web_decide_reply", { proposal_id: DRAFT_ID, reviewer_user_id: EDITOR_ID, decision: "approved" })).rejects.toThrow(/requires an MD/);
+    expect(issued()).toHaveLength(1);
+  });
+
+  it("claim is one guarded UPDATE on an approved, unclaimed row; zero rows is an error, not a no-op", async () => {
+    const server = makeServer();
+    mockSql.mockResolvedValueOnce([{ id: DRAFT_ID, platform: "x", mention_id: "m1", decision: "approved", posted_id: null }]).mockResolvedValueOnce([auditRow]);
+    const r = (await callParsed(server, "web_record_reply_post", { proposal_id: DRAFT_ID, outcome: "claim" })) as { proposal: { decision: string } };
+    expect(r.proposal.decision).toBe("approved");
+    const sql = issued();
+    expect(sql[0]).toContain("post_attempted_at = NOW()");
+    expect(sql[0]).toContain("decision = 'approved' AND post_attempted_at IS NULL");
+    expect(mockSql.mock.calls[1][1]).toBe("system");
+    expect(mockSql.mock.calls[1]).toContain("reply_post_claim");
 
     mockSql.mockReset();
-    mockSql.mockResolvedValueOnce([mdUser]);
-    await expect(callParsed(server, "web_decide_reply", { proposal_id: DRAFT_ID, reviewer_user_id: MD_ID, decision: "posted" })).rejects.toThrow(/posted_id/);
+    mockSql.mockResolvedValueOnce([]);
+    await expect(callParsed(server, "web_record_reply_post", { proposal_id: DRAFT_ID, outcome: "claim" })).rejects.toThrow(/not approved, or a post attempt is already in flight/);
+    expect(issued()).toHaveLength(1);
+  });
+
+  it("'posted' needs the platform id and a prior claim; 'failed' releases the claim", async () => {
+    const server = makeServer();
+    await expect(callParsed(server, "web_record_reply_post", { proposal_id: DRAFT_ID, outcome: "posted" })).rejects.toThrow(/posted_id/);
+    expect(issued()).toHaveLength(0);
+
+    mockSql.mockResolvedValueOnce([{ id: DRAFT_ID, platform: "x", mention_id: "m1", decision: "posted", posted_id: "t1" }]).mockResolvedValueOnce([auditRow]);
+    await callParsed(server, "web_record_reply_post", { proposal_id: DRAFT_ID, outcome: "posted", posted_id: "t1", posted_text: "b" });
+    expect(issued()[0]).toContain("decision = 'posted'");
+    expect(issued()[0]).toContain("decision = 'approved' AND post_attempted_at IS NOT NULL");
+
+    mockSql.mockReset();
+    mockSql.mockResolvedValueOnce([{ id: DRAFT_ID, platform: "x", mention_id: "m1", decision: "approved", posted_id: null }]).mockResolvedValueOnce([auditRow]);
+    await callParsed(server, "web_record_reply_post", { proposal_id: DRAFT_ID, outcome: "failed", error: "Twitter 503" });
+    expect(issued()[0]).toContain("post_attempted_at = NULL");
+    expect(mockSql.mock.calls[0]).toContain("Twitter 503");
+  });
+
+  it("web_get_ledger_forecast is a plain SELECT by id", async () => {
+    const server = makeServer();
+    mockSql.mockResolvedValueOnce([PUBLISHED_ROW]);
+    const r = (await callParsed(server, "web_get_ledger_forecast", { forecast_id: DRAFT_ID })) as { forecast: { entry_id: string } };
+    expect(r.forecast.entry_id).toBe("PT-2026-001");
+    expect(issued()[0]).toContain("SELECT * FROM ledger_forecasts WHERE id = $");
+    mockSql.mockReset();
+    mockSql.mockResolvedValueOnce([]);
+    await expect(callParsed(server, "web_get_ledger_forecast", { forecast_id: DRAFT_ID })).rejects.toThrow(/not found/);
   });
 });
 

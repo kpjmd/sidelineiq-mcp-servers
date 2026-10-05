@@ -204,6 +204,7 @@ const WEB: Record<string, Hints> = {
   // COALESCE keeps the first value; the trigger refuses a second.
   web_record_ledger_provenance: [false, false, true, false],
   web_get_ledger_entry: READ,
+  web_get_ledger_forecast: READ,
   web_list_ledger_entries: READ,
   web_list_ledger_resolutions: READ,
   web_export_ledger: READ,
@@ -217,7 +218,10 @@ const WEB: Record<string, Hints> = {
   // Idempotent per (platform, mention_id).
   web_propose_reply: [false, false, true, false],
   web_list_reply_proposals: READ,
+  // 027: approve/discard; a repeat finds the proposal decided and throws.
   web_decide_reply: [false, false, false, false],
+  // One-way transitions; a second claim is an error (the double-post lock).
+  web_record_reply_post: [false, false, false, false],
 };
 
 // Both social servers are pure external-API proxies — every tool is open-world.
@@ -242,7 +246,7 @@ const TWITTER: Record<string, Hints> = {
 };
 
 const SERVERS = [
-  { label: "web", register: registerWebTools, expected: WEB, count: 85 },
+  { label: "web", register: registerWebTools, expected: WEB, count: 87 },
   { label: "farcaster", register: registerFarcasterTools, expected: FARCASTER, count: 6 },
   { label: "twitter", register: registerTwitterTools, expected: TWITTER, count: 6 },
 ] as const;
@@ -293,12 +297,12 @@ describe.each(SERVERS)("$label tool annotations", ({ register, expected, count }
 });
 
 describe("annotation coverage across all servers", () => {
-  it("covers all 97 tools", () => {
+  it("covers all 99 tools", () => {
     const total = SERVERS.reduce(
       (sum, { register }) => sum + Object.keys(annotationsByTool(register)).length,
       0,
     );
 
-    expect(total).toBe(97);
+    expect(total).toBe(99);
   });
 });

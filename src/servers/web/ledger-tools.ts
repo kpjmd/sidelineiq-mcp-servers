@@ -229,6 +229,20 @@ export function registerLedgerTools(server: McpServer, web: WebDatabaseClient, l
   );
 
   server.tool(
+    "web_get_ledger_forecast",
+    "Fetch one ledger forecast row by its id, draft or published. The agents' publish function reads the STORED published row this way before rendering the card text and the commit from it; nothing is ever rendered from caller-supplied fields.",
+    { forecast_id: uuid("ledger_forecasts.id") },
+    READ,
+    async (input) => {
+      try {
+        return toolSuccess({ forecast: await ledger.getForecast(input.forecast_id) });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  server.tool(
     "web_list_ledger_entries",
     "List ledger forecast rows, newest first. Published only unless include_drafts.",
     {
@@ -402,19 +416,39 @@ export function registerLedgerTools(server: McpServer, web: WebDatabaseClient, l
 
   server.tool(
     "web_decide_reply",
-    "Record the physician's decision on a reply proposal: posted (with the platform id and the final text) or discarded. MD only. This records the decision; the agents' reply publisher is what posts, and it posts only a proposal decided here.",
+    "The physician's decision on a reply proposal (027): approved (with the final wording, if edited) or discarded. MD only (role re-derived). Records who and when BEFORE anything is posted; nothing is posted by this call. The agents' reply publisher posts only an approved proposal and records the result with web_record_reply_post.",
     {
       proposal_id: uuid("reply_proposals.id"),
       reviewer_user_id: reviewer,
-      decision: z.enum(["posted", "discarded"]),
-      posted_id: z.string().nullable().optional(),
-      posted_text: z.string().nullable().optional(),
+      decision: z.enum(["approved", "discarded"]),
+      approved_text: z.string().min(1).nullable().optional().describe("The MD's final wording when edited; omitted = post proposed_text as drafted"),
       note: z.string().nullable().optional(),
     },
     WRITE,
     async (input) => {
       try {
         return toolSuccess({ proposal: await ledger.decideReply(input) });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  server.tool(
+    "web_record_reply_post",
+    "The reply publisher's state machine, system caller (027). 'claim' takes an APPROVED proposal for posting, once — a second claim is an error, which is what stops a double click or a retried request posting twice. 'posted' records the platform id and the text that went out. 'failed' releases the claim and records the error so the physician can retry. A pending or discarded proposal is never changed.",
+    {
+      proposal_id: uuid("reply_proposals.id"),
+      outcome: z.enum(["claim", "posted", "failed"]),
+      posted_id: z.string().min(1).nullable().optional().describe("Required with outcome 'posted': the tweet id or cast hash"),
+      posted_text: z.string().nullable().optional(),
+      error: z.string().nullable().optional().describe("With outcome 'failed': why the post did not go out"),
+    },
+    // Each transition is a one-way step; a repeat is an error by design.
+    WRITE,
+    async (input) => {
+      try {
+        return toolSuccess({ proposal: await ledger.recordReplyPost(input) });
       } catch (err) {
         return handleToolError(err, logger);
       }
