@@ -157,10 +157,20 @@ export interface ProposeReplyInput {
 export interface DecideReplyInput {
   proposal_id: string;
   reviewer_user_id: string;
-  decision: "posted" | "discarded";
+  /** 027: the MD approves or discards. 'posted' is written only by recordReplyPost after the platform answers. */
+  decision: "approved" | "discarded";
+  /** The MD's final wording if edited before approval. */
+  approved_text?: string | null;
+  note?: string | null;
+}
+
+export interface RecordReplyPostInput {
+  proposal_id: string;
+  /** claim: take the approved row for posting (once); posted: record the platform id; failed: release the claim. */
+  outcome: "claim" | "posted" | "failed";
   posted_id?: string | null;
   posted_text?: string | null;
-  note?: string | null;
+  error?: string | null;
 }
 
 export interface LedgerEntryDetail {
@@ -536,6 +546,13 @@ export class LedgerClient {
 
   // ── Reads ───────────────────────────────────────────────────────────
 
+  /** One forecast row by primary key, draft or published. The agents' publish function reads the STORED row this way. */
+  async getForecast(forecastId: string): Promise<LedgerForecast> {
+    const rows = await this.sql`SELECT * FROM ledger_forecasts WHERE id = ${forecastId}`;
+    if (rows.length === 0) throw notFound("Ledger forecast", forecastId, "Use web_list_ledger_entries (include_drafts for drafts) to find it.");
+    return rows[0] as LedgerForecast;
+  }
+
   async getEntry(entryId: string): Promise<LedgerEntryDetail> {
     const versions = (await this.sql`
       SELECT * FROM ledger_forecasts WHERE entry_id = ${entryId} AND status = 'published' ORDER BY version
@@ -790,15 +807,18 @@ export class LedgerClient {
     return rows as ReplyProposal[];
   }
 
+  /**
+   * The physician's decision on a proposal (027): approve (recording who, when and
+   * the final wording) or discard. Nothing is posted here. 'posted' is not a value
+   * the MD can set — recordReplyPost writes it after the platform returns an id.
+   */
   async decideReply(input: DecideReplyInput): Promise<ReplyProposal> {
     await this.requireMd(input.reviewer_user_id, "Deciding a reply");
-    if (input.decision === "posted" && !input.posted_id) {
-      throw new McpToolError("A posted reply needs its posted_id", "Pass the id the platform returned for the reply.");
-    }
+    const approvedText = input.decision === "approved" ? (input.approved_text?.trim() || null) : null;
     const rows = await this.sql`
       UPDATE reply_proposals
       SET decision = ${input.decision}, decided_by = ${input.reviewer_user_id}, decided_at = NOW(),
-          posted_id = ${input.posted_id ?? null}, posted_text = ${input.posted_text ?? null}, note = ${input.note ?? null}
+          approved_text = ${approvedText}, note = ${input.note ?? null}
       WHERE id = ${input.proposal_id} AND decision = 'pending'
       RETURNING *
     `;
@@ -809,8 +829,63 @@ export class LedgerClient {
       actor_id: input.reviewer_user_id,
       entity_type: "reply_proposal",
       entity_id: proposal.id,
-      action: input.decision === "posted" ? "reply_posted" : "reply_discarded",
-      payload: { platform: proposal.platform, mention_id: proposal.mention_id, posted_id: proposal.posted_id },
+      action: input.decision === "approved" ? "reply_approved" : "reply_discarded",
+      payload: {
+        platform: proposal.platform,
+        mention_id: proposal.mention_id,
+        text_edited: approvedText !== null && approvedText !== proposal.proposed_text,
+      },
+    });
+    return proposal;
+  }
+
+  /**
+   * The reply publisher's state machine, system caller (027). Every transition is
+   * one guarded UPDATE whose WHERE clause IS the rule:
+   *   claim  — approved AND no attempt in flight → post_attempted_at = NOW(). Zero rows
+   *            is an error, not a no-op: that is the double-click lock.
+   *   posted — approved AND claimed → decision 'posted' + the platform id.
+   *   failed — approved AND claimed → claim released, error recorded; the MD retries.
+   * A pending or discarded proposal is never touched by any branch.
+   */
+  async recordReplyPost(input: RecordReplyPostInput): Promise<ReplyProposal> {
+    let rows: unknown[];
+    if (input.outcome === "claim") {
+      rows = await this.sql`
+        UPDATE reply_proposals SET post_attempted_at = NOW(), post_error = NULL
+        WHERE id = ${input.proposal_id} AND decision = 'approved' AND post_attempted_at IS NULL
+        RETURNING *
+      `;
+      if (rows.length === 0) {
+        throw new McpToolError(
+          `Reply proposal ${input.proposal_id} is not approved, or a post attempt is already in flight`,
+          "Only an approved proposal with no attempt in flight can be claimed. If an earlier attempt hung, inspect the row before retrying.",
+        );
+      }
+    } else if (input.outcome === "posted") {
+      if (!input.posted_id) throw new McpToolError("A posted reply needs its posted_id", "Pass the id the platform returned for the reply.");
+      rows = await this.sql`
+        UPDATE reply_proposals SET decision = 'posted', posted_id = ${input.posted_id}, posted_text = ${input.posted_text ?? null}, post_error = NULL
+        WHERE id = ${input.proposal_id} AND decision = 'approved' AND post_attempted_at IS NOT NULL
+        RETURNING *
+      `;
+      if (rows.length === 0) throw notFound("Claimed approved reply proposal", input.proposal_id, "'posted' follows a successful 'claim' on an approved proposal.");
+    } else {
+      rows = await this.sql`
+        UPDATE reply_proposals SET post_attempted_at = NULL, post_error = ${input.error ?? "unknown error"}
+        WHERE id = ${input.proposal_id} AND decision = 'approved' AND post_attempted_at IS NOT NULL
+        RETURNING *
+      `;
+      if (rows.length === 0) throw notFound("Claimed approved reply proposal", input.proposal_id, "'failed' releases a claim; there is none to release.");
+    }
+    const proposal = rows[0] as ReplyProposal;
+    await this.web.auditAppend({
+      actor: "system",
+      actor_id: "ledger-reply-publish",
+      entity_type: "reply_proposal",
+      entity_id: proposal.id,
+      action: `reply_post_${input.outcome}`,
+      payload: { platform: proposal.platform, mention_id: proposal.mention_id, posted_id: proposal.posted_id, error: input.error ?? null },
     });
     return proposal;
   }

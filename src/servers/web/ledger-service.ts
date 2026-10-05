@@ -147,9 +147,15 @@ export interface ReplyProposal {
   mention_text: string | null;
   proposed_text: string;
   proposed_at: string | Date;
-  decision: "pending" | "posted" | "discarded";
+  /** 027: 'approved' is the physician's recorded confirmation; only the system moves approved → posted. */
+  decision: "pending" | "approved" | "posted" | "discarded";
   decided_by: string | null;
   decided_at: string | Date | null;
+  /** The MD's final wording at approval, when edited; the publisher posts approved_text ?? proposed_text. */
+  approved_text: string | null;
+  /** Set once by the publisher's claim while it posts; cleared by 'failed'. The double-post lock. */
+  post_attempted_at: string | Date | null;
+  post_error: string | null;
   posted_text: string | null;
   posted_id: string | null;
   note: string | null;
