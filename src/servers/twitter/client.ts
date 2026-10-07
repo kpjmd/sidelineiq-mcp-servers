@@ -195,8 +195,15 @@ export class TwitterClient {
   }
 
   private handleTwitterError(err: unknown): never {
+    // twitter-api-v2's ApiResponseError carries X's own explanation in `data`
+    // ({title, detail, errors[]}); its `message` is only "Request failed with
+    // code 403". The first ledger card reply failed with that bare 403 and the
+    // log could not say whether it was permissions, a reply restriction, or a
+    // post too long for a non-Premium account. Surface the detail everywhere.
+    const detail = twitterErrorDetail(err);
     logger.error("Twitter API error", {
       error: err instanceof Error ? err.message : String(err),
+      ...(detail ? { detail } : {}),
     });
 
     if (err && typeof err === "object" && "code" in err) {
@@ -218,8 +225,8 @@ export class TwitterClient {
 
       if (code === 403) {
         throw new McpToolError(
-          "Twitter API forbidden — check app permissions",
-          "Verify Twitter API credentials have read+write permissions in the Twitter Developer Portal.",
+          detail ? `Twitter API forbidden: ${detail}` : "Twitter API forbidden (no detail from X)",
+          "A 403 from X means one of: the app lacks write permission (Developer Portal), the account may not reply to that conversation (reply restrictions or a block), the text is longer than the account's limit (280 characters without Premium), or the content was rejected. The detail above is X's own wording.",
         );
       }
     }
@@ -232,11 +239,28 @@ export class TwitterClient {
     }
 
     throw new McpToolError(
-      "Twitter API request failed",
+      detail ? `Twitter API request failed: ${detail}` : "Twitter API request failed",
       "Check server logs for details. Verify Twitter API credentials are valid.",
       err,
     );
   }
+}
+
+/** X's own explanation from an ApiResponseError, or null when there is none. Exported for tests. */
+export function twitterErrorDetail(err: unknown): string | null {
+  const data = (err as { data?: unknown } | null)?.data;
+  if (!data || typeof data !== "object") return null;
+  const d = data as { title?: unknown; detail?: unknown; errors?: unknown };
+  const parts: string[] = [];
+  if (typeof d.title === "string") parts.push(d.title);
+  if (typeof d.detail === "string" && d.detail !== d.title) parts.push(d.detail);
+  if (Array.isArray(d.errors)) {
+    for (const e of d.errors) {
+      const m = (e as { message?: unknown } | null)?.message;
+      if (typeof m === "string" && !parts.includes(m)) parts.push(m);
+    }
+  }
+  return parts.length > 0 ? parts.join(" — ") : null;
 }
 
 function isCount(value: unknown): value is number {
