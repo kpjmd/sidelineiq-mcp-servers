@@ -1,5 +1,5 @@
 /**
- * Prove migration 026's triggers (and 027's reply state machine) against a real database.
+ * Prove migration 026's triggers (027's reply state machine, 028's set-once linkage) against a real database.
  *
  * `mockSql` cannot exercise a trigger, and the ledger's whole promise — a
  * published forecast row is immutable — lives in one. This script publishes a
@@ -8,7 +8,7 @@
  * to succeed exactly once.
  *
  * It leaves a PUBLISHED test row behind (by design it cannot delete it), so it
- * must only ever run against a scratch Neon branch on which 026 and 027 have
+ * must only ever run against a scratch Neon branch on which 026, 027 and 028 have
  * already been applied with psql:
  *
  *   LEDGER_SCHEMA_CHECK_DATABASE_URL=postgres://… \
@@ -114,6 +114,19 @@ async function main(): Promise<void> {
   await check({ name: "published: set x_post_id via COALESCE (first value sticks)", expect: "ok", run: () => sql`UPDATE ledger_forecasts SET x_post_id = COALESCE(x_post_id, '1') WHERE id = ${id}` });
   await check({ name: "published: COALESCE a second x_post_id (no change, no raise)", expect: "ok", run: () => sql`UPDATE ledger_forecasts SET x_post_id = COALESCE(x_post_id, '2') WHERE id = ${id}` });
   await check({ name: "published: DELETE", expect: "raise", run: () => sql`DELETE FROM ledger_forecasts WHERE id = ${id}` });
+
+  // 028: linkage ids are once-settable, outside the hash; every other column stays frozen.
+  await check({ name: "028 published: set gsis_id/pfr_id/espn/team/season once", expect: "ok", run: () => sql`UPDATE ledger_forecasts SET gsis_id = COALESCE(gsis_id, '00-0000001'), pfr_id = COALESCE(pfr_id, 'ChecSc00'), espn_athlete_id = COALESCE(espn_athlete_id, '1'), nflverse_team = COALESCE(nflverse_team, 'ZZ'), season = COALESCE(season, 2999) WHERE id = ${id}` });
+  await check({ name: "028 published: change gsis_id", expect: "raise", run: () => sql`UPDATE ledger_forecasts SET gsis_id = '00-0000002' WHERE id = ${id}` });
+  await check({ name: "028 published: clear pfr_id", expect: "raise", run: () => sql`UPDATE ledger_forecasts SET pfr_id = NULL WHERE id = ${id}` });
+  await check({ name: "028 published: change season", expect: "raise", run: () => sql`UPDATE ledger_forecasts SET season = 3000 WHERE id = ${id}` });
+  await check({ name: "028 published: a hashed field is still frozen", expect: "raise", run: () => sql`UPDATE ledger_forecasts SET f1_ir = 0.5 WHERE id = ${id}` });
+  await check({ name: "028 published: player_id stays frozen", expect: "raise", run: () => sql`UPDATE ledger_forecasts SET player_id = gen_random_uuid() WHERE id = ${id}` });
+  await check({ name: "028 published: row_hash unchanged by linkage", expect: "ok", run: async () => {
+    const r = (await sql`SELECT row_hash FROM ledger_forecasts WHERE id = ${id}`) as { row_hash: string }[];
+    if (r[0].row_hash !== hash) throw new Error(`row_hash moved: ${r[0].row_hash}`);
+    return r;
+  } });
 
   // Resolutions.
   const entryId = published[0].entry_id;

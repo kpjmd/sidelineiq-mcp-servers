@@ -215,6 +215,8 @@ const WEB: Record<string, Hints> = {
   web_decide_ledger_proposal: [false, false, false, false],
   // Append-only correction rows.
   web_record_ledger_correction: [false, false, false, false],
+  // 028: set-once ids; the same ids again are a no-op.
+  web_record_ledger_linkage: [false, false, true, false],
   // Idempotent per (platform, mention_id).
   web_propose_reply: [false, false, true, false],
   web_list_reply_proposals: READ,
@@ -246,7 +248,7 @@ const TWITTER: Record<string, Hints> = {
 };
 
 const SERVERS = [
-  { label: "web", register: registerWebTools, expected: WEB, count: 87 },
+  { label: "web", register: registerWebTools, expected: WEB, count: 88 },
   { label: "farcaster", register: registerFarcasterTools, expected: FARCASTER, count: 6 },
   { label: "twitter", register: registerTwitterTools, expected: TWITTER, count: 6 },
 ] as const;
@@ -297,12 +299,12 @@ describe.each(SERVERS)("$label tool annotations", ({ register, expected, count }
 });
 
 describe("annotation coverage across all servers", () => {
-  it("covers all 99 tools", () => {
+  it("covers all 100 tools", () => {
     const total = SERVERS.reduce(
       (sum, { register }) => sum + Object.keys(annotationsByTool(register)).length,
       0,
     );
 
-    expect(total).toBe(99);
+    expect(total).toBe(100);
   });
 });
