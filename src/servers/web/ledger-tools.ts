@@ -8,7 +8,8 @@
 //   the ingest may call   web_propose_ledger_resolution, web_propose_reply
 //   the publish loop may  web_record_ledger_provenance (after a confirmed publish)
 //   ONLY the physician    web_publish_ledger_forecast, web_decide_ledger_proposal,
-//                         web_record_ledger_correction, web_decide_reply
+//                         web_record_ledger_correction, web_record_ledger_linkage,
+//                         web_decide_reply
 //   — each of those takes reviewer_user_id and the client re-derives the role
 //   from the users table; a caller-supplied role is never read.
 
@@ -372,6 +373,31 @@ export function registerLedgerTools(server: McpServer, web: WebDatabaseClient, l
     async (input) => {
       try {
         return toolSuccess({ correction: await ledger.recordCorrection(input) });
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── Linkage (028) ───────────────────────────────────────────────────
+  server.tool(
+    "web_record_ledger_linkage",
+    "Attach the public-record ids the resolution ingest keys on (ESPN athlete id, nflverse GSIS and PFR ids, nflverse team, season) to every published version of an entry. MD only. Each id is set once and never changed; none is part of the row hash. Also writes a ledger_corrections row recording the ids. Look the ids up by ESPN id first (agents GET /admin/ledger/nflverse-ids); never by name.",
+    {
+      entry_id: entryId,
+      reviewer_user_id: reviewer,
+      espn_athlete_id: z.string().regex(/^\d{1,12}$/).describe("ESPN athlete id (numeric)"),
+      gsis_id: z.string().regex(/^\d{2}-\d{7}$/).describe("nflverse GSIS id, e.g. 00-0034796 (injury report key)"),
+      pfr_id: z.string().regex(/^[A-Za-z][A-Za-z.]{1,7}\d{2}$/).describe("Pro Football Reference id, e.g. JackLa00 (snap counts key)"),
+      nflverse_team: z.string().regex(/^[A-Z]{2,3}$/).nullable().optional().describe("Team abbreviation as nflverse games.csv spells it"),
+      season: z.number().int().min(2000).max(2100).nullable().optional().describe("NFL season (the year it starts)"),
+      note: z.string().min(1).nullable().optional(),
+    },
+    // Set-once: the same ids again are a no-op; different ids are refused.
+    { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    async (input) => {
+      try {
+        return toolSuccess(await ledger.recordLinkage(input));
       } catch (err) {
         return handleToolError(err, logger);
       }

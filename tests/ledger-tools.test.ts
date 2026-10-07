@@ -449,3 +449,58 @@ describe("strict input policy covers the ledger tools", () => {
     expect(schema.safeParse({ ...base, tier: 3 }).success).toBe(false);
   });
 });
+
+// 028: linkage ids are set once on a published entry, never by name, and the
+// attachment is itself an append-only correction row.
+describe("web_record_ledger_linkage", () => {
+  const IDS = { espn_athlete_id: "3916387", gsis_id: "00-0034796", pfr_id: "JackLa00", nflverse_team: "BAL", season: 2026 };
+  const idless = { ...PUBLISHED_ROW, espn_athlete_id: null, gsis_id: null, pfr_id: null, nflverse_team: null, season: null };
+
+  it("sets NULL ids with COALESCE in one CTE that also files a correction, and audits the MD", async () => {
+    const server = makeServer();
+    mockSql
+      .mockResolvedValueOnce([mdUser])
+      .mockResolvedValueOnce([idless])
+      .mockResolvedValueOnce([{ updated: 1, correction: { id: "c1", entry_id: "PT-2026-001", field: "linkage" } }])
+      .mockResolvedValueOnce([{ ...idless, ...IDS }])
+      .mockResolvedValueOnce([auditRow]);
+    const out = (await callParsed(server, "web_record_ledger_linkage", { entry_id: "PT-2026-001", reviewer_user_id: MD_ID, ...IDS })) as { changed: boolean };
+    expect(out.changed).toBe(true);
+    const sql = issued();
+    expect(sql[2]).toContain("gsis_id = COALESCE(gsis_id,");
+    expect(sql[2]).toContain("INSERT INTO ledger_corrections");
+    expect(sql[2]).toContain("status = 'published'");
+    // The hash and every forecast number are untouched.
+    for (const col of ["row_hash", "f1_ir", "f4_point", "published_at"]) expect(sql[2]).not.toContain(`${col} =`);
+    expect(mockSql.mock.calls[4][1]).toBe("md");
+  });
+
+  it("is a no-op when the same ids are already stored", async () => {
+    const server = makeServer();
+    mockSql.mockResolvedValueOnce([mdUser]).mockResolvedValueOnce([{ ...idless, ...IDS }]);
+    const out = (await callParsed(server, "web_record_ledger_linkage", { entry_id: "PT-2026-001", reviewer_user_id: MD_ID, ...IDS })) as { changed: boolean };
+    expect(out.changed).toBe(false);
+    expect(issued().some((s) => s.includes("UPDATE"))).toBe(false);
+  });
+
+  it("refuses a different id once one is set", async () => {
+    const server = makeServer();
+    mockSql.mockResolvedValueOnce([mdUser]).mockResolvedValueOnce([{ ...idless, ...IDS, pfr_id: "OtheRx00" }]);
+    await expect(callParsed(server, "web_record_ledger_linkage", { entry_id: "PT-2026-001", reviewer_user_id: MD_ID, ...IDS })).rejects.toThrow(/set once/);
+    expect(issued().some((s) => s.includes("UPDATE"))).toBe(false);
+  });
+
+  it("refuses a non-MD before reading anything", async () => {
+    const server = makeServer();
+    mockSql.mockResolvedValueOnce([editorUser]);
+    await expect(callParsed(server, "web_record_ledger_linkage", { entry_id: "PT-2026-001", reviewer_user_id: EDITOR_ID, ...IDS })).rejects.toThrow(/requires an MD/);
+    expect(mockSql).toHaveBeenCalledTimes(1);
+  });
+
+  it("takes ids, never a name", () => {
+    const schema = getTool(makeServer(), "web_record_ledger_linkage").inputSchema;
+    expect(schema.safeParse({ entry_id: "PT-2026-001", reviewer_user_id: MD_ID, ...IDS, player: "Lamar Jackson" }).success).toBe(true); // stripped here; strict policy rejects it on tools/call
+    expect(schema.safeParse({ entry_id: "PT-2026-001", reviewer_user_id: MD_ID, ...IDS, gsis_id: "Lamar Jackson" }).success).toBe(false);
+    expect(schema.safeParse({ entry_id: "PT-2026-001", reviewer_user_id: MD_ID, ...IDS, espn_athlete_id: "Lamar" }).success).toBe(false);
+  });
+});

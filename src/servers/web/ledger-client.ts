@@ -126,6 +126,21 @@ export interface RecordCorrectionInput {
   corrected_by: string;
 }
 
+export interface RecordLinkageInput {
+  entry_id: string;
+  reviewer_user_id: string;
+  espn_athlete_id: string;
+  gsis_id: string;
+  pfr_id: string;
+  nflverse_team?: string | null;
+  season?: number | null;
+  note?: string | null;
+}
+
+/** The five once-settable linkage columns (migration 028). None is in the row hash. */
+export const LINKAGE_COLUMNS = ["espn_athlete_id", "gsis_id", "pfr_id", "nflverse_team", "season"] as const;
+type LinkageColumn = (typeof LINKAGE_COLUMNS)[number];
+
 export interface UpsertBaseRateInput {
   row_key: string;
   injury_type: string;
@@ -771,6 +786,89 @@ export class LedgerClient {
       payload: { entry_id: row.entry_id, field: row.field, old_value: row.old_value, new_value: row.new_value },
     });
     return row;
+  }
+
+  // ── Linkage (028) ───────────────────────────────────────────────────
+
+  /**
+   * Attach the public-record ids the resolution ingest keys on to EVERY published
+   * version of an entry. MD only. Each column goes NULL → value once (the trigger
+   * enforces it); a value already set to something else is refused here with a
+   * readable error rather than a trigger exception. The ids are recorded in
+   * ledger_corrections by the same statement, so the attachment is itself an
+   * append-only public record. None of these columns is hashed.
+   */
+  async recordLinkage(input: RecordLinkageInput): Promise<{ forecasts: LedgerForecast[]; correction: LedgerCorrection | null; changed: boolean }> {
+    await this.requireMd(input.reviewer_user_id, "Recording ledger linkage ids");
+    const wanted: Record<LinkageColumn, string | number | null> = {
+      espn_athlete_id: input.espn_athlete_id,
+      gsis_id: input.gsis_id,
+      pfr_id: input.pfr_id,
+      nflverse_team: input.nflverse_team ?? null,
+      season: input.season ?? null,
+    };
+    const current = (await this.sql`
+      SELECT * FROM ledger_forecasts WHERE entry_id = ${input.entry_id} AND status = 'published' ORDER BY version
+    `) as LedgerForecast[];
+    if (current.length === 0) throw notFound("Ledger entry", input.entry_id, "Linkage is recorded on published entries only; a draft takes ids through web_update_ledger_draft.");
+
+    const conflicts: string[] = [];
+    let missing = false;
+    for (const row of current) {
+      for (const col of LINKAGE_COLUMNS) {
+        const want = wanted[col];
+        if (want === null) continue;
+        const have = (row as unknown as Record<string, unknown>)[col];
+        if (have === null || have === undefined) missing = true;
+        else if (String(have) !== String(want)) conflicts.push(`v${row.version} ${col}=${String(have)} (asked ${String(want)})`);
+      }
+    }
+    if (conflicts.length > 0) {
+      throw new McpToolError(
+        `Linkage ids are set once and differ from what is stored: ${conflicts.join("; ")}`,
+        "A wrong id on a published entry cannot be changed. Record a clerical correction with web_record_ledger_correction and raise it with the physician.",
+      );
+    }
+    if (!missing) return { forecasts: current, correction: null, changed: false };
+
+    const oldValue = JSON.stringify(
+      current.map((r) => ({ version: r.version, ...Object.fromEntries(LINKAGE_COLUMNS.map((c) => [c, (r as unknown as Record<string, unknown>)[c] ?? null])) })),
+    );
+    const newValue = JSON.stringify(wanted);
+    const note = input.note?.trim() || "Linkage ids attached after publish (espn → gsis/pfr via nflverse players.csv). Not part of the row hash.";
+    const rows = await this.sql`
+      WITH f AS (
+        UPDATE ledger_forecasts SET
+          espn_athlete_id = COALESCE(espn_athlete_id, ${wanted.espn_athlete_id}),
+          gsis_id = COALESCE(gsis_id, ${wanted.gsis_id}),
+          pfr_id = COALESCE(pfr_id, ${wanted.pfr_id}),
+          nflverse_team = COALESCE(nflverse_team, ${wanted.nflverse_team}),
+          season = COALESCE(season, ${wanted.season}),
+          updated_at = NOW()
+        WHERE entry_id = ${input.entry_id} AND status = 'published'
+        RETURNING id
+      ),
+      c AS (
+        INSERT INTO ledger_corrections (entry_id, field, old_value, new_value, note, corrected_by)
+        SELECT ${input.entry_id}, 'linkage', ${oldValue}, ${newValue}, ${note}, ${input.reviewer_user_id}
+        WHERE EXISTS (SELECT 1 FROM f)
+        RETURNING *
+      )
+      SELECT (SELECT COUNT(*) FROM f)::int AS updated, (SELECT row_to_json(c) FROM c) AS correction
+    `;
+    const out = rows[0] as { updated: number; correction: LedgerCorrection | null };
+    const forecasts = (await this.sql`
+      SELECT * FROM ledger_forecasts WHERE entry_id = ${input.entry_id} AND status = 'published' ORDER BY version
+    `) as LedgerForecast[];
+    await this.web.auditAppend({
+      actor: "md",
+      actor_id: input.reviewer_user_id,
+      entity_type: "ledger_forecast",
+      entity_id: forecasts[0].id,
+      action: "ledger_record_linkage",
+      payload: { entry_id: input.entry_id, versions_updated: out.updated, ...wanted, correction_id: out.correction?.id ?? null },
+    });
+    return { forecasts, correction: out.correction, changed: true };
   }
 
   // ── Gated replies (D6) ──────────────────────────────────────────────
