@@ -448,6 +448,29 @@ describe("strict input policy covers the ledger tools", () => {
     expect(schema.safeParse({ ...base, f1_ir: 1.2 }).success).toBe(false);
     expect(schema.safeParse({ ...base, tier: 3 }).success).toBe(false);
   });
+
+  // 029: position is autofilled from players.position (VARCHAR(32)); an ILB's
+  // "Inside Linebacker" is 17 characters and used to reach the database as a
+  // NeonDbError. Every bounded text field now fails at the schema, named.
+  it("the draft schema bounds text fields to their column widths", () => {
+    const server = makeServer();
+    const schema = getTool(server, "web_create_ledger_draft").inputSchema;
+    const base = {
+      ...Object.fromEntries(Object.entries(DRAFT_ROW).filter(([k]) => ["player", "team", "reported_injury", "source_tier", "source_urls", "mechanism", "base_rate_row", "base_rate_strength", "f4_point", "f4_low", "f4_high", "season_ending", "what_moves_this", "tier"].includes(k))),
+      injury_date: "2026-10-04",
+      f1_ir: 0.18,
+      f2_next: 0.12,
+      f3_4wk: 0.61,
+      f5_reinjury: null,
+      created_by: MD_ID,
+    };
+    expect(schema.safeParse({ ...base, position: "Inside Linebacker" }).success).toBe(true);
+    const tooLong = schema.safeParse({ ...base, position: "x".repeat(33) });
+    expect(tooLong.success).toBe(false);
+    expect(tooLong.error?.issues[0].path).toEqual(["position"]);
+    expect(schema.safeParse({ ...base, position: "LB", team: "x".repeat(65) }).success).toBe(false);
+    expect(schema.safeParse({ ...base, position: "LB", gsis_id: "x".repeat(17) }).success).toBe(false);
+  });
 });
 
 // 028: linkage ids are set once on a published entry, never by name, and the
