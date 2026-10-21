@@ -258,7 +258,7 @@ every depth, cloning wrapper defs so `.describe()` text survives. `z.record` /
 `MCP_UNKNOWN_KEYS=strict|strip`, default strict; only an explicit `strip`
 reopens it. tools/list is byte-identical under both modes — strict changes what
 is ENFORCED, not what is ADVERTISED; `tests/input-key-policy.test.ts` pins that
-for all of them (97 as of 2026-10-04, 18 of them the ledger's; the number is
+for all of them (101 as of 2026-10-21, 18 of them the ledger's; the number is
 pinned in that test and TWICE in `tests/annotations.test.ts` — the all-server
 total and the per-server `count` — plus the per-tool hints map, so adding a tool
 means four edits, not one).
@@ -274,6 +274,43 @@ for every caller at once.
 RAW callback — zod never runs, so neither stripping nor rejection is visible to
 it. Use `tool.inputSchema.parse()` first, or a real `Client` over
 `InMemoryTransport` (see `tests/input-key-policy.test.ts`).
+
+### A published title is corrected, never edited
+
+`desk_update_draft` refuses anything but DRAFT/READY, and it stays that way: a
+general post-publish edit would let any section change behind a published
+attestation. The one post-publish edit is `desk_correct_title`
+(`correctDeskPostTitle`), built after the first live run shipped "Ben Simmons —
+achilles rupture" from DeskList's lowercase seeded title (2026-10-21).
+
+- **It re-attests.** The title is inside `deskContentHash`, so a correction moves
+  `content_hash`, and the attestation the post was published under no longer
+  covers it. The call takes the same three confirmations as `desk_attest`
+  (`assertMdConfirmations`, the status-free half of `assertCanAttest`), inserts
+  a `desk_attestations` row for the NEW hash and re-points `attestation_id`.
+  Every hash a live page can carry stays covered by an MD. Attestation first,
+  then the version-guarded UPDATE: a lost race leaves an unreferenced
+  attestation, never a title with no attestation behind it.
+- **MD only; no automation actor.** Unlike `web_thread_correct_laterality`, there
+  is no `actor`/`corrected_by` pair — this is published content under the
+  physician credential, and a script must never retitle it. The role is
+  re-derived from `users`.
+- **Audit:** `action: 'desk_title_corrected'`, `actor: 'md'`, with
+  `{previous_title, new_title, reason, previous_content_hash, new_content_hash,
+  attestation_id, version, slug}` in the payload (before/after are hashes only).
+  A `desk_post_versions` row carries `edit_diff: {title: {from, to}}`.
+- **Same title = no-op**, no writes at all. A stub title (only the athlete's
+  name) is refused by the same `checkTitle` the linter's `title_incomplete`
+  blocker uses.
+- **The handoff regenerates and the live page goes stale on its own.**
+  `refreshDraftJson` rewrites `headline` and `_sideline.content_hash`. `slug`,
+  `published_at` and every `kpjmd_*` column are untouched, so
+  `kpjmd_content_hash` still holds the OLD hash: the desk shows "stale" and
+  `desk_confirm_kpjmd_live` reports `live page is stale` until the handoff is
+  re-downloaded, rebuilt (full build, never `--slug`), rsynced and confirmed.
+- Tested against a RECORDED row (`tests/fixtures/desk-post-published-row.json`,
+  `src/scripts/record-desk-fixture.ts`): the refreshed handoff must equal the
+  recorded one except `headline` and `_sideline.content_hash`.
 
 ### The Prognosis Ledger is immutable by trigger, not by convention
 

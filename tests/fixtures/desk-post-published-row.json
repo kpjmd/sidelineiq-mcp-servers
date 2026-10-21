@@ -1,0 +1,147 @@
+{
+  "_recorded": {
+    "tool": "desk_get",
+    "desk_post_id": "67cb7fc3-f428-40c8-be70-c784c7d38500",
+    "at": "2026-10-21T04:27:37.649Z",
+    "source": "src/scripts/record-desk-fixture.ts"
+  },
+  "post": {
+    "id": "67cb7fc3-f428-40c8-be70-c784c7d38500",
+    "candidate_id": "c99d88a6-29f4-4320-bb16-3599980330d3",
+    "entity_id": "66837e46-97e5-4460-9d02-6a509a4c9930",
+    "slug": "ben-simmons-achilles-rupture",
+    "title": "Ben Simmons — achilles rupture",
+    "markdown_body": "## The Snapshot\n\nPer the Sacramento Kings, Ben Simmons tore his right Achilles tendon in practice this week, days before the season opener, ending a comeback attempt that began with a one-year minimum contract. It is the latest in a long run of injuries, most notably to his back, that has kept him off the court for much of the last several seasons.\n\n## What Happened\n\nAccording to the Kings, Simmons was hurt during a live drill in practice on Sunday. The Kings confirmed a torn right Achilles tendon, per the team's statement, and said surgery was completed on Tuesday October 20. ESPN's Shams Charania reported the injury first. Simmons signed with Sacramento in September 2026 after missing most of recent seasons. He has said publicly that he has been knocked down before and has always gotten back up.\n\nThe injury lands on a long medical history. In 2016 he fractured his right foot, the same side, in a scrimmage before his rookie season and had surgery to repair it.  He subsequently missed that entire year. Per public reporting he has since had a lower back nerve impingement, a knee injury, a herniated disc, a back surgery, and a recurrence of the nerve problem shut him down after 15 games in 2023-24. Reporting on exact dates and procedures is not consistent, so this account follows the public record only.\n\nThe surgeon, the surgical approach and the team's own recovery estimate have not been released.\n\n## The Anatomy\n\nThe Achilles is the largest tendon in the body. It connects the calf muscles to the heel bone and carries the force of every push-off, jump and sprint. Complete tears usually happen in the middle of the tendon or near its heel attachment, often during a sudden push-off or change of direction, which is consistent with a live practice drill. Tendons that have been repeatedly loaded or have gone through long layoffs can be less forgiving, although a single report cannot say whether that applies here.\n\n## The Repair\n\nA complete tear in an elite athlete is most often treated with surgical repair, followed by a staged rehabilitation: a period of protection, gradual weight bearing, calf strengthening, then running, jumping and cutting before basketball. The team has said surgery has been completed.The surgical technique used is not known.\n\n## The Timeline\n\nSurgery was reported complete on Tuesday October 20, so the clock has started. Recovery from an Achilles tear is generally measured in many months, not weeks. Return to full competitive basketball commonly takes around nine to twelve months or longer, and strength and explosiveness can lag behind the date an athlete is cleared. The Kings have not published a return timeline, so any date should be treated as an estimate.\n\nFor Simmons, the backdrop matters. He would be rebuilding the calf, tendon and push-off mechanics while also managing a back with a long surgical and nerve history, and he has not played a full season in years. That does not predict how this recovery will go. It does mean the rehabilitation has more moving parts than it would for an athlete with a clean medical record. Dated updates will be added as they are reported.\n\n## Why It Matters For You\n\nAchilles tears are not only a professional athlete's injury. They are common in recreational players in their 30s and 40s, often in a sudden push-off after a stretch of inactivity or a return to play. If you feel a pop or a sudden sharp blow at the back of the ankle, followed by weakness pushing off, get it examined promptly. Early assessment affects the treatment options.\n\n## Dr. Johnson's Take\n\nWhat stands out to me is the sequence. A player coming back from multiple publicly reported injuries enters a preseason ramp-up, then suffers a reported tendon injury in a drill. I cannot claim a link between his prior problems and this tear, although the frequency of injury is noteworthy. What I can say is that the first season back after a long layoff is a stress test for the body, and tendons are one of the slowest tissues to adapt.\n\n---\n\nCommentary by Keith P. Johnson, MD is general educational analysis based on publicly reported information. Dr. Johnson has not examined or treated these athletes. This is not a diagnosis, not medical advice, and does not create a physician-patient relationship.\n",
+    "draft_json": {
+      "faqs": [
+        {
+          "a": "Recovery is measured in months, not weeks. After surgical repair, patients are usually protected in a boot or brace at first, then progress through weight bearing, calf strengthening, walking, running and sport-specific work. Many athletes need around nine to twelve months or longer before returning to competition, and strength can lag behind clearance. Individual timelines vary with the injury, the repair and the athlete's health history.",
+          "q": "How long does recovery from an Achilles rupture usually take?"
+        },
+        {
+          "a": "Yes. Achilles tears are common in recreational players, especially people in their 30s and 40s who play stop-and-go sports after a period of inactivity. People often describe a sudden pop or a feeling of being kicked in the back of the ankle, followed by trouble pushing off. Anyone who suspects a tear should be examined promptly, because early assessment shapes the treatment options.",
+          "q": "Can a recreational athlete tear an Achilles the same way?"
+        },
+        {
+          "a": "The Achilles tendon connects the calf muscles to the heel bone and carries the load of walking, running and jumping. Tears usually happen when the tendon is loaded suddenly and hard, such as in a push-off or a change of direction. A long layoff, age and repeated stress on the tendon are commonly discussed risk factors. This is general education and not a statement about any one athlete.",
+          "q": "What is the Achilles tendon and why do tears happen?"
+        }
+      ],
+      "slug": "ben-simmons-achilles-rupture",
+      "bridge": "Achilles tears are not only a professional athlete's injury. They are common in recreational players in their 30s and 40s, often in a sudden push-off after a stretch of inactivity or a return to play. If you feel a pop or a sudden sharp blow at the back of the ankle, followed by weakness pushing off, get it examined promptly. Early assessment affects the treatment options.",
+      "league": "NBA",
+      "player": "Ben Simmons",
+      "anatomy": "The Achilles is the largest tendon in the body. It connects the calf muscles to the heel bone and carries the force of every push-off, jump and sprint. Complete tears usually happen in the middle of the tendon or near its heel attachment, often during a sudden push-off or change of direction, which is consistent with a live practice drill. Tendons that have been repeatedly loaded or have gone through long layoffs can be less forgiving, although a single report cannot say whether that applies here.",
+      "dr_take": "What stands out to me is the sequence. A player coming back from multiple publicly reported injuries enters a preseason ramp-up, then suffers a reported tendon injury in a drill. I cannot claim a link between his prior problems and this tear, although the frequency of injury is noteworthy. What I can say is that the first season back after a long layoff is a stress test for the body, and tendons are one of the slowest tissues to adapt.",
+      "headline": "Ben Simmons — achilles rupture",
+      "snapshot": "Per the Sacramento Kings, Ben Simmons tore his right Achilles tendon in practice this week, days before the season opener, ending a comeback attempt that began with a one-year minimum contract. It is the latest in a long run of injuries, most notably to his back, that has kept him off the court for much of the last several seasons.",
+      "timeline": "Surgery was reported complete on Tuesday October 20, so the clock has started. Recovery from an Achilles tear is generally measured in many months, not weeks. Return to full competitive basketball commonly takes around nine to twelve months or longer, and strength and explosiveness can lag behind the date an athlete is cleared. The Kings have not published a return timeline, so any date should be treated as an estimate.\n\nFor Simmons, the backdrop matters. He would be rebuilding the calf, tendon and push-off mechanics while also managing a back with a long surgical and nerve history, and he has not played a full season in years. That does not predict how this recovery will go. It does mean the rehabilitation has more moving parts than it would for an athlete with a clean medical record. Dated updates will be added as they are reported.",
+      "_sideline": {
+        "status": "PUBLISHED",
+        "entity_id": "66837e46-97e5-4460-9d02-6a509a4c9930",
+        "disclaimer": "Commentary by Keith P. Johnson, MD is general educational analysis based on publicly reported information. Dr. Johnson has not examined or treated these athletes. This is not a diagnosis, not medical advice, and does not create a physician-patient relationship.",
+        "content_hash": "b60684be4aba5868afcc9d7acfe59d791cdf5f96e6836e8c04cfb275da3856ad",
+        "desk_post_id": "67cb7fc3-f428-40c8-be70-c784c7d38500",
+        "source_attribution": [
+          {
+            "url": "https://www.nba.com/news/kings-guard-ben-simmons-suffers-torn-achilles-tendon-during-practice-sunday",
+            "label": "NBA.com"
+          },
+          {
+            "url": "https://www.si.com/nba/kings/onsi/ben-simmons-injury-history-what-kings-should-expect-from-3x-all-star",
+            "label": "SI.com"
+          },
+          {
+            "url": "https://basketnews.com/news-257765-sacramento-kings-announce-good-news-on-ben-simmons-achilles-injury.html",
+            "label": "basketnews.com"
+          }
+        ]
+      },
+      "treatment": "A complete tear in an elite athlete is most often treated with surgical repair, followed by a staged rehabilitation: a period of protection, gradual weight bearing, calf strengthening, then running, jumping and cutting before basketball. The team has said surgery has been completed.The surgical technique used is not known.",
+      "injury_type": "rupture",
+      "short_title": "Ben Simmons · Achilles",
+      "related_slugs": [
+        "jayson-tatum-achilles-tear"
+      ],
+      "relevant_tool": "achilles",
+      "what_happened": "According to the Kings, Simmons was hurt during a live drill in practice on Sunday. The Kings confirmed a torn right Achilles tendon, per the team's statement, and said surgery was completed on Tuesday October 20. ESPN's Shams Charania reported the injury first. Simmons signed with Sacramento in September 2026 after missing most of recent seasons. He has said publicly that he has been knocked down before and has always gotten back up.\n\nThe injury lands on a long medical history. In 2016 he fractured his right foot, the same side, in a scrimmage before his rookie season and had surgery to repair it.  He subsequently missed that entire year. Per public reporting he has since had a lower back nerve impingement, a knee injury, a herniated disc, a back surgery, and a recurrence of the nerve problem shut him down after 15 games in 2023-24. Reporting on exact dates and procedures is not consistent, so this account follows the public record only.\n\nThe surgeon, the surgical approach and the team's own recovery estimate have not been released.",
+      "published_date": "2026-10-21",
+      "schema_version": 2,
+      "meta_description": "Ben Simmons tore his right Achilles in Kings practice, per the team. What the injury is, how it's treated and what recovery usually looks like.",
+      "treatment_heading": "The Repair"
+    },
+    "status": "PUBLISHED",
+    "version": 88,
+    "author_id": "9a2a10ae-96ea-4587-aafa-d519615a9633",
+    "reviewed_by": "9a2a10ae-96ea-4587-aafa-d519615a9633",
+    "attestation_id": "a61ad7d9-79b8-4091-a7be-38c88abf48b2",
+    "content_hash": "b60684be4aba5868afcc9d7acfe59d791cdf5f96e6836e8c04cfb275da3856ad",
+    "source_attribution": [
+      {
+        "url": "https://www.nba.com/news/kings-guard-ben-simmons-suffers-torn-achilles-tendon-during-practice-sunday",
+        "label": "NBA.com"
+      },
+      {
+        "url": "https://www.si.com/nba/kings/onsi/ben-simmons-injury-history-what-kings-should-expect-from-3x-all-star",
+        "label": "SI.com"
+      },
+      {
+        "url": "https://basketnews.com/news-257765-sacramento-kings-announce-good-news-on-ben-simmons-achilles-injury.html",
+        "label": "basketnews.com"
+      }
+    ],
+    "disclaimer_present": false,
+    "created_at": "2026-10-21T02:15:29.729Z",
+    "updated_at": "2026-10-21T04:11:37.909Z",
+    "published_at": "2026-10-21T04:01:36.676Z",
+    "sections": {
+      "bridge": "Achilles tears are not only a professional athlete's injury. They are common in recreational players in their 30s and 40s, often in a sudden push-off after a stretch of inactivity or a return to play. If you feel a pop or a sudden sharp blow at the back of the ankle, followed by weakness pushing off, get it examined promptly. Early assessment affects the treatment options.",
+      "anatomy": "The Achilles is the largest tendon in the body. It connects the calf muscles to the heel bone and carries the force of every push-off, jump and sprint. Complete tears usually happen in the middle of the tendon or near its heel attachment, often during a sudden push-off or change of direction, which is consistent with a live practice drill. Tendons that have been repeatedly loaded or have gone through long layoffs can be less forgiving, although a single report cannot say whether that applies here.",
+      "dr_take": "What stands out to me is the sequence. A player coming back from multiple publicly reported injuries enters a preseason ramp-up, then suffers a reported tendon injury in a drill. I cannot claim a link between his prior problems and this tear, although the frequency of injury is noteworthy. What I can say is that the first season back after a long layoff is a stress test for the body, and tendons are one of the slowest tissues to adapt.",
+      "snapshot": "Per the Sacramento Kings, Ben Simmons tore his right Achilles tendon in practice this week, days before the season opener, ending a comeback attempt that began with a one-year minimum contract. It is the latest in a long run of injuries, most notably to his back, that has kept him off the court for much of the last several seasons.",
+      "timeline": "Surgery was reported complete on Tuesday October 20, so the clock has started. Recovery from an Achilles tear is generally measured in many months, not weeks. Return to full competitive basketball commonly takes around nine to twelve months or longer, and strength and explosiveness can lag behind the date an athlete is cleared. The Kings have not published a return timeline, so any date should be treated as an estimate.\n\nFor Simmons, the backdrop matters. He would be rebuilding the calf, tendon and push-off mechanics while also managing a back with a long surgical and nerve history, and he has not played a full season in years. That does not predict how this recovery will go. It does mean the rehabilitation has more moving parts than it would for an athlete with a clean medical record. Dated updates will be added as they are reported.",
+      "treatment": "A complete tear in an elite athlete is most often treated with surgical repair, followed by a staged rehabilitation: a period of protection, gradual weight bearing, calf strengthening, then running, jumping and cutting before basketball. The team has said surgery has been completed.The surgical technique used is not known.",
+      "what_happened": "According to the Kings, Simmons was hurt during a live drill in practice on Sunday. The Kings confirmed a torn right Achilles tendon, per the team's statement, and said surgery was completed on Tuesday October 20. ESPN's Shams Charania reported the injury first. Simmons signed with Sacramento in September 2026 after missing most of recent seasons. He has said publicly that he has been knocked down before and has always gotten back up.\n\nThe injury lands on a long medical history. In 2016 he fractured his right foot, the same side, in a scrimmage before his rookie season and had surgery to repair it.  He subsequently missed that entire year. Per public reporting he has since had a lower back nerve impingement, a knee injury, a herniated disc, a back surgery, and a recurrence of the nerve problem shut him down after 15 games in 2023-24. Reporting on exact dates and procedures is not consistent, so this account follows the public record only.\n\nThe surgeon, the surgical approach and the team's own recovery estimate have not been released."
+    },
+    "meta": {
+      "faqs": [
+        {
+          "a": "Recovery is measured in months, not weeks. After surgical repair, patients are usually protected in a boot or brace at first, then progress through weight bearing, calf strengthening, walking, running and sport-specific work. Many athletes need around nine to twelve months or longer before returning to competition, and strength can lag behind clearance. Individual timelines vary with the injury, the repair and the athlete's health history.",
+          "q": "How long does recovery from an Achilles rupture usually take?"
+        },
+        {
+          "a": "Yes. Achilles tears are common in recreational players, especially people in their 30s and 40s who play stop-and-go sports after a period of inactivity. People often describe a sudden pop or a feeling of being kicked in the back of the ankle, followed by trouble pushing off. Anyone who suspects a tear should be examined promptly, because early assessment shapes the treatment options.",
+          "q": "Can a recreational athlete tear an Achilles the same way?"
+        },
+        {
+          "a": "The Achilles tendon connects the calf muscles to the heel bone and carries the load of walking, running and jumping. Tears usually happen when the tendon is loaded suddenly and hard, such as in a push-off or a change of direction. A long layoff, age and repeated stress on the tendon are commonly discussed risk factors. This is general education and not a statement about any one athlete.",
+          "q": "What is the Achilles tendon and why do tears happen?"
+        }
+      ],
+      "player": "Ben Simmons",
+      "short_title": "Ben Simmons · Achilles",
+      "related_slugs": [
+        "jayson-tatum-achilles-tear"
+      ],
+      "relevant_tool": "achilles",
+      "meta_description": "Ben Simmons tore his right Achilles in Kings practice, per the team. What the injury is, how it's treated and what recovery usually looks like.",
+      "treatment_heading": "The Repair"
+    },
+    "kpjmd_published_at": "2026-10-21T04:11:37.909Z",
+    "kpjmd_url": "https://kpjmd.com/injury-desk/ben-simmons-achilles-rupture/",
+    "kpjmd_content_hash": "b60684be4aba5868afcc9d7acfe59d791cdf5f96e6836e8c04cfb275da3856ad"
+  },
+  "attestations": [
+    {
+      "id": "a61ad7d9-79b8-4091-a7be-38c88abf48b2",
+      "desk_post_id": "67cb7fc3-f428-40c8-be70-c784c7d38500",
+      "reviewer_user_id": "9a2a10ae-96ea-4587-aafa-d519615a9633",
+      "reviewed_source_reports": true,
+      "edited_for_accuracy": true,
+      "framing_confirmed": true,
+      "content_hash": "b60684be4aba5868afcc9d7acfe59d791cdf5f96e6836e8c04cfb275da3856ad",
+      "timestamp": "2026-10-21T04:01:33.086Z",
+      "ip": "98.116.242.127"
+    }
+  ]
+}

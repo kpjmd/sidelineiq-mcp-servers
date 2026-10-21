@@ -231,6 +231,25 @@ export function assertCanAttest(
   >,
   post: Pick<DeskPost, "id" | "status">,
 ): void {
+  assertMdConfirmations(user, input);
+  if (post.status !== "DRAFT" && post.status !== "READY") {
+    throw new McpToolError(
+      `Desk post ${post.id} is ${post.status} and cannot be attested`,
+      "Only DRAFT or READY posts can be attested.",
+    );
+  }
+}
+
+// The status-independent half of assertCanAttest: a DB-derived MD who has
+// confirmed all three review steps. desk_correct_title re-attests a PUBLISHED
+// post, so it needs this half and not the DRAFT/READY one.
+export function assertMdConfirmations(
+  user: User | null,
+  input: Pick<
+    AttestInput,
+    "reviewer_user_id" | "reviewed_source_reports" | "edited_for_accuracy" | "framing_confirmed"
+  >,
+): void {
   if (!user) {
     throw new McpToolError(
       `Reviewer ${input.reviewer_user_id} not found`,
@@ -247,12 +266,6 @@ export function assertCanAttest(
     throw new McpToolError(
       "Cannot attest without confirming all three review steps",
       "reviewed_source_reports, edited_for_accuracy, and framing_confirmed must all be true.",
-    );
-  }
-  if (post.status !== "DRAFT" && post.status !== "READY") {
-    throw new McpToolError(
-      `Desk post ${post.id} is ${post.status} and cannot be attested`,
-      "Only DRAFT or READY posts can be attested.",
     );
   }
 }
