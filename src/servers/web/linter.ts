@@ -187,6 +187,44 @@ export function checkNonPublicDetailRegex(body: string): LintFinding[] {
 // cannot make: it checks presence only, never type, so a non-string section
 // passes validation there and then throws in textToHtmlParagraphs.
 
+// The title is the kpjmd headline: it is the h1, the <title>, the og/twitter
+// title and the listing card. DeskList seeds a new draft's title with the
+// athlete's name alone, which reads as finished at a glance; this blocker is what
+// stops that stub from publishing unedited, the same way incomplete_sections
+// stops an empty section. A published title can only be changed afterwards by
+// desk_correct_title, which re-attests — so catching it here is much cheaper.
+function normalizeTitle(raw: string): string {
+  return raw
+    .normalize("NFKD")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
+
+export function checkTitle(title: string | null | undefined, meta: DeskMeta | null | undefined): LintFinding[] {
+  const normalized = normalizeTitle(title ?? "");
+  if (normalized === "") {
+    return [
+      {
+        code: "title_incomplete",
+        severity: "blocker",
+        message: "The headline is empty. Write the headline readers will see on kpjmd.com.",
+      },
+    ];
+  }
+  const player = meta?.player ? normalizeTitle(meta.player) : "";
+  if (player !== "" && normalized === player) {
+    return [
+      {
+        code: "title_incomplete",
+        severity: "blocker",
+        message: "Write a headline: the title is still only the athlete's name.",
+      },
+    ];
+  }
+  return [];
+}
+
 // Every one of the seven sections must be a non-empty string.
 export function checkSectionsComplete(sections: DeskSections | null | undefined): LintFinding[] {
   if (!sections) {
@@ -324,6 +362,7 @@ export async function lintDeskPost(input: LintDeskPostInput): Promise<LintResult
   route(checkNonPublicDetailRegex(body));
 
   // kpjmd contract — structural, no network, always applied.
+  route(checkTitle(input.title, input.meta));
   route(checkSectionsComplete(input.sections));
   route(checkMarkdownInSections(input.sections));
   route(checkMetaAdvisories(input.meta));

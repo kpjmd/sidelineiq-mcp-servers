@@ -1,7 +1,7 @@
 import { getDatabase } from "../../shared/database.js";
 import { McpToolError } from "../../shared/errors.js";
 import { hashPayload } from "../../shared/hash.js";
-import { lintDeskPost, type LintFinding } from "./linter.js";
+import { checkTitle, lintDeskPost, type LintFinding } from "./linter.js";
 import { assembleDeskHandoff } from "./desk-handoff.js";
 import { checkKpjmdLive, type LiveCheckResult } from "./kpjmd-live.js";
 import {
@@ -25,6 +25,7 @@ import {
   pickScoredWindow,
   resolveActualIso,
   assertCanAttest,
+  assertMdConfirmations,
   slugify,
   summarizeCtaClicks,
 } from "./service.js";
@@ -662,6 +663,26 @@ export interface AttestInput {
   edited_for_accuracy: boolean;
   framing_confirmed: boolean;
   ip?: string;
+}
+
+export interface CorrectTitleInput {
+  desk_post_id: string;
+  reviewer_user_id: string;
+  title: string;
+  reason: string;
+  reviewed_source_reports: boolean;
+  edited_for_accuracy: boolean;
+  framing_confirmed: boolean;
+  ip?: string;
+}
+
+export interface CorrectTitleResult {
+  post: DeskPost;
+  changed: boolean;
+  previous_title: string;
+  previous_content_hash: string;
+  // null on a no-op: nothing changed, so nothing was attested.
+  attestation: DeskAttestation | null;
 }
 
 // The structured outcome of the publish gate. A blocked publish is a SUCCESSFUL
@@ -3485,6 +3506,144 @@ export class WebDatabaseClient {
       payload: { slug: post.slug },
     });
     return post;
+  }
+
+  // Correct the title of a PUBLISHED desk post — the one edit allowed after
+  // publish. desk_update_draft stays locked to DRAFT/READY on purpose: a general
+  // post-publish edit would let any section change behind a published attestation.
+  //
+  // The title is inside deskContentHash, so a correction MOVES content_hash, and
+  // the attestation the post was published under no longer covers what it says.
+  // This call therefore RE-ATTESTS: same MD-only, three-confirmation guard as
+  // desk_attest, a new desk_attestations row for the new hash, and attestation_id
+  // re-pointed at it. Every hash a live page can carry stays covered by an MD.
+  //
+  // MD only. Unlike web_thread_correct_laterality there is no 'automation' actor:
+  // this is published content under the physician credential.
+  //
+  // kpjmd_* is deliberately left alone. kpjmd_content_hash still holds the OLD
+  // hash, so the desk shows the page as stale, and desk_confirm_kpjmd_live
+  // reports "live page is stale" until the handoff is rebuilt and rsynced.
+  async correctDeskPostTitle(input: CorrectTitleInput): Promise<CorrectTitleResult> {
+    const user = await this.getUser(input.reviewer_user_id);
+    assertMdConfirmations(user, input);
+
+    const rows = await this.sql`SELECT * FROM desk_posts WHERE id = ${input.desk_post_id}`;
+    if (rows.length === 0) {
+      throw new McpToolError(
+        `Desk post ${input.desk_post_id} not found`,
+        "Use desk_list to find a valid desk post id.",
+      );
+    }
+    const prev = rows[0] as DeskPost;
+    if (prev.status !== "PUBLISHED") {
+      throw new McpToolError(
+        `Desk post ${input.desk_post_id} is ${prev.status}, not PUBLISHED`,
+        prev.status === "RETRACTED"
+          ? "A retracted post is a tombstone and has no headline to correct."
+          : "Edit a DRAFT or READY post's title with desk_update_draft.",
+      );
+    }
+
+    const title = input.title.trim();
+    // Idempotent: re-submitting the stored title must not manufacture a second
+    // attestation or an audit row claiming a change that did not happen.
+    if (title === prev.title) {
+      return {
+        post: prev,
+        changed: false,
+        previous_title: prev.title,
+        previous_content_hash: prev.content_hash,
+        attestation: null,
+      };
+    }
+
+    const titleFindings = checkTitle(title, prev.meta);
+    if (titleFindings.length > 0) {
+      throw new McpToolError(titleFindings[0].message, "Correct to a full headline.");
+    }
+
+    // markdown_body does not carry the title (serializeSections), so only the
+    // hash moves.
+    const contentHash = deskContentHash(title, prev.sections, prev.meta, prev.markdown_body);
+    const newVersion = prev.version + 1;
+
+    // Attestation first: if the post write below loses a race, this row is an
+    // unreferenced orphan — harmless. The reverse order could leave a published
+    // title pointing at an attestation that was never written.
+    const attRows = await this.sql`
+      INSERT INTO desk_attestations (
+        desk_post_id, reviewer_user_id, reviewed_source_reports,
+        edited_for_accuracy, framing_confirmed, content_hash, ip
+      ) VALUES (
+        ${prev.id}, ${input.reviewer_user_id}, ${input.reviewed_source_reports},
+        ${input.edited_for_accuracy}, ${input.framing_confirmed}, ${contentHash}, ${input.ip ?? null}
+      )
+      RETURNING *
+    `;
+    const attestation = attRows[0] as DeskAttestation;
+
+    const updated = await this.sql`
+      UPDATE desk_posts SET
+        title = ${title},
+        content_hash = ${contentHash},
+        attestation_id = ${attestation.id},
+        reviewed_by = ${input.reviewer_user_id},
+        version = ${newVersion},
+        updated_at = NOW()
+      WHERE id = ${prev.id} AND status = 'PUBLISHED' AND version = ${prev.version}
+      RETURNING *
+    `;
+    if (updated.length === 0) {
+      throw new McpToolError(
+        `Desk post ${input.desk_post_id} changed concurrently`,
+        "The post was modified since it was read. Re-fetch it with desk_get and retry the correction.",
+      );
+    }
+    const post = updated[0] as DeskPost;
+
+    await this.sql`
+      INSERT INTO desk_post_versions (
+        desk_post_id, version, markdown_body, sections, meta, draft_json, content_hash, edited_by, edit_diff
+      ) VALUES (
+        ${post.id}, ${newVersion}, ${post.markdown_body}, ${JSON.stringify(post.sections)},
+        ${JSON.stringify(post.meta)}, ${null}, ${contentHash}, ${input.reviewer_user_id},
+        ${JSON.stringify({ title: { from: prev.title, to: title } })}
+      )
+    `;
+
+    // The handoff's headline and _sideline.content_hash both come from this row.
+    await this.refreshDraftJson(post);
+
+    await this.auditAppend({
+      actor: "md",
+      actor_id: input.reviewer_user_id,
+      entity_type: "desk_post",
+      entity_id: post.id,
+      action: "desk_title_corrected",
+      before: prev,
+      after: post,
+      // before/after are stored only as hashes, so the readable diff lives here.
+      payload: {
+        previous_title: prev.title,
+        new_title: title,
+        reason: input.reason,
+        previous_content_hash: prev.content_hash,
+        new_content_hash: contentHash,
+        attestation_id: attestation.id,
+        version: newVersion,
+        slug: post.slug,
+      },
+    });
+
+    const fresh = await this.sql`SELECT * FROM desk_posts WHERE id = ${post.id}`;
+    return {
+      post: (fresh[0] as DeskPost | undefined) ?? post,
+      changed: true,
+      previous_title: prev.title,
+      previous_content_hash: prev.content_hash,
+      attestation,
+    };
   }
 
   // Confirm a desk post is actually live on kpjmd.com and record it.

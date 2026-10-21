@@ -2333,6 +2333,40 @@ export function registerWebTools(server: McpServer): void {
     },
   );
 
+  // ── desk_correct_title ──────────────────────────────────────────────
+  // The one post-publish edit. Re-attests (the title is inside the content hash),
+  // MD only, audited as desk_title_corrected. desk_update_draft stays locked.
+  server.tool(
+    "desk_correct_title",
+    "Correct the title (kpjmd headline) of a PUBLISHED desk post. The title is inside the content hash, so this RE-ATTESTS: the MD role is re-derived server-side from reviewer_user_id and all three confirmations must be true; a new attestation is recorded for the new hash. Writes a desk_title_corrected audit row and refreshes the handoff JSON (headline + _sideline.content_hash). Slug, published_at and the kpjmd confirmation are unchanged, so the live page reads as stale until it is rebuilt, rsynced and confirmed again. Re-submitting the stored title is a no-op (changed:false).",
+    {
+      desk_post_id: z.string().uuid(),
+      reviewer_user_id: z.string().uuid().describe("MD user id (UUID); role re-derived from the DB"),
+      title: z.string().trim().min(1).max(512).describe("The corrected headline"),
+      reason: z.string().trim().min(1).describe("Why the title is being corrected; recorded in the audit row"),
+      reviewed_source_reports: z.boolean(),
+      edited_for_accuracy: z.boolean(),
+      framing_confirmed: z.boolean(),
+      ip: z.string().optional(),
+    },
+    // Not destructive: the prior title survives in desk_post_versions and the
+    // audit payload. Idempotent: the same title again writes nothing.
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    async (input) => {
+      try {
+        const result = await client.correctDeskPostTitle(input);
+        return toolSuccess(result);
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
   // ── desk_confirm_kpjmd_live ─────────────────────────────────────────
   // The fetch and the DB write are deliberately both server-side: a separate
   // "record the result" tool would be callable with a fabricated result, making
