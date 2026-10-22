@@ -187,6 +187,7 @@ const WEB: Record<string, Hints> = {
   desk_confirm_kpjmd_live: [false, false, true, true],
   // Re-attests a PUBLISHED post's title; the same title again writes nothing.
   desk_correct_title: [false, false, true, false],
+  desk_correct_published: [false, false, true, false],
   desk_append_update: [false, false, false, false],
   desk_list_updates: READ,
   desk_list: READ,
@@ -250,7 +251,7 @@ const TWITTER: Record<string, Hints> = {
 };
 
 const SERVERS = [
-  { label: "web", register: registerWebTools, expected: WEB, count: 89 },
+  { label: "web", register: registerWebTools, expected: WEB, count: 90 },
   { label: "farcaster", register: registerFarcasterTools, expected: FARCASTER, count: 6 },
   { label: "twitter", register: registerTwitterTools, expected: TWITTER, count: 6 },
 ] as const;
@@ -301,12 +302,12 @@ describe.each(SERVERS)("$label tool annotations", ({ register, expected, count }
 });
 
 describe("annotation coverage across all servers", () => {
-  it("covers all 101 tools", () => {
+  it("covers all 102 tools", () => {
     const total = SERVERS.reduce(
       (sum, { register }) => sum + Object.keys(annotationsByTool(register)).length,
       0,
     );
 
-    expect(total).toBe(101);
+    expect(total).toBe(102);
   });
 });

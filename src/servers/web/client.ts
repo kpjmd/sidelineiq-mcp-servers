@@ -5,6 +5,14 @@ import { checkTitle, lintDeskPost, type LintFinding } from "./linter.js";
 import { assembleDeskHandoff } from "./desk-handoff.js";
 import { checkKpjmdLive, type LiveCheckResult } from "./kpjmd-live.js";
 import {
+  mergeCorrection,
+  refusingBlockers,
+  sizeCapViolations,
+  type CorrectableMeta,
+  type CorrectionDiff,
+  type MergedCorrection,
+} from "./desk-correction.js";
+import {
   deskContentHash,
   normalizeMeta,
   normalizeSections,
@@ -680,6 +688,27 @@ export interface CorrectTitleResult {
   post: DeskPost;
   changed: boolean;
   previous_title: string;
+  previous_content_hash: string;
+  // null on a no-op: nothing changed, so nothing was attested.
+  attestation: DeskAttestation | null;
+}
+
+export interface CorrectContentInput {
+  desk_post_id: string;
+  reviewer_user_id: string;
+  sections?: Partial<DeskSections>;
+  meta?: CorrectableMeta;
+  reason: string;
+  reviewed_source_reports: boolean;
+  edited_for_accuracy: boolean;
+  framing_confirmed: boolean;
+  ip?: string;
+}
+
+export interface CorrectContentResult {
+  post: DeskPost;
+  changed: boolean;
+  diff: CorrectionDiff;
   previous_content_hash: string;
   // null on a no-op: nothing changed, so nothing was attested.
   attestation: DeskAttestation | null;
@@ -3641,6 +3670,167 @@ export class WebDatabaseClient {
       post: (fresh[0] as DeskPost | undefined) ?? post,
       changed: true,
       previous_title: prev.title,
+      previous_content_hash: prev.content_hash,
+      attestation,
+    };
+  }
+
+  // Correct the sections or prose meta of a PUBLISHED desk post. The same design
+  // as correctDeskPostTitle — MD only, re-attests the new hash, version-guarded
+  // UPDATE, a desk_post_versions row, an audit row with a readable diff, the
+  // handoff refreshed, kpjmd_* left alone so the live page reads stale — plus two
+  // guards a title never needed:
+  //
+  //   • A size cap (desk-correction.ts). A correction fixes a typo or a misstated
+  //     fact; a rewrite behind a "correction" is a retraction and a new post.
+  //   • The linter, on the corrected post. A section edit can introduce
+  //     diagnosis_as_fact where a title edit cannot. Deterministic blockers always
+  //     refuse; a classifier blocker refuses only when the published post, linted
+  //     in the same call, did not already carry that code — the classifier is
+  //     nondeterministic, and an untouched sentence must not block a typo fix.
+  async correctDeskPostContent(input: CorrectContentInput): Promise<CorrectContentResult> {
+    const user = await this.getUser(input.reviewer_user_id);
+    assertMdConfirmations(user, input);
+
+    const rows = await this.sql`SELECT * FROM desk_posts WHERE id = ${input.desk_post_id}`;
+    if (rows.length === 0) {
+      throw new McpToolError(
+        `Desk post ${input.desk_post_id} not found`,
+        "Use desk_list to find a valid desk post id.",
+      );
+    }
+    const prev = rows[0] as DeskPost;
+    if (prev.status !== "PUBLISHED") {
+      throw new McpToolError(
+        `Desk post ${input.desk_post_id} is ${prev.status}, not PUBLISHED`,
+        prev.status === "RETRACTED"
+          ? "A retracted post is a tombstone and has no content to correct."
+          : "Edit a DRAFT or READY post with desk_update_draft.",
+      );
+    }
+
+    let merged: MergedCorrection;
+    try {
+      merged = mergeCorrection(prev.sections, prev.meta, input.sections, input.meta);
+    } catch (err) {
+      throw new McpToolError((err as Error).message, "Retract and republish to restructure a post.");
+    }
+    const { sections, meta, diff, total_distance } = merged;
+
+    // Idempotent: nothing differs from what is stored, so nothing is attested.
+    if (Object.keys(diff).length === 0) {
+      return {
+        post: prev,
+        changed: false,
+        diff,
+        previous_content_hash: prev.content_hash,
+        attestation: null,
+      };
+    }
+
+    const overCap = sizeCapViolations(diff, total_distance);
+    if (overCap.length > 0) {
+      throw new McpToolError(
+        `Too large for a correction: ${overCap.join("; ")}`,
+        "A correction fixes a typo or a misstated fact. For a larger change, retract the post and publish a new one.",
+      );
+    }
+
+    const markdownBody = serializeSections(sections, meta);
+    const lintBase = {
+      title: prev.title,
+      draft_json: prev.draft_json,
+      source_attribution: prev.source_attribution,
+      disclaimer_present: prev.disclaimer_present,
+    };
+    const [beforeLint, afterLint] = await Promise.all([
+      lintDeskPost({ ...lintBase, markdown_body: prev.markdown_body, sections: prev.sections, meta: prev.meta }),
+      lintDeskPost({ ...lintBase, markdown_body: markdownBody, sections, meta }),
+    ]);
+    const refusing = refusingBlockers(beforeLint.blockers, afterLint.blockers);
+    if (refusing.length > 0) {
+      throw new McpToolError(
+        `The corrected post fails the linter: ${refusing.map((f) => `${f.code}: ${f.message}`).join(" | ")}`,
+        "Reword the correction so it passes the same framing rules the post was published under.",
+      );
+    }
+
+    const contentHash = deskContentHash(prev.title, sections, meta, markdownBody);
+    const newVersion = prev.version + 1;
+    const sectionsJson = JSON.stringify(sections);
+    const metaJson = JSON.stringify(meta);
+
+    // Attestation first, for the reason given in correctDeskPostTitle.
+    const attRows = await this.sql`
+      INSERT INTO desk_attestations (
+        desk_post_id, reviewer_user_id, reviewed_source_reports,
+        edited_for_accuracy, framing_confirmed, content_hash, ip
+      ) VALUES (
+        ${prev.id}, ${input.reviewer_user_id}, ${input.reviewed_source_reports},
+        ${input.edited_for_accuracy}, ${input.framing_confirmed}, ${contentHash}, ${input.ip ?? null}
+      )
+      RETURNING *
+    `;
+    const attestation = attRows[0] as DeskAttestation;
+
+    const updated = await this.sql`
+      UPDATE desk_posts SET
+        markdown_body = ${markdownBody},
+        sections = ${sectionsJson},
+        meta = ${metaJson},
+        content_hash = ${contentHash},
+        attestation_id = ${attestation.id},
+        reviewed_by = ${input.reviewer_user_id},
+        version = ${newVersion},
+        updated_at = NOW()
+      WHERE id = ${prev.id} AND status = 'PUBLISHED' AND version = ${prev.version}
+      RETURNING *
+    `;
+    if (updated.length === 0) {
+      throw new McpToolError(
+        `Desk post ${input.desk_post_id} changed concurrently`,
+        "The post was modified since it was read. Re-fetch it with desk_get and retry the correction.",
+      );
+    }
+    const post = updated[0] as DeskPost;
+
+    await this.sql`
+      INSERT INTO desk_post_versions (
+        desk_post_id, version, markdown_body, sections, meta, draft_json, content_hash, edited_by, edit_diff
+      ) VALUES (
+        ${post.id}, ${newVersion}, ${markdownBody}, ${sectionsJson}, ${metaJson}, ${null},
+        ${contentHash}, ${input.reviewer_user_id}, ${JSON.stringify(diff)}
+      )
+    `;
+
+    await this.refreshDraftJson(post);
+
+    await this.auditAppend({
+      actor: "md",
+      actor_id: input.reviewer_user_id,
+      entity_type: "desk_post",
+      entity_id: post.id,
+      action: "desk_content_corrected",
+      before: prev,
+      after: post,
+      // before/after are stored only as hashes, so the readable diff lives here.
+      payload: {
+        diff,
+        total_distance,
+        reason: input.reason,
+        previous_content_hash: prev.content_hash,
+        new_content_hash: contentHash,
+        attestation_id: attestation.id,
+        version: newVersion,
+        slug: post.slug,
+      },
+    });
+
+    const fresh = await this.sql`SELECT * FROM desk_posts WHERE id = ${post.id}`;
+    return {
+      post: (fresh[0] as DeskPost | undefined) ?? post,
+      changed: true,
+      diff,
       previous_content_hash: prev.content_hash,
       attestation,
     };

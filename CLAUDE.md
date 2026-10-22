@@ -279,9 +279,10 @@ it. Use `tool.inputSchema.parse()` first, or a real `Client` over
 
 `desk_update_draft` refuses anything but DRAFT/READY, and it stays that way: a
 general post-publish edit would let any section change behind a published
-attestation. The one post-publish edit is `desk_correct_title`
-(`correctDeskPostTitle`), built after the first live run shipped "Ben Simmons —
-achilles rupture" from DeskList's lowercase seeded title (2026-10-21).
+attestation. There are exactly two post-publish edits, both corrections:
+`desk_correct_title` (`correctDeskPostTitle`), built after the first live run
+shipped "Ben Simmons — achilles rupture" from DeskList's lowercase seeded title
+(2026-10-21), and `desk_correct_published` (below).
 
 - **It re-attests.** The title is inside `deskContentHash`, so a correction moves
   `content_hash`, and the attestation the post was published under no longer
@@ -311,6 +312,37 @@ achilles rupture" from DeskList's lowercase seeded title (2026-10-21).
 - Tested against a RECORDED row (`tests/fixtures/desk-post-published-row.json`,
   `src/scripts/record-desk-fixture.ts`): the refreshed handoff must equal the
   recorded one except `headline` and `_sideline.content_hash`.
+
+### A published section is corrected the same way, and only a little
+
+`desk_correct_published` (`correctDeskPostContent`, rules in `desk-correction.ts`)
+fixes a typo or a misstated fact in the sections or prose meta. Built for
+"completed.The surgical technique" in Simmons' treatment section (2026-10-22).
+Everything above holds — MD only, three confirmations, re-attests the new hash,
+attestation first, version-guarded UPDATE, `desk_post_versions` row, handoff
+refreshed, `kpjmd_*` untouched so the page reads stale, same content = no-op —
+plus what a section edit needs that a title did not:
+
+- **Scope is the schema.** Sections are partial; meta accepts only
+  `short_title`, `meta_description`, `treatment_heading`, `anatomy_diagram_alt`
+  and `faqs` (same count — adding or removing one is refused). The title and the
+  structural keys (`player`, `related_slugs`, `relevant_tool`, `conflict_flag`,
+  `anatomy_diagram`) are not declared, so strict inputs refuse them outright.
+- **Small edits only.** Character edit distance per changed field ≤
+  `MAX_FIELD_EDIT_DISTANCE` (150) and summed ≤ `MAX_TOTAL_EDIT_DISTANCE` (300).
+  Over that is a rewrite behind a "correction": retract and publish a new post.
+- **Re-linted, and a new blocker refuses.** The corrected post and the published
+  one are linted in the same call. Every deterministic blocker on the corrected
+  post refuses. A classifier blocker (`diagnosis_as_fact`,
+  `non_public_scan_detail` — `CLASSIFIER_BLOCKER_CODES`) refuses only when the
+  published post did not carry that code in the same call: the classifier is
+  nondeterministic, and an untouched sentence must not block a typo fix.
+- **Recorded, not announced.** `action: 'desk_content_corrected'` with
+  `{diff, total_distance, reason, previous_content_hash, new_content_hash,
+  attestation_id, version, slug}`; `diff` is keyed by field path
+  (`sections.treatment`, `meta.faqs[1].a`) with `{from, to, distance}`, and the
+  same object is the version row's `edit_diff`. No reader-facing correction note
+  — the handoff contract and the kpjmd builder are unchanged.
 
 ### The Prognosis Ledger is immutable by trigger, not by convention
 
