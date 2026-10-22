@@ -5,6 +5,7 @@ import type { InsertProcessedMentionInput, InsertPendingCorrectionInput } from "
 import { handleToolError, McpToolError, toolSuccess } from "../../shared/errors.js";
 import { createLogger } from "../../shared/logger.js";
 import { registerLedgerTools } from "./ledger-tools.js";
+import { MAX_FIELD_EDIT_DISTANCE, MAX_TOTAL_EDIT_DISTANCE } from "./desk-correction.js";
 
 const logger = createLogger("web-tools");
 
@@ -2360,6 +2361,54 @@ export function registerWebTools(server: McpServer): void {
     async (input) => {
       try {
         const result = await client.correctDeskPostTitle(input);
+        return toolSuccess(result);
+      } catch (err) {
+        return handleToolError(err, logger);
+      }
+    },
+  );
+
+  // ── desk_correct_published ──────────────────────────────────────────
+  // The section/prose-meta sibling of desk_correct_title: re-attests, MD only,
+  // size-capped, re-linted, audited as desk_content_corrected. Structural meta
+  // and the title are deliberately not in the schema, so strict inputs refuse them.
+  server.tool(
+    "desk_correct_published",
+    `Correct a small error (a typo, a misstated fact) in the sections or prose meta of a PUBLISHED desk post. Sections are partial — omitted ones keep their stored value. Meta accepts only short_title, meta_description, treatment_heading, anatomy_diagram_alt and faqs (same number of FAQs); the title has desk_correct_title. Content is inside the content hash, so this RE-ATTESTS: the MD role is re-derived server-side and all three confirmations must be true. Refused when any changed field moves more than ${MAX_FIELD_EDIT_DISTANCE} characters or the whole correction more than ${MAX_TOTAL_EDIT_DISTANCE} (retract and republish instead), and when the corrected post carries a lint blocker the published post did not. Writes a desk_content_corrected audit row with a per-field diff and refreshes the handoff JSON. Slug, published_at and the kpjmd confirmation are unchanged, so the live page reads as stale until it is rebuilt, rsynced and confirmed again. Re-submitting stored content is a no-op (changed:false).`,
+    {
+      desk_post_id: z.string().uuid(),
+      reviewer_user_id: z.string().uuid().describe("MD user id (UUID); role re-derived from the DB"),
+      sections: deskSectionsSchema
+        .partial()
+        .optional()
+        .describe("Partial: omitted sections keep their stored value"),
+      meta: deskMetaSchema
+        .pick({
+          short_title: true,
+          meta_description: true,
+          treatment_heading: true,
+          anatomy_diagram_alt: true,
+          faqs: true,
+        })
+        .optional()
+        .describe("Prose meta only; faqs replaces the list and must keep its length"),
+      reason: z.string().trim().min(1).describe("What is being corrected and why; recorded in the audit row"),
+      reviewed_source_reports: z.boolean(),
+      edited_for_accuracy: z.boolean(),
+      framing_confirmed: z.boolean(),
+      ip: z.string().optional(),
+    },
+    // Not destructive: the prior content survives in desk_post_versions and the
+    // audit diff. Idempotent: the same content again writes nothing.
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    async (input) => {
+      try {
+        const result = await client.correctDeskPostContent(input);
         return toolSuccess(result);
       } catch (err) {
         return handleToolError(err, logger);
