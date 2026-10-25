@@ -896,7 +896,7 @@ export class LedgerClient {
     return { proposal, status: "created" };
   }
 
-  async listReplyProposals(decision: "pending" | "posted" | "discarded" | null = "pending"): Promise<ReplyProposal[]> {
+  async listReplyProposals(decision: ReplyProposal["decision"] | null = "pending"): Promise<ReplyProposal[]> {
     const rows = await this.sql`
       SELECT * FROM reply_proposals
       WHERE (${decision}::text IS NULL OR decision = ${decision})
