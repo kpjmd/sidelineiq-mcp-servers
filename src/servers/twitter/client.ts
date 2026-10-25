@@ -30,8 +30,19 @@ export interface TwitterMention {
   authorUsername: string;
   authorFollowerCount?: number;
   conversationId: string;
+  /** The AUTHOR of the post this mention replies to — a user id, not a post id. */
   inReplyToUserId?: string;
+  /** The POST this mention replies to. Absent for a mention that is not a reply. */
+  inReplyToTweetId?: string;
   createdAt: string;
+}
+
+/**
+ * The id of the post a tweet replies to, from `referenced_tweets`. X returns
+ * the replied-to AUTHOR as `in_reply_to_user_id`; the post itself is only here.
+ */
+export function repliedToTweetId(tweet: { referenced_tweets?: Array<{ type: string; id: string }> }): string | undefined {
+  return tweet.referenced_tweets?.find((r) => r.type === "replied_to")?.id;
 }
 
 export interface GetMentionsResult {
@@ -133,7 +144,7 @@ export class TwitterClient {
   async getMentions(userId: string, sinceId?: string, maxResults?: number): Promise<GetMentionsResult> {
     try {
       const opts: Record<string, unknown> = {
-        "tweet.fields": ["id", "text", "author_id", "conversation_id", "in_reply_to_user_id", "created_at"],
+        "tweet.fields": ["id", "text", "author_id", "conversation_id", "in_reply_to_user_id", "referenced_tweets", "created_at"],
         "user.fields": ["public_metrics", "username"],
         expansions: ["author_id"],
         max_results: maxResults ?? 10,
@@ -166,6 +177,7 @@ export class TwitterClient {
           authorFollowerCount: authorInfo?.followerCount,
           conversationId: tweet.conversation_id ?? tweet.id,
           inReplyToUserId: tweet.in_reply_to_user_id,
+          inReplyToTweetId: repliedToTweetId(tweet),
           createdAt: tweet.created_at ?? new Date().toISOString(),
         };
       });
