@@ -366,6 +366,24 @@ describe("web_record_ledger_correction, web_propose_reply, web_decide_reply", ()
     expect(mockSql.mock.calls[2]).toContain("reply_approved");
   });
 
+  // The replies page lists 'pending' and 'approved' in one Promise.all; the enum
+  // predated 027's 'approved', so the whole page failed and hid every pending
+  // draft. Every reply_proposals state must be listable.
+  it("lists every reply_proposals state, approved included", async () => {
+    const server = makeServer();
+    const schema = getTool(server, "web_list_reply_proposals").inputSchema;
+    for (const decision of ["pending", "approved", "posted", "discarded", null]) {
+      expect(schema.safeParse({ decision }).success).toBe(true);
+    }
+    expect(schema.safeParse({ decision: "rejected" }).success).toBe(false);
+
+    mockSql.mockResolvedValueOnce([{ id: DRAFT_ID, platform: "x", mention_id: "m1", decision: "approved" }]);
+    const r = (await callParsed(server, "web_list_reply_proposals", { decision: "approved" })) as { proposals: Array<{ decision: string }> };
+    expect(r.proposals.map((p) => p.decision)).toEqual(["approved"]);
+    expect(issued()[0]).toContain("FROM reply_proposals");
+    expect(mockSql.mock.calls[0]).toContain("approved");
+  });
+
   it("a non-MD cannot decide a reply", async () => {
     const server = makeServer();
     mockSql.mockResolvedValueOnce([editorUser]);

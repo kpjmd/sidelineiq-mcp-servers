@@ -428,8 +428,10 @@ export function registerLedgerTools(server: McpServer, web: WebDatabaseClient, l
 
   server.tool(
     "web_list_reply_proposals",
-    "List reply proposals, pending by default.",
-    { decision: z.enum(["pending", "posted", "discarded"]).nullable().optional() },
+    "List reply proposals, pending by default. null lists every state.",
+    // Every reply_proposals state (027 added 'approved'): the replies page lists
+    // approved rows whose post failed, and an enum missing one fails the call.
+    { decision: z.enum(["pending", "approved", "posted", "discarded"]).nullable().optional() },
     READ,
     async (input) => {
       try {
