@@ -105,6 +105,37 @@ describe("web_list_threads column projection", () => {
     }
   });
 
+  it("filters to return candidates on both the page and the count", async () => {
+    await tool("web_list_threads").handler(
+      { return_candidates: true, limit: 100, offset: 0 },
+      {},
+    );
+    const entityCalls = mockSql.mock.calls.filter((c) => /FROM injury_entities e/i.test(stmt(c)));
+    expect(entityCalls).toHaveLength(2);
+    for (const c of entityCalls) {
+      // Bound to true, against the current date, and ACTIVE only.
+      expect(c.slice(1)).toContain(true);
+      expect(stmt(c)).toContain("e.status = 'ACTIVE'");
+      expect(stmt(c)).toContain("to_char(e.injury_date, 'YYYY-MM-DD')");
+    }
+    const page = entityCalls.find((c) => !/SELECT COUNT/i.test(stmt(c)));
+    expect(stmt(page as unknown[])).toContain("return_before_credible_window");
+  });
+
+  it("does not filter when return_candidates is absent", async () => {
+    await tool("web_list_threads").handler({ status: "ACTIVE", limit: 100, offset: 0 }, {});
+    const entityCalls = mockSql.mock.calls.filter((c) => /FROM injury_entities e/i.test(stmt(c)));
+    for (const c of entityCalls) expect(c.slice(1)).toContain(false);
+    expect(entityCalls.flatMap((c) => c.slice(1))).not.toContain(true);
+  });
+
+  it("accepts return_candidates under the strict input schema", () => {
+    const schema = (tool("web_list_threads") as unknown as {
+      inputSchema: { parse: (v: unknown) => Record<string, unknown> };
+    }).inputSchema;
+    expect(schema.parse({ return_candidates: true }).return_candidates).toBe(true);
+  });
+
   it("returns both fields on the row it hands back", async () => {
     // The recorded SELECT * row, minus the two columns listThreads deliberately
     // does not project.

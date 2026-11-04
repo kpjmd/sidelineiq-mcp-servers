@@ -1755,6 +1755,12 @@ export function registerWebTools(server: McpServer): void {
         .boolean()
         .optional()
         .describe("Filter to threads flagged (or not flagged) for MD date review"),
+      return_candidates: z
+        .boolean()
+        .optional()
+        .describe(
+          "When true, return only ACTIVE threads the return detector found a game for and declined to close, each carrying return_hold (the candidate game, its link and why it was held). A hold made against an earlier injury_date is excluded.",
+        ),
       limit: z.number().int().min(1).max(500).default(100).describe("Results per page (max 500)"),
       offset: z.number().int().min(0).default(0).describe("Pagination offset"),
     },
