@@ -418,7 +418,20 @@ export interface InjuryEntity {
 }
 
 // A thread row joined with player/team display fields for the MD dashboard list.
+/** The return detector's latest hold on a thread. See listThreads. */
+export interface ThreadReturnHold {
+  action: "return_before_first_report" | "return_before_credible_window";
+  candidate_return_date: string | null;
+  game_url: string | null;
+  first_report_date: string | null;
+  earliest_credible_return: string | null;
+  injury_date: string | null;
+  at: string;
+}
+
 export interface ThreadListItem {
+  /** Present only when listThreads was called with return_candidates. */
+  return_hold?: ThreadReturnHold | null;
   id: string;
   player_id: string;
   athlete_name: string | null;
@@ -2804,6 +2817,7 @@ export class WebDatabaseClient {
     status?: EntityStatus;
     sport?: string;
     needs_date_review?: boolean;
+    return_candidates?: boolean;
     limit?: number;
     offset?: number;
   }): Promise<{ threads: ThreadListItem[]; total: number }> {
@@ -2814,6 +2828,13 @@ export class WebDatabaseClient {
     // and throw most of it away.
     const sport = input.sport ?? null;
     const needsReview = input.needs_date_review ?? null;
+    // Threads the return detector found a game for and declined to close. Read
+    // from audit_log, not needs_date_review, because the md_manual guard can drop
+    // that flag while the audit row is still written. A hold only counts against
+    // the date it was made on: once the MD corrects the date it no longer speaks
+    // for the thread, and the detector's next pass decides afresh. Only ACTIVE
+    // threads qualify, since a closed one has nothing left to confirm.
+    const returnCandidates = input.return_candidates === true;
     const limit = input.limit ?? 100;
     const offset = input.offset ?? 0;
     const countRows = await this.sql`
@@ -2823,6 +2844,22 @@ export class WebDatabaseClient {
       WHERE (${status}::text IS NULL OR e.status = ${status})
         AND (${sport}::text IS NULL OR p.sport = ${sport})
         AND (${needsReview}::boolean IS NULL OR e.needs_date_review = ${needsReview})
+        AND (
+          NOT ${returnCandidates}::boolean
+          OR (
+            e.status = 'ACTIVE'
+            AND LEFT(
+              (SELECT a.payload->>'injury_date'
+               FROM audit_log a
+               WHERE a.entity_type = 'injury_thread'
+                 AND a.entity_id = e.id
+                 AND a.action IN ('return_before_first_report', 'return_before_credible_window')
+               ORDER BY a.ts DESC
+               LIMIT 1),
+              10
+            ) = to_char(e.injury_date, 'YYYY-MM-DD')
+          )
+        )
     `;
     const rows = await this.sql`
       SELECT e.id, e.player_id, e.body_part, e.laterality, e.injury_type, e.status,
@@ -2835,7 +2872,8 @@ export class WebDatabaseClient {
              p.full_name AS athlete_name, p.sport AS sport,
              p.espn_athlete_id AS espn_athlete_id,
              t.display_name AS team_name,
-             pw.published_windows
+             pw.published_windows,
+             rh.return_hold
       FROM injury_entities e
       JOIN players p ON p.id = e.player_id
       LEFT JOIN teams t ON t.id = p.current_team_id
@@ -2861,9 +2899,35 @@ export class WebDatabaseClient {
                          WHERE u.entity_id = e.id AND u.post_id IS NOT NULL)
           )
       ) pw ON TRUE
+      -- Reads no audit row unless asked, so the other callers pay nothing.
+      LEFT JOIN LATERAL (
+        SELECT json_build_object(
+                 'action', a.action,
+                 'candidate_return_date', a.payload->>'candidate_return_date',
+                 'game_url', a.payload->>'game_url',
+                 'first_report_date', a.payload->>'first_report_date',
+                 'earliest_credible_return', a.payload->>'earliest_credible_return',
+                 'injury_date', a.payload->>'injury_date',
+                 'at', a.ts
+               ) AS return_hold
+        FROM audit_log a
+        WHERE ${returnCandidates}::boolean
+          AND a.entity_type = 'injury_thread'
+          AND a.entity_id = e.id
+          AND a.action IN ('return_before_first_report', 'return_before_credible_window')
+        ORDER BY a.ts DESC
+        LIMIT 1
+      ) rh ON TRUE
       WHERE (${status}::text IS NULL OR e.status = ${status})
         AND (${sport}::text IS NULL OR p.sport = ${sport})
         AND (${needsReview}::boolean IS NULL OR e.needs_date_review = ${needsReview})
+        AND (
+          NOT ${returnCandidates}::boolean
+          OR (
+            e.status = 'ACTIVE'
+            AND LEFT(rh.return_hold->>'injury_date', 10) = to_char(e.injury_date, 'YYYY-MM-DD')
+          )
+        )
       ORDER BY e.last_updated_at DESC, e.id DESC
       LIMIT ${limit}
       OFFSET ${offset}
